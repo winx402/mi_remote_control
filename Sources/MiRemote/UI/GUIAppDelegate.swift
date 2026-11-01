@@ -13,6 +13,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusController: StatusItemController?
     private var badgeController: FloatingBadgeController?
     private var overlayCenter: OverlayCenter?
+    private var shutdownSignals: [DispatchSourceSignal] = []
 
     init(uiPreview: Bool) {
         self.uiPreview = uiPreview
@@ -21,6 +22,17 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Prefs.registerDefaults()
+        // 本地重建会发送 TERM；先走正常清理，避免留下设备级按键中转。
+        for number in [SIGINT, SIGTERM] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in
+                self?.services?.stop()
+                NSApp.terminate(nil)
+            }
+            source.resume()
+            shutdownSignals.append(source)
+        }
         configureMainMenu()
         // Dock + 菜单栏双入口：服务运行期间始终保留 Dock 图标，
         // 关闭设置窗口也不退出；点 Dock 图标由 applicationShouldHandleReopen 重开窗口。

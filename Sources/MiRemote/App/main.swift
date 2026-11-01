@@ -27,6 +27,27 @@ while let argument = args.first {
         exit(0)
     case "--self-test":
         exit(SelfTest.run())
+    case "--print-default-config":
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(defaultConfig())
+            FileHandle.standardOutput.write(data)
+            print("")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("默认配置导出失败: \(error)\n".data(using: .utf8)!)
+            exit(2)
+        }
+    case "--validate-config":
+        guard !args.isEmpty,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: args.removeFirst())),
+              (try? JSONDecoder().decode(MappingConfig.self, from: data)) != nil else {
+            FileHandle.standardError.write("配置验证失败：需要可解码的配置 JSON 文件。\n".data(using: .utf8)!)
+            exit(2)
+        }
+        print("配置 JSON 验证通过")
+        exit(0)
     case "--doctor":
         // 体检是 standalone 只读 + 残留清理；但有活实例时 hidutil 中转映射正在使用，
         // 不是残留——探测到活实例就跳过清理，绝不把在用的映射当残留清掉。
@@ -148,6 +169,7 @@ while let argument = args.first {
         print("miremote [--list-audio-devices] [--output <name>] [--wav <path>] [--gain <dB>] [--verbose]")
         print("         [--keys] [--config <path>] [--doubao] [--run-action '<action json>']")
         print("         [--doctor] [--login-item on|off|status] [--claude-hooks install|uninstall|status]")
+        print("         [--print-default-config] [--validate-config <path>]")
         exit(0)
     default:
         FileHandle.standardError.write("未知参数: \(argument)\n".data(using: .utf8)!)
@@ -216,20 +238,24 @@ if !uiPreview {
 
 if cliServiceMode && !uiPreview {
     let services = AppServices(options: opts)
-    signal(SIGINT, SIG_IGN)
-    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    sigint.setEventHandler {
-        log("退出中…")
-        services.stop()
-        exit(0)
+    let shutdownSignals = [SIGINT, SIGTERM].map { number in
+        signal(number, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+        source.setEventHandler {
+            log("退出中…")
+            services.stop()
+            exit(0)
+        }
+        source.resume()
+        return source
     }
-    sigint.resume()
     services.start()
-    RunLoop.main.run()
+    withExtendedLifetime(shutdownSignals) { RunLoop.main.run() }
 } else {
     let app = NSApplication.shared
     let delegate = MainActor.assumeIsolated { GUIAppDelegate(uiPreview: uiPreview) }
     app.delegate = delegate
     // 激活策略由 GUIAppDelegate 管理（菜单栏优先形态常驻 .accessory）。
-    app.run()
+    // NSApplication.delegate 是弱引用；优化构建也必须持有生命周期与信号清理对象。
+    withExtendedLifetime(delegate) { app.run() }
 }

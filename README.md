@@ -2,6 +2,8 @@
 
 # MiRemote
 
+本 fork 的本地构建、Codex 按键预设与后续维护方法见 [fork 维护说明](docs/fork-maintenance.md)。
+
 **小米蓝牙遥控器 2 Pro → macOS 全能控制台**
 躺着就能指挥 AI 写代码：按住语音键对遥控器说话直接出字，13 个键映射成 Mac 的任何操作。
 

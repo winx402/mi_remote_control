@@ -133,6 +133,7 @@ struct MappingPage: View {
     private var keyEditor: some View {
         let key = model.selectedKey
         let binding = model.binding(for: key)
+        let reserved = model.config.globalShortcuts?[key.rawValue]
         return VStack(alignment: .leading, spacing: Spacing.section) {
             // 头部
             HStack(spacing: Spacing.intra) {
@@ -151,26 +152,32 @@ struct MappingPage: View {
 
             // 分组 A：触发方式
             SettingsGroup(title: "触发方式") {
-                SettingsRow(icon: "checkmark", iconColor: .blue, title: "短按", subtitle: "松开时立即触发") {
-                    ActionPicker(action: binding.tap) { new in
+                SettingsRow(icon: "checkmark", iconColor: .blue, title: "短按",
+                            subtitle: reserved?.tap != nil ? "独立全局动作，应用不能覆盖"
+                                : reserved?.double != nil ? "等待双击窗口后触发" : "松开时立即触发") {
+                    ActionPicker(action: reserved?.tap ?? binding.tap) { new in
                         model.updateBinding(for: key) { $0.tap = new }
                     }
+                    .disabled(reserved?.tap != nil)
                 }
                 RowDivider()
                 SettingsRow(icon: "clock", iconColor: .orange, title: "长按",
-                            subtitle: "超过 \(model.config.settings.holdMs) ms 触发") {
-                    ActionPicker(action: binding.hold) { new in
+                            subtitle: reserved?.hold != nil ? "独立全局动作 · \(reserved?.holdMs ?? model.config.settings.holdMs) ms"
+                                : "超过 \(model.config.settings.holdMs) ms 触发") {
+                    ActionPicker(action: reserved?.hold ?? binding.hold) { new in
                         model.updateBinding(for: key) { $0.hold = new }
                     }
+                    .disabled(reserved?.hold != nil)
                 }
                 RowDivider()
                 SettingsRow(icon: "ellipsis", iconColor: .purple, title: "双击",
                             subtitle: model.config.settings.doubleMs > 0
                                 ? "\(model.config.settings.doubleMs)ms 窗口内连按两次；配了双击后此键短按需等窗口确认"
                                 : "已关闭（在通用页开启）") {
-                    ActionPicker(action: binding.double) { new in
+                    ActionPicker(action: reserved?.double ?? binding.double) { new in
                         model.updateBinding(for: key) { $0.double = new }
                     }
+                    .disabled(model.config.globalShortcuts != nil)
                 }
             }
 
@@ -195,6 +202,7 @@ struct MappingPage: View {
             }
 
             // 分组 C：第二功能模式（底层仍沿用 layer 配置格式，UI 不暴露术语）
+            if model.config.globalShortcuts == nil {
             DisclosureGroup {
                 Text("功能模式类似遥控器的 Fn：按住 OK 使用快捷控制（切 App、桌面空间等）；单击 TV 进出 App 控制模式（批准、拒绝、切换 agent，屏幕角落有键位提示）。")
                     .font(.caption).foregroundStyle(.secondary).padding(.bottom, 4)
@@ -216,8 +224,11 @@ struct MappingPage: View {
             } label: {
                 Text("第二功能模式（高级）").font(.callout)
             }
+            }
 
-            Text("绑定组合键可点击「录制快捷键」。如果不确定当前状态，可再按一下 TV 键退出 App 控制模式。")
+            Text(model.config.globalShortcuts != nil
+                 ? "独立全局快捷键可在「通用」页查看。本页编辑未被保留的应用动作；返回长按退出临时模式。"
+                 : "绑定组合键可点击「录制快捷键」。如果不确定当前状态，可再按一下 TV 键退出 App 控制模式。")
                 .font(.footnote)
                 .foregroundStyle(.tertiary)
         }

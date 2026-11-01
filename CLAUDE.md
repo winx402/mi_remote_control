@@ -65,6 +65,15 @@ keycode 放行（保住系统 autorepeat 与零延迟），层/手势场景才�
 
 ### 基础态（层 0）的按键保护
 
+以下保护描述属于上游兼容路由。配置包含 `globalShortcuts` 时走新版独立路由：保留的
+全局手势不能被 App 覆盖，Home/Menu/TV 双击优先；应用方向键只有显式 `overrideBase`
+才替换原生箭头。独立路由不再使用旧的锁定层。返回长按 1.2 秒退出模式；菜单长按
+0.6 秒切鼠标，不能重新引入旧菜单 1.5 秒逃生的双重动作。
+
+电源菜单的测试只能使用假执行器，绝不能为了测试执行真实休眠或关机。语音短按的
+聚焦通过设备 HID 识别；VoicePressGate 在长按确认前不启动音频/识别。Codex AX 导航
+必须在排队前单飞合并并支持取消，不能每个滚动 tick 都排一个主线程扫描任务。
+
 DESIGN §3.1b 的「内容操作」原则：基础态方向=光标、返回=删除、OK=确认，profile 不得改写。
 实现在 `MappingEngine.fireTap` / `doubleAction` / `publishTapRoute`，**不是**普通的绑定查表——
 改这里前先读 `overlayDeclared` 的注释。

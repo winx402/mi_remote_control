@@ -236,6 +236,13 @@ enum SelfTest {
         expect(MappingEngine.tapRouteSelfCheck(), "M3 方向键分流快照/判定自测")
         expect(MappingEngine.backOverrideSelfCheck(), "Codex 基础返回覆盖及控制模式超时回归")
         expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
+        expect(IndependentGestures.selfCheck(), "独立全局手势单击/双击/长按互斥与取消")
+        expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
+        expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
+        expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
+        expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")
+        expect(VoicePressGate.selfCheck(), "语音短按不启动音频、长按预录音与结束清理")
+        expect(MouseMode.selfCheck(), "鼠标快慢档、滚动、锁定拖拽及闲置释放")
         expect(ActionRunner.selfCheck(), "ActionRunner 键表/修饰位自测")
         expect(WorkspaceActions.selfCheck(), "WorkspaceActions 工作区动作目录自测")
         expect(Set(KeyRemapper.table.map(\.key)).isSuperset(of: [.volUp, .volDown]),
@@ -319,16 +326,17 @@ enum SelfTest {
         }
 
         // M4-5. MouseMode 加速曲线纯函数
-        expect(MouseMode.speed(afterSeconds: 0) == 4.0, "MouseMode 初速 4px/tick")
-        expect(abs(MouseMode.speed(afterSeconds: 0.75) - 22.0) < 0.001, "MouseMode 中点 22px/tick")
-        expect(MouseMode.speed(afterSeconds: 1.5) == 40.0, "MouseMode 1.5s 满速 40px/tick")
-        expect(MouseMode.speed(afterSeconds: 10) == 40.0, "MouseMode 满速封顶")
-        expect(MouseMode.speed(afterSeconds: -1) == 4.0, "MouseMode 负时长取初速")
+        expect(MouseMode.speed(afterSeconds: 0) == 1.0, "MouseMode 慢速初速 1px/tick")
+        expect(abs(MouseMode.speed(afterSeconds: 0.4) - 2.0) < 0.001, "MouseMode 慢速中点 2px/tick")
+        expect(MouseMode.speed(afterSeconds: 0.8) == 3.0, "MouseMode 慢速封顶 3px/tick")
+        expect(MouseMode.speed(afterSeconds: 10, mode: .fast) == 12.0, "MouseMode 快速封顶 12px/tick")
+        expect(MouseMode.speed(afterSeconds: -1) == 1.0, "MouseMode 负时长取初速")
 
         // M4-6. MouseMode 方向向量（对角线/相消）
         do {
             let d1 = MouseMode.delta(dirs: [.up, .right], speed: 10)
-            expect(d1.dx == 10 && d1.dy == -10, "MouseMode 对角线向量")
+            expect(abs(hypot(d1.dx, d1.dy) - 10) < 0.001 && d1.dx > 0 && d1.dy < 0,
+                   "MouseMode 对角线速度归一化")
             let d2 = MouseMode.delta(dirs: [.left, .right], speed: 10)
             expect(d2.dx == 0 && d2.dy == 0, "MouseMode 反向相消")
         }

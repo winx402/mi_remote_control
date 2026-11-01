@@ -52,6 +52,14 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let center = OverlayCenter(model: model, services: services)
         overlayCenter = center
         center.onOpenSettings = { [weak self] in self?.showWindow() }
+        model.onMouseStatus = { [weak center] text in center?.updateMouseStatus(text: text) }
+        CodexNavigation.onUnavailable = { [weak center] name, message in
+            if name == "codex_previous_chat" || name == "codex_next_chat" {
+                center?.ensureOpen("codex_sessions")
+            } else {
+                CodexNavigation.showNotice(message)
+            }
+        }
         ActionRunner.onOverlay = { name in
             // ActionRunner 已切主线程投递
             MainActor.assumeIsolated { center.open(name) }
@@ -246,6 +254,22 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // UI 侧同步收掉全部浮层/HUD（角标随 onLayerChanged 归零自动消失）。
             km.engine.onEscapeHatch = { [weak self] in
                 MainActor.assumeIsolated { self?.overlayCenter?.escapeHatch() }
+            }
+            km.engine.onGlobalAction = { [weak self] action in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    switch action {
+                    case .overlay(let name): self.overlayCenter?.open(name)
+                    case .mouseMode:
+                        self.overlayCenter?.close()
+                        MouseMode.shared.toggle()
+                    case .openApp, .system("app_mru_back"):
+                        self.overlayCenter?.close()
+                        MouseMode.shared.deactivate()
+                        ActionRunner().run(action)
+                    default: ActionRunner().run(action)
+                    }
+                }
             }
             // model.degraded 只经 services.health.onChange（下方已接线）单一来源写入——
             // 它汇总 tap/映射/权限/蓝牙四个健康源；km.onSeizeState 在 AppServices.start()

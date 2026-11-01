@@ -1,10 +1,9 @@
 import AppKit
 import SwiftUI
 
-// M5 v2 浮层体系（DESIGN §3.1b「UI 模态路由」）：
-//   窗口选择器（菜单键单击）/ 系统功能菜单（菜单键长按）/ 按键教程（Home 长按）
-//   三个捕获式浮层：打开时 MappingEngine.setOverlayCapture 把遥控键喂给本中心；
-//   App 控制模式 HUD（TV 单击进层 2 时展示）是非捕获的纯状态提示。
+// 捕获式浮层打开时由 MappingEngine.setOverlayCapture 把列表按键喂给本中心；
+// 独立的全局手势由 MappingEngine 优先决断，避免面板和鼠标模式遮住系统入口。
+// App 控制模式 HUD 是非捕获的纯状态提示。
 // 面板全部用 NSPanel(.nonactivatingPanel)：不抢焦点、不打断前台 App；
 // 内容用系统材质与语义色，深浅色自动适配。
 
@@ -129,13 +128,40 @@ final class OverlayUIState: ObservableObject {
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexIndex = 0
+    @Published var powerMenu = PowerMenuState()
 }
 
 /// 窗口选择器的菜单键三段流程：全局跨桌面 → 当前 App → 关闭。
 enum WindowPickerFlow {
+    static let pageSize = 6
+
     /// true=当前 App，false=全局，nil=关闭。
     static func nextAfterMenu(currentAppOnly: Bool) -> Bool? {
         currentAppOnly ? nil : true
+    }
+
+    /// 与会话列表一致：上下逐项、左右一页，首尾夹住，不回绕。
+    static func movedIndex(_ index: Int, key: RemoteKey, count: Int) -> Int {
+        let delta: Int
+        switch key {
+        case .up: delta = -1
+        case .down: delta = 1
+        case .left: delta = -pageSize
+        case .right: delta = pageSize
+        default: delta = 0
+        }
+        return count > 0 ? min(max(index + delta, 0), count - 1) : 0
+    }
+
+    static func selfCheck() -> Bool {
+        movedIndex(0, key: .up, count: 10) == 0
+            && movedIndex(0, key: .down, count: 10) == 1
+            && movedIndex(1, key: .right, count: 10) == 7
+            && movedIndex(7, key: .left, count: 10) == 1
+            && movedIndex(8, key: .right, count: 10) == 9
+            && movedIndex(4, key: .down, count: 0) == 0
+            && nextAfterMenu(currentAppOnly: false) == true
+            && nextAfterMenu(currentAppOnly: true) == nil
     }
 }
 
@@ -150,6 +176,7 @@ final class OverlayCenter {
         case tutorial = "tutorial"
         case appWheel = "app_wheel"
         case codexSessions = "codex_sessions"
+        case computerPower = "computer_power"
     }
 
     private weak var model: AppModel?
@@ -175,6 +202,8 @@ final class OverlayCenter {
     private let codexSessions = CodexSessions()
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexIndex = 0
+    private var powerMenu = PowerMenuState()
+    private var powerGeneration: UInt64 = 0
     /// 窗口选择/系统菜单/教程不应无限占用遥控路由；10s 无操作自动收起。
     private static let overlayIdleSeconds: TimeInterval = 10
     private var overlayIdleTimer: Timer?
@@ -182,8 +211,10 @@ final class OverlayCenter {
     private var hudPanel: NSPanel?
     // 按键提示条（gamepad-ux B1：模式/浮层激活时屏底常驻）
     private var hintPanel: NSPanel?
+    private var hintVisibilityGeneration: UInt64 = 0
     /// profile 切换提示的自增令牌（见 noteProfileSwitch）。
     private var profileHintToken = 0
+    private var mouseStatusText: String?
     // 列表导航按住加速（gamepad-ux D3）：400ms 起连发，1.5s 后提速
     private var repeatKey: RemoteKey?
     private var repeatTimer: Timer?
@@ -207,6 +238,12 @@ final class OverlayCenter {
     /// 「打开 MiRemote 设置」可绑定动作（菜单栏优先形态的遥控入口，GUIAppDelegate 接线）。
     var onOpenSettings: (() -> Void)?
 
+    /// 异步失败回落可能重复到达；已有同一面板时保持打开，不执行 toggle。
+    func ensureOpen(_ name: String) {
+        guard active?.rawValue != name else { return }
+        open(name)
+    }
+
     func open(_ name: String) {
         if name == "open_settings" {
             close()
@@ -219,6 +256,11 @@ final class OverlayCenter {
         }
         if active == kind { close(); return }
         if active != nil { close() }
+        if kind == .windowPicker || kind == .systemMenu || kind == .computerPower {
+            MouseMode.shared.deactivate()
+            mouseStatusText = nil
+        }
+        profileHintToken &+= 1
         active = kind
         switch kind {
         case .windowPicker:
@@ -227,6 +269,10 @@ final class OverlayCenter {
             showPanel()
         case .systemMenu:
             menuIndex = 0
+            showPanel()
+        case .computerPower:
+            powerGeneration &+= 1
+            powerMenu.open()
             showPanel()
         case .tutorial:
             quickLook.setVisible(true,
@@ -267,6 +313,8 @@ final class OverlayCenter {
     func close() {
         guard active != nil else { return }
         active = nil
+        powerGeneration &+= 1
+        powerMenu.close()
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexIndex = 0
@@ -287,20 +335,14 @@ final class OverlayCenter {
             closing?.orderOut(nil)
         }
         quickLook.setVisible(false, bundleID: nil, appName: nil)
-        // 若仍处于某个层，提示条回落为该层键表；否则收起
-        if let model, model.activeLayer != 0 {
-            showHintBar(HintBarCatalog.hints(forLayer: model.activeLayer,
-                                             config: model.config,
-                                             profile: frontApp?.bundleIdentifier ?? "global"))
-        } else {
-            hideHintBar()
-        }
+        restoreContextHints()
     }
 
-    /// 逃生键（长按菜单 1.5s）触发：关闭所有浮层与 HUD。层态由引擎自清，
+    /// 全局返回长按 1.2s 触发：关闭所有浮层与 HUD。层态由引擎自清，
     /// 菜单栏/角标随 onLayerChanged 回到全局态。
     func escapeHatch() {
         close()
+        mouseStatusText = nil
         noteLayer(0)
     }
 
@@ -331,6 +373,7 @@ final class OverlayCenter {
         case .systemMenu:   handleMenuKey(event.key)
         case .appWheel:     handleWheelKey(event.key)
         case .codexSessions: handleCodexKey(event.key)
+        case .computerPower: handlePowerKey(event.key)
         case .tutorial:
             // 再按 Home / 返回 / OK 关闭；其余键吞掉（教程页不该有副作用）。
             if event.key == .home || event.key == .back || event.key == .ok { close() }
@@ -370,20 +413,17 @@ final class OverlayCenter {
         repeatKey = nil
     }
 
-    private func pickerStep(_ delta: Int) {
+    private func pickerStep(_ key: RemoteKey) {
         guard !pickerEntries.isEmpty else { return }
-        pickerIndex = (pickerIndex + delta + pickerEntries.count) % pickerEntries.count
+        pickerIndex = WindowPickerFlow.movedIndex(pickerIndex, key: key, count: pickerEntries.count)
         sync()
     }
 
     private func handlePickerKey(_ key: RemoteKey) {
         switch key {
-        case .left:
-            pickerStep(-1)
-            startRepeat(key) { [weak self] in self?.pickerStep(-1) }
-        case .right:
-            pickerStep(1)
-            startRepeat(key) { [weak self] in self?.pickerStep(1) }
+        case .up, .down, .left, .right:
+            pickerStep(key)
+            startRepeat(key) { [weak self] in self?.pickerStep(key) }
         case .menu:
             // 菜单键固定三段：第一下已打开“全局跨桌面”；
             // 第二下切“当前 App”；第三下关闭。
@@ -394,11 +434,6 @@ final class OverlayCenter {
             pickerCurrentAppOnly = next
             reloadPickerEntries()
             sync()
-        case .up, .down:
-            // 上下保留为快速往返查看两个范围，不影响菜单键三段语义。
-            pickerCurrentAppOnly.toggle()
-            reloadPickerEntries()
-            sync()
         case .ok:
             if pickerEntries.indices.contains(pickerIndex) {
                 let target = pickerEntries[pickerIndex].window
@@ -407,7 +442,7 @@ final class OverlayCenter {
             } else {
                 close()
             }
-        case .back, .home:
+        case .back, .home, .tv:
             close()
         default:
             break
@@ -501,6 +536,9 @@ final class OverlayCenter {
 
     private func restartOverlayIdleTimer() {
         overlayIdleTimer?.invalidate()
+        overlayIdleTimer = nil
+        // 系统可能正在等待 Automation 授权或保存文件，结果到达前保留反馈位置。
+        if active == .computerPower, powerMenu.isExecuting { return }
         // 会话列表需要阅读标题；给它比图标菜单更长的空闲时间。
         let idleSeconds = active == .codexSessions ? 60 : Self.overlayIdleSeconds
         overlayIdleTimer = Timer.scheduledTimer(withTimeInterval: idleSeconds,
@@ -513,6 +551,32 @@ final class OverlayCenter {
         pickerEntries = WindowSwitcher.pickerEntries(currentAppOnly: pickerCurrentAppOnly,
                                                      frontPid: frontApp?.processIdentifier)
         pickerIndex = 0
+    }
+
+    // MARK: 电脑电源列表
+
+    private func handlePowerKey(_ key: RemoteKey) {
+        switch powerMenu.handle(key) {
+        case .none:
+            sync()
+        case .dismiss:
+            close()
+        case .execute(let request):
+            stopRepeat()
+            restartOverlayIdleTimer()
+            sync(animated: false)
+            let token = powerGeneration
+            ComputerPower.execute(request) { [weak self] result in
+                guard let self, self.active == .computerPower,
+                      self.powerGeneration == token else { return }
+                if self.powerMenu.complete(result) == .dismiss {
+                    self.close()
+                } else {
+                    self.restartOverlayIdleTimer()
+                    self.sync(animated: false)
+                }
+            }
+        }
     }
 
     // MARK: Codex 本地会话列表
@@ -568,6 +632,7 @@ final class OverlayCenter {
             uiState.wheelIndex = wheelIndex
             uiState.codexSnapshot = codexSnapshot
             uiState.codexIndex = codexIndex
+            uiState.powerMenu = powerMenu
         }
         if animated {
             withAnimation(Motion.select) { apply() }
@@ -616,7 +681,7 @@ final class OverlayCenter {
     /// 闪一条提示条。基础态平时不常驻提示条，故到点自动收起。
     /// 浮层打开或已在功能层时不打扰——那两种状态的提示条另有主人。
     func noteProfileSwitch(_ bundleID: String?) {
-        guard active == nil, model?.activeLayer == 0 else { return }
+        guard active == nil, mouseStatusText == nil, model?.activeLayer == 0 else { return }
         profileHintToken &+= 1
         let token = profileHintToken
         guard let model, let bundleID else { hideHintBar(); return }
@@ -627,7 +692,8 @@ final class OverlayCenter {
         }
         showHintBar(hints)
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Self.profileHintMs)) { [weak self] in
-            guard let self, self.profileHintToken == token, self.active == nil else { return }
+            guard let self, self.profileHintToken == token, self.active == nil,
+                  self.mouseStatusText == nil else { return }
             self.hideHintBar()
         }
     }
@@ -639,7 +705,9 @@ final class OverlayCenter {
     func noteLayer(_ layer: Int) {
         // 按键提示条：层激活时显示该层键表（浮层打开期间由浮层键表接管，不在此覆盖）
         if active == nil {
-            if layer != 0, let model {
+            if let mouseStatusText {
+                showHintBar(HintBarCatalog.hintsForMouse(status: mouseStatusText))
+            } else if layer != 0, let model {
                 showHintBar(HintBarCatalog.hints(forLayer: layer, config: model.config,
                                                  profile: frontApp?.bundleIdentifier ?? "global"))
             } else {
@@ -696,11 +764,35 @@ final class OverlayCenter {
 
     // MARK: 按键提示条面板（屏底半透明横条，可点穿；通用页可关，默认开）
 
+    /// AppModel 状态轮询入口；浮层优先，鼠标模式退出后恢复所在层的提示。
+    func updateMouseStatus(text: String?) {
+        let normalized = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let next = normalized?.isEmpty == false ? normalized : nil
+        guard mouseStatusText != next else { return }
+        mouseStatusText = next
+        profileHintToken &+= 1
+        guard active == nil else { return }
+        if next != nil { hudPanel?.orderOut(nil) }
+        restoreContextHints()
+    }
+
+    private func restoreContextHints() {
+        if let mouseStatusText {
+            showHintBar(HintBarCatalog.hintsForMouse(status: mouseStatusText))
+        } else if let model, model.activeLayer != 0 {
+            showHintBar(HintBarCatalog.hints(forLayer: model.activeLayer, config: model.config,
+                                             profile: frontApp?.bundleIdentifier ?? "global"))
+        } else {
+            hideHintBar()
+        }
+    }
+
     private func showHintBar(_ items: [HintBarCatalog.Hint]) {
         guard model?.showHintBar != false, !items.isEmpty else {
             hideHintBar()
             return
         }
+        hintVisibilityGeneration &+= 1
         let host = NSHostingView(rootView: HintBarView(items: items))
         host.frame.size = host.fittingSize
         if hintPanel == nil {
@@ -733,17 +825,27 @@ final class OverlayCenter {
             }
         } else {
             hintPanel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = Motion.fadeInDuration
+                hintPanel.animator().alphaValue = 1
+            }
         }
     }
 
     private func hideHintBar() {
         guard let hintPanel, hintPanel.isVisible else { return }
+        hintVisibilityGeneration &+= 1
+        let token = hintVisibilityGeneration
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = Motion.fadeOutDuration
             hintPanel.animator().alphaValue = 0
-        }, completionHandler: {
-            hintPanel.orderOut(nil)
-            hintPanel.alphaValue = 1
+        }, completionHandler: { [weak self] in
+            // 全局入口可立即切换面板，旧淡出回调不能收掉新面板的提示。
+            Task { @MainActor in
+                guard self?.hintVisibilityGeneration == token else { return }
+                hintPanel.orderOut(nil)
+                hintPanel.alphaValue = 1
+            }
         })
     }
 
@@ -762,9 +864,10 @@ enum HintBarCatalog {
     static func hints(for kind: OverlayCenter.Kind) -> [Hint] {
         switch kind {
         case .windowPicker:
-            return [Hint(keys: [.left, .right], text: "选窗（按住加速）"),
-                    Hint(keys: [.menu], text: "全局 → 当前 → 关闭"),
-                    Hint(keys: [.ok], text: "前往"),
+            return [Hint(keys: [.up, .down], text: "选窗口（按住加速）"),
+                    Hint(keys: [.left, .right], text: "翻页"),
+                    Hint(keys: [.menu], text: "切换范围"),
+                    Hint(keys: [.ok], text: "激活"),
                     Hint(keys: [.back], text: "关闭")]
         case .systemMenu:
             return [Hint(keys: [.up, .down, .left, .right], text: "选择"),
@@ -781,13 +884,44 @@ enum HintBarCatalog {
                     Hint(keys: [.left, .right], text: "翻页"),
                     Hint(keys: [.ok], text: "打开"),
                     Hint(keys: [.back, .home, .tv], text: "取消")]
+        case .computerPower:
+            return [Hint(keys: [.up, .down], text: "选择"),
+                    Hint(keys: [.ok], text: "确认"),
+                    Hint(keys: [.back, .power], text: "取消")]
         }
+    }
+
+    static func hintsForGlobal() -> [Hint] {
+        [Hint(keys: [.home], text: "双击窗口列表"),
+         Hint(keys: [.menu], text: "双击系统面板 · 长按鼠标"),
+         Hint(keys: [.tv], text: "单击 Codex · 双击上个 App"),
+         Hint(keys: [.power], text: "电脑电源"),
+         Hint(keys: [.back], text: "长按 1.2 秒退出模式")]
+    }
+
+    static func hintsForCodex() -> [Hint] {
+        [Hint(keys: [.up, .down], text: "滚动"),
+         Hint(keys: [.left, .right], text: "上 / 下会话"),
+         Hint(keys: [.home], text: "单击列表 · 长按新建"),
+         Hint(keys: [.menu], text: "单击命令 · 长按鼠标"),
+         Hint(keys: [.tv], text: "长按模型"),
+         Hint(keys: [.voice], text: "单击聚焦"),
+         Hint(keys: [.back], text: "长按 1.2 秒退出模式")]
+    }
+
+    static func hintsForMouse(status: String = "鼠标模式") -> [Hint] {
+        [Hint(keys: [], text: status),
+         Hint(keys: [.up, .down, .left, .right], text: "移动"),
+         Hint(keys: [.ok], text: "左键"),
+         Hint(keys: [.menu], text: "单击右键 · 长按退出"),
+         Hint(keys: [.back], text: "退出鼠标")]
     }
 
     /// 基础态的 per-app 覆盖提示：切到该 App 时闪一下，告诉用户这颗键在这里变了。
     /// 只列 profile 显式声明且基础态确实生效的槽位；Back 必须额外 opt-in，
     /// 与 MappingEngine 的保护保持一致，避免提示条许诺引擎不认的绑定。
     static func hints(forBaseProfile bundleID: String, config: MappingConfig) -> [Hint] {
+        if bundleID == "com.openai.codex" { return hintsForCodex() }
         var hints: [Hint] = []
         if let action = config.profiles[bundleID]?["ok"]?.tap {
             hints.append(Hint(keys: [.ok], text: ActionSummary.describe(action)))
@@ -897,6 +1031,8 @@ private struct OverlayRootView: View {
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
+                case .computerPower:
+                    PowerMenuView(state: state.powerMenu)
                 default:
                     EmptyView()
                 }
@@ -908,7 +1044,7 @@ private struct OverlayRootView: View {
     }
 }
 
-/// 窗口选择器：横向卡片（App 图标 + 窗口标题），系统蓝描边高亮所选。
+/// 窗口与会话使用相同的纵向列表语义，避免上下键在两种面板里承担不同职责。
 private struct WindowPickerView: View {
     let entries: [WindowSwitcher.PickerEntry]
     let selected: Int
@@ -916,80 +1052,74 @@ private struct WindowPickerView: View {
     let frontAppName: String?
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Image(systemName: "macwindow.on.rectangle")
-                Text(currentAppOnly ? "窗口 · \(frontAppName ?? "当前 App")"
-                                    : "窗口 · 所有 App · 全部桌面")
-                    .font(.headline)
+                Text("窗口列表").font(.headline)
                 Spacer()
+                if !entries.isEmpty {
+                    Text("\(selected + 1) / \(entries.count)")
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                }
             }
+            Text(currentAppOnly ? "当前 App · \(frontAppName ?? "当前应用")"
+                                : "所有 App · 全部桌面")
+                .font(.callout).foregroundStyle(.secondary).lineLimit(1)
             if entries.isEmpty {
                 Text(currentAppOnly ? "当前 App 没有可见窗口，按菜单键查看所有 App"
                                     : "没有可见窗口")
                     .font(.callout).foregroundStyle(.secondary)
-                    .padding(.vertical, 30)
+                    .frame(maxWidth: .infinity).frame(height: 150)
             } else {
                 ScrollViewReader { proxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
-                            ForEach(Array(entries.enumerated()), id: \.offset) { index, entry in
-                                card(entry, isSelected: index == selected).id(index)
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(spacing: 4) {
+                            ForEach(Array(entries.enumerated()), id: \.element.window.windowID) { index, entry in
+                                row(entry, selected: index == selected).id(entry.window.windowID)
                             }
                         }
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, 4).padding(.vertical, 5)
                     }
-                    .onAppear { proxy.scrollTo(selected, anchor: .center) }
-                    .onChange(of: selected) { _, value in
-                        withAnimation(Motion.select) {
-                            proxy.scrollTo(value, anchor: .center)
-                        }
-                    }
-                    // 两侧渐隐：截断的卡片以淡出收边，暗示可继续滚动
-                    .mask(
-                        HStack(spacing: 0) {
-                            LinearGradient(colors: [.clear, .black],
-                                           startPoint: .leading, endPoint: .trailing)
-                                .frame(width: 64)
-                            Rectangle()
-                            LinearGradient(colors: [.black, .clear],
-                                           startPoint: .leading, endPoint: .trailing)
-                                .frame(width: 64)
-                        }
-                    )
+                    .frame(height: 360)
+                    .onAppear { scroll(proxy) }
+                    .onChange(of: selected) { _, _ in scroll(proxy) }
+                    .onChange(of: entries.map(\.window.windowID)) { _, _ in scroll(proxy) }
                 }
             }
         }
         .padding(Spacing.sheetPadding)
-        .frame(maxWidth: 1000)
+        .frame(width: 660)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Radius.overlay))
         .overlay(RoundedRectangle(cornerRadius: Radius.overlay)
             .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
         .shadow(radius: 24, y: 8)
     }
 
-    private func card(_ entry: WindowSwitcher.PickerEntry, isSelected: Bool) -> some View {
-        VStack(spacing: 8) {
-            appIcon(entry.bundleID)
-                .frame(width: 60, height: 60)
-            Text(entry.window.title.isEmpty ? entry.appName : entry.window.title)
-                .font(.callout)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .frame(width: 156)
-            Text(entry.appName)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+    private func scroll(_ proxy: ScrollViewProxy) {
+        guard entries.indices.contains(selected) else { return }
+        withAnimation(Motion.select) {
+            proxy.scrollTo(entries[selected].window.windowID, anchor: .center)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(isSelected ? 1 : 0.55),
-                    in: RoundedRectangle(cornerRadius: Radius.hud))
-        .overlay(RoundedRectangle(cornerRadius: Radius.hud)
-            .stroke(isSelected ? Color.accentColor : .clear, lineWidth: 2.5))
-        .shadow(color: isSelected ? Color.accentColor.opacity(0.5) : .clear, radius: 6)
-        .scaleEffect(isSelected ? 1.06 : 1)
+    }
+
+    private func row(_ entry: WindowSwitcher.PickerEntry, selected: Bool) -> some View {
+        HStack(spacing: 12) {
+            appIcon(entry.bundleID).frame(width: 32, height: 32)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.window.title.isEmpty ? entry.appName : entry.window.title)
+                    .font(.body.weight(selected ? .semibold : .regular)).lineLimit(1)
+                Text(entry.appName).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .frame(minHeight: 50)
+        .background(selected ? Color.accentColor.opacity(0.14) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: Radius.small))
+        .overlay(RoundedRectangle(cornerRadius: Radius.small)
+            .stroke(selected ? Color.accentColor : Color.clear, lineWidth: 2))
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     @ViewBuilder private func appIcon(_ bundleID: String?) -> some View {

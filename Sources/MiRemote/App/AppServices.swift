@@ -328,6 +328,12 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var sessionActive = false
     private var sessionSwitchedMic = false
     private var sessionDoubao = false
+    private var pressGate = VoicePressGate()
+    private var _minimumHoldMs = 0
+    var minimumHoldMs: Int {
+        get { cfgLock.lock(); defer { cfgLock.unlock() }; return _minimumHoldMs }
+        set { cfgLock.lock(); _minimumHoldMs = newValue; cfgLock.unlock() }
+    }
 
     /// GUI 状态反馈钩子（ATVV 队列回调）。
     var onConnection: ((Bool, String?) -> Void)?
@@ -370,6 +376,12 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     func atvvVoiceStarted() {
+        let delay = minimumHoldMs
+        pressGate.begin(nowNs: DispatchTime.now().uptimeNanoseconds, holdMs: delay,
+                        enabled: delay == 0 || switchInput || doubao)
+    }
+
+    private func beginVoiceSession() {
         log("语音开始")
         onVoiceActive?(true)
         restoreWork?.cancel()
@@ -401,6 +413,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var triggered = false
 
     func atvvVoiceStopped() {
+        guard pressGate.end() else { return }
         log("语音结束")
         onVoiceActive?(false)
         pendingMicSwitch = false
@@ -429,6 +442,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 服务停止兜底：语音会话仍在进行时按锁存状态强制收尾
     ///（松开触发键、还原默认麦克风），防止 stop 后修饰键粘住/麦克风停在 BlackHole。
     func forceEndSessionIfActive() {
+        _ = pressGate.end()
         let hadPendingMicRestore = restoreWork != nil
         restoreWork?.cancel()
         restoreWork = nil
@@ -456,6 +470,18 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     func atvvAudioFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
+        guard let delivery = pressGate.receive(.init(data: frame, sync: sync),
+                                              nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
+        switch delivery {
+        case .begin(let frames):
+            beginVoiceSession()
+            for frame in frames { processVoiceFrame(frame.data, sync: frame.sync) }
+        case .frames(let frames):
+            for frame in frames { processVoiceFrame(frame.data, sync: frame.sync) }
+        }
+    }
+
+    private func processVoiceFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
         if pendingMicSwitch {
             pendingMicSwitch = false
             let engaged = DefaultInput.engage(deviceName: micDeviceName)
@@ -618,10 +644,13 @@ private final class VoiceRuleStore: @unchecked Sendable {
 /// 其余键由 hidutil 中转 + CGEventTap 处理，这里放行会造成双触发。
 final class IOHIDOnlyFilter: HIDEngineDelegate {
     let target: KeyMapperApp
-    let allowed: Set<RemoteKey> = [.back]
+    let allowed: Set<RemoteKey>
     /// 所有原始按键事件（含被过滤不进引擎的），GUI「识别按键」学习模式用。
     var onRawButton: ((ButtonEvent) -> Void)?
-    init(_ target: KeyMapperApp) { self.target = target }
+    init(_ target: KeyMapperApp, voiceKey: Bool = false) {
+        self.target = target
+        self.allowed = voiceKey ? [.back, .voice] : [.back]
+    }
     func hidLog(_ message: String) { target.hidLog(message) }
     func hidButton(_ event: ButtonEvent) {
         target.hidLog("IOHID读到 \(event.key.rawValue) \(event.isDown ? "↓" : "↑")")
@@ -713,6 +742,8 @@ final class AppServices {
                                   doubao: options.doubao,
                                   micDeviceName: settings.voiceOutputDevice ?? "BlackHole",
                                   extraSink: options.levelSink)
+        voiceApp.minimumHoldMs = options.keys && preloaded?.globalShortcuts != nil
+            ? preloaded?.settings.holdMs ?? 600 : 0
         bridge = ATVVBridge(delegate: voiceApp)
         health.log = { log("健康 \($0)") }
         voiceApp.onConnection = { [weak health] connected, _ in
@@ -750,7 +781,7 @@ final class AppServices {
             ActionRunner.onAppMRUBack = { [weak km] in km?.activateMRUBack() }
             let tap = TapEngine(delegate: km)
             tap.router = km.engine  // 方向键三态分流的快照来源
-            let filter = IOHIDOnlyFilter(km)
+            let filter = IOHIDOnlyFilter(km, voiceKey: config.globalShortcuts != nil)
             let hid = HIDEngine(delegate: filter)
             keyMapper = km
             tapEngine = tap
@@ -806,6 +837,8 @@ final class AppServices {
     func stop() {
         guard started else { return }
         started = false
+        keyMapper?.engine.setSuspended(true)
+        MouseMode.shared.deactivate()
         eventListener.stop()
         health.stop()
         // 先同步排空 ATVV 队列，再从生命周期线程收尾 VoiceBridgeApp；否则首帧回调
@@ -828,6 +861,8 @@ final class AppServices {
     /// 热加载映射配置（UI 写回 config.json 后调用）。
     /// settings 里的 VID/PID、声卡名改动需重启进程生效（引擎构建期绑定）；终端白名单即刻生效。
     func applyConfig(_ config: MappingConfig) {
+        voiceApp.minimumHoldMs = options.keys && config.globalShortcuts != nil
+            ? config.settings.holdMs : 0
         FocusInput.extraTerminalBundles = Set(config.settings.terminalApps ?? [])
         voiceRuleStore.update(config: config)
         keyMapper?.engine.setConfig(config)

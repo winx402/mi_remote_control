@@ -93,6 +93,9 @@ enum ActionSummary {
 
     private static let baseSystemNames: [(value: String, display: String)] = [
         ("app_mru_back", "回到上一个 App"),
+        ("remote_reset", "退出所有遥控模式"),
+        ("codex_scroll_up", "Codex 向上滚动回复"), ("codex_scroll_down", "Codex 向下滚动回复"),
+        ("codex_previous_chat", "Codex 上一个会话"), ("codex_next_chat", "Codex 下一个会话"),
         ("volume_up", "音量 ＋"), ("volume_down", "音量 －"), ("mute", "静音"),
         ("play_pause", "播放/暂停"), ("next", "下一曲"), ("prev", "上一曲"),
         ("mission_control", "调度中心"), ("launchpad", "启动台"), ("spotlight", "Spotlight"),
@@ -164,6 +167,7 @@ enum ActionSummary {
         ("app_wheel", "App 轮盘（最近使用）"),
         ("open_settings", "打开 MiRemote 设置"),
         ("codex_sessions", "Codex 会话列表"),
+        ("computer_power", "电脑电源菜单"),
     ]
     static func overlayDisplay(_ v: String) -> String {
         overlayNames.first(where: { $0.value == v })?.display ?? "浮层 · \(v)"
@@ -231,6 +235,8 @@ final class AppModel: ObservableObject {
     @Published var voiceActive = false
     @Published var batteryPercent: Int?
     @Published var mouseModeActive = false
+    @Published var mouseStatus: String?
+    var onMouseStatus: ((String?) -> Void)?
     @Published var degraded = false          // tap 失效等故障态
     @Published var levelBars: [Float] = Array(repeating: 0, count: 12)
     /// 暂停遥控（镜像 services.isRemoteSuspended，供菜单栏面板响应式显示）
@@ -293,6 +299,11 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 let active = MouseMode.shared.isActive
                 if active != self.mouseModeActive { self.mouseModeActive = active }
+                let status = MouseMode.shared.statusText
+                if status != self.mouseStatus {
+                    self.mouseStatus = status
+                    self.onMouseStatus?(status)
+                }
             }
         }
     }

@@ -110,7 +110,7 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
         // M4 高级动作
         case .windowCycle(let scope):       WindowSwitcher.cycle(scope: scope)
         case .tabJump(let dir, let index):  tabJump(dir: dir, index: index)
-        case .focusInput:                   FocusInput.perform()
+        case .focusInput:                   DispatchQueue.main.async { FocusInput.perform() }
         case .mouseMode:                    MouseMode.shared.toggle()
         case .macro(let steps):             MacroEngine.shared.run(steps, runner: self)
         case .voice, .layerMomentary, .layerToggle, .none:
@@ -145,6 +145,7 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
 
     // MARK: - system
     private func system(_ name: String) {
+        if CodexNavigation.perform(name) { return }
         switch name {
         case "volume_up":   aux(NX_KEYTYPE_SOUND_UP)
         case "volume_down": aux(NX_KEYTYPE_SOUND_DOWN)

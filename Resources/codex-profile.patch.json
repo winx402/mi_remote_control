@@ -1,43 +1,194 @@
 {
+  "settings": {
+    "holdMs": 600,
+    "doubleMs": 250
+  },
+  "globalShortcuts": {
+    "power": {
+      "tap": {
+        "type": "overlay",
+        "value": "computer_power"
+      },
+      "hold": {
+        "type": "none"
+      }
+    },
+    "home": {
+      "double": {
+        "type": "overlay",
+        "value": "window_picker"
+      }
+    },
+    "menu": {
+      "double": {
+        "type": "overlay",
+        "value": "system_menu"
+      },
+      "hold": {
+        "type": "mouse_mode"
+      }
+    },
+    "tv": {
+      "tap": {
+        "type": "open_app",
+        "value": "com.openai.codex"
+      },
+      "double": {
+        "type": "system",
+        "value": "app_mru_back"
+      }
+    },
+    "back": {
+      "hold": {
+        "type": "system",
+        "value": "remote_reset"
+      },
+      "holdMs": 1200
+    },
+    "volUp": {
+      "tap": {
+        "type": "system",
+        "value": "volume_up"
+      }
+    },
+    "volDown": {
+      "tap": {
+        "type": "system",
+        "value": "volume_down"
+      }
+    }
+  },
   "profiles": {
     "global": {
-      "tv": { "tap": { "type": "open_app", "value": "com.openai.codex" } }
+      "power": {
+        "tap": {
+          "type": "none"
+        },
+        "hold": {
+          "type": "none"
+        }
+      },
+      "home": {
+        "tap": {
+          "type": "none"
+        },
+        "hold": {
+          "type": "none"
+        }
+      },
+      "menu": {
+        "tap": {
+          "type": "none"
+        },
+        "hold": {
+          "type": "none"
+        }
+      },
+      "tv": {
+        "tap": {
+          "type": "none"
+        },
+        "hold": {
+          "type": "none"
+        }
+      },
+      "voice": {
+        "tap": {
+          "type": "voice"
+        },
+        "hold": {
+          "type": "voice"
+        }
+      }
     },
     "com.openai.codex": {
-      "tv": {
-        "tap": { "type": "layer_toggle", "value": 2 },
-        "double": { "type": "key_stroke", "key": "m", "mods": ["left_ctrl", "left_shift"] },
-        "layers": { "2": { "type": "layer_toggle", "value": 2 } }
+      "up": {
+        "overrideBase": true,
+        "tap": {
+          "type": "system",
+          "value": "codex_scroll_up"
+        }
+      },
+      "down": {
+        "overrideBase": true,
+        "tap": {
+          "type": "system",
+          "value": "codex_scroll_down"
+        }
       },
       "left": {
-        "layers": { "2": { "type": "key_stroke", "key": "left_arrow", "mods": ["left_cmd", "left_option"] } }
+        "overrideBase": true,
+        "tap": {
+          "type": "system",
+          "value": "codex_previous_chat"
+        }
       },
       "right": {
-        "layers": { "2": { "type": "key_stroke", "key": "right_arrow", "mods": ["left_cmd", "left_option"] } }
+        "overrideBase": true,
+        "tap": {
+          "type": "system",
+          "value": "codex_next_chat"
+        }
       },
-      "up": { "layers": { "2": { "type": "key_stroke", "key": "page_up" } } },
-      "down": { "layers": { "2": { "type": "key_stroke", "key": "page_down" } } },
       "ok": {
-        "tap": { "type": "key_stroke", "key": "return" },
-        "layers": { "2": { "type": "key_stroke", "key": "return" } }
+        "tap": {
+          "type": "key_stroke",
+          "key": "return",
+          "mods": []
+        },
+        "hold": {
+          "type": "none"
+        }
       },
       "back": {
         "overrideBase": true,
-        "tap": { "type": "key_stroke", "key": "escape", "mods": [] },
-        "hold": { "type": "key_stroke", "key": "escape", "mods": [] },
-        "layers": { "2": { "type": "key_stroke", "key": "escape", "mods": [] } }
-      },
-      "menu": {
-        "tap": { "type": "key_stroke", "key": "p", "mods": ["left_cmd", "left_shift"] },
-        "layers": { "2": { "type": "key_stroke", "key": "p", "mods": ["left_cmd", "left_shift"] } }
+        "tap": {
+          "type": "key_stroke",
+          "key": "escape",
+          "mods": []
+        }
       },
       "home": {
-        "tap": { "type": "overlay", "value": "codex_sessions" },
-        "hold": { "type": "key_stroke", "key": "n", "mods": ["left_cmd"] },
-        "layers": { "2": { "type": "overlay", "value": "codex_sessions" } }
+        "tap": {
+          "type": "overlay",
+          "value": "codex_sessions"
+        },
+        "hold": {
+          "type": "key_stroke",
+          "key": "n",
+          "mods": [
+            "left_cmd"
+          ]
+        }
       },
-      "volUp": { "layers": { "2": { "type": "system", "value": "volume_up" } } },
-      "volDown": { "layers": { "2": { "type": "system", "value": "volume_down" } } }
+      "menu": {
+        "tap": {
+          "type": "key_stroke",
+          "key": "p",
+          "mods": [
+            "left_cmd",
+            "left_shift"
+          ]
+        }
+      },
+      "tv": {
+        "hold": {
+          "type": "key_stroke",
+          "key": "m",
+          "mods": [
+            "left_ctrl",
+            "left_shift"
+          ]
+        }
+      },
+      "voice": {
+        "tap": {
+          "type": "focus_input"
+        },
+        "hold": {
+          "type": "voice"
+        }
+      }
     }
   }
 }

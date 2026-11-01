@@ -13,6 +13,18 @@ struct GeneralPage: View {
             VStack(alignment: .leading, spacing: Spacing.section) {
                 PageHeader(title: "通用", subtitle: "调整触发阈值、开机行为与提示反馈。")
 
+                if let shortcuts = model.config.globalShortcuts {
+                    SettingsGroup(title: "独立全局快捷键") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("以下手势在所有应用中优先生效，应用专用配置不能覆盖。")
+                                .font(.caption).foregroundStyle(.secondary)
+                            ForEach(globalShortcutLines(shortcuts), id: \.self) { line in
+                                Text(line).font(.callout)
+                            }
+                        }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
                 SettingsGroup(title: "启动与显示") {
                     SettingsRow(icon: "power.circle", title: "登录时启动", subtitle: nil) {
                         Toggle("", isOn: $loginItemOn)
@@ -160,5 +172,16 @@ struct GeneralPage: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .onAppear { loginItemOn = model.loginItems.isEnabled }
+    }
+
+    private func globalShortcutLines(_ shortcuts: [String: KeyBinding]) -> [String] {
+        [RemoteKey.power, .home, .menu, .tv, .back, .volUp, .volDown].flatMap { key -> [String] in
+            guard let binding = shortcuts[key.rawValue] else { return [] }
+            let slots: [(String, Action?)] = [("单击", binding.tap), ("双击", binding.double), ("长按", binding.hold)]
+            return slots.compactMap { title, action in
+                guard let action, action != .none else { return nil }
+                return "\(KeyDisplay.name(key)) · \(title)：\(ActionSummary.describe(action))"
+            }
+        }
     }
 }

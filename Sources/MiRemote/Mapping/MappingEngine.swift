@@ -120,6 +120,20 @@ final class MappingEngine: @unchecked Sendable {
     /// UI 侧接线钩子（主线程回调）：逃生触发时关闭所有浮层/HUD（OverlayCenter 全收）。
     /// 引擎自身已清捕获态与层，未接线（CLI 模式）也能自愈；接线期设置，之后只读。
     var onEscapeHatch: (() -> Void)?
+    /// 保留全局动作在主线程执行，GUI 先收起当前临时面板再切换目标。
+    var onGlobalAction: ((Action) -> Void)?
+
+    private var independent: Bool { config.globalShortcuts != nil }
+    private var contextGeneration = 0
+    private var gestureContexts: [RemoteKey: (Int, Bool)] = [:]
+    private var repeatTokens: [RemoteKey: Int] = [:]
+    private var independentHeld: Set<RemoteKey> = []
+    private var scrollRepeatingKeys: Set<RemoteKey> = []
+    private lazy var independentGestures: IndependentGestures = {
+        let interpreter = IndependentGestures(schedule: scheduleAfter)
+        interpreter.onGesture = { [weak self] key, gesture in self?.independentGesture(key, gesture) }
+        return interpreter
+    }()
 
     // MARK: - 暂停遥控（suspend）
 
@@ -174,7 +188,10 @@ final class MappingEngine: @unchecked Sendable {
         // 基础状态是“文字输入态”：Profile 不能接管四方向的短按语义。
         // 只有第二功能/导航模式（layer != 0），或用户明确按住 OK 组成手势时，
         // 方向键才进入映射引擎。直接改写能保留系统原生 autorepeat 与零延迟。
-        let native: Set<RemoteKey> = [.up, .down, .left, .right]
+        let directions: Set<RemoteKey> = [.up, .down, .left, .right]
+        let native = Set(directions.filter { key in
+            !independent || overlayDeclared(key)?.overrideBase != true
+        })
         let route = TapRoute(effectiveLayer: effectiveLayer,
                              okDown: okPhysicallyDown,
                              nativeDirections: native,
@@ -247,7 +264,10 @@ final class MappingEngine: @unchecked Sendable {
     /// 复位全部输入运行态：作废在途定时器、清按键相位/瞬时层/OK 物理态，重发布快照。
     /// 设备移除、系统睡眠、tap 失效恢复等可能丢 keyUp 的场景调用，防止卡键/卡层。
     func resetInputState(reason: String) {
-        dispatch { [weak self] in self?._resetInputState(reason) }
+        dispatch { [weak self] in
+            MouseMode.shared.deactivate()
+            self?._resetInputState(reason)
+        }
     }
 
     /// M5 v2 浮层键捕获：handler 非 nil 时所有遥控键改喂浮层（主线程回调），
@@ -263,7 +283,20 @@ final class MappingEngine: @unchecked Sendable {
     // MARK: - 对外 API 实现（均在执行上下文内）
 
     private func _setConfig(_ config: MappingConfig) {
+        CodexNavigation.cancelScrolling()
+        independentGestures.reset()
+        gestureContexts.removeAll()
+        independentHeld.removeAll()
+        scrollRepeatingKeys.removeAll()
+        contextGeneration &+= 1
         self.config = config
+        if config.globalShortcuts != nil {
+            lockedLayer = 0
+            momentaryLayer = nil
+            momentaryOwner = nil
+            invalidateLockedLayerIdleTimer()
+            recomputeLayer()
+        }
         self.globalProfile = config.profiles["global"] ?? [:]
         // overlay 随新配置重解析（同一 bundle 的绑定可能已改）。
         if let b = activeBundleID, let p = config.profiles[b] {
@@ -276,6 +309,8 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _setActiveProfile(_ bundleID: String?) {
+        CodexNavigation.cancelScrolling()
+        contextGeneration &+= 1
         activeBundleID = bundleID
         if let b = bundleID, let p = config.profiles[b] {
             activeOverlay = p
@@ -288,6 +323,13 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _resetInputState(_ reason: String) {
+        CodexNavigation.cancelScrolling()
+        independentGestures.reset()
+        gestureContexts.removeAll()
+        contextGeneration &+= 1
+        for key in repeatTokens.keys { repeatTokens[key, default: 0] &+= 1 }
+        independentHeld.removeAll()
+        scrollRepeatingKeys.removeAll()
         // 保留 states 条目、只 bump seq：直接清空会让新按压的 seq 从 0 重计，
         // 可能与在途旧定时器的令牌撞值而误触发。
         for (key, var st) in states {
@@ -308,6 +350,10 @@ final class MappingEngine: @unchecked Sendable {
     private func _handle(_ event: ButtonEvent) {
         // 暂停态：遥控完全惰性——不进状态机、不追踪逃生、不喂浮层。
         if suspendedLock.withLock({ $0 }) { return }
+        if independent {
+            handleIndependent(event)
+            return
+        }
         // 锁定控制模式中的每次遥控操作都延后空闲退出。
         if lockedLayer != 0 { restartLockedLayerIdleTimer() }
         // 全局逃生键跟踪必须在浮层捕获分支【之前】：浮层打开时事件不进状态机，
@@ -352,6 +398,172 @@ final class MappingEngine: @unchecked Sendable {
         } else {
             handleUp(event.key)
         }
+    }
+
+    // MARK: 独立全局手势（保留槽 → 临时面板/鼠标 → App 单击/长按）
+
+    private func handleIndependent(_ event: ButtonEvent) {
+        let key = event.key
+        if key == .volUp || key == .volDown {
+            if event.isDown {
+                guard independentHeld.insert(key).inserted else { return }
+                repeatTokens[key, default: 0] &+= 1
+                let token = repeatTokens[key]!
+                runIndependentGlobal(config.globalShortcuts?[key.rawValue]?.tap
+                    ?? .system(key == .volUp ? "volume_up" : "volume_down"))
+                repeatIndependent(key, token: token, after: 350, global: true)
+            } else {
+                independentHeld.remove(key)
+                repeatTokens[key, default: 0] &+= 1
+            }
+            return
+        }
+        if isDirection(key) {
+            // 短按的一次滚动可以异步完成；只有按住产生的连续滚动在松手时取消。
+            if !event.isDown, scrollRepeatingKeys.remove(key) != nil {
+                CodexNavigation.cancelScrolling()
+            }
+            if let handler = overlayHandler { mainDispatch { handler(event) }; return }
+            if MouseMode.shared.handle(key: key, isDown: event.isDown) { return }
+            if event.isDown {
+                guard independentHeld.insert(key).inserted else { return }
+                repeatTokens[key, default: 0] &+= 1
+                runIndependentLocal(independentTapAction(key))
+                if independentTapAction(key) == .system("codex_scroll_up")
+                    || independentTapAction(key) == .system("codex_scroll_down") {
+                    repeatIndependent(key, token: repeatTokens[key]!, after: 350, global: false)
+                }
+            } else {
+                independentHeld.remove(key)
+                repeatTokens[key, default: 0] &+= 1
+            }
+            return
+        }
+        // OK 在浮层/鼠标中保留真实按下与松开，支持列表即时确认及锁定拖拽。
+        if key == .ok {
+            if let handler = overlayHandler { mainDispatch { handler(event) }; return }
+            if MouseMode.shared.handle(key: key, isDown: event.isDown) { return }
+        }
+        if event.isDown, gestureContexts[key] == nil {
+            gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
+        }
+        let reserved = config.globalShortcuts?[key.rawValue]
+        let localHold = overlayHandler == nil && (!MouseMode.shared.isActive || key == .voice)
+            ? binding(for: key)?.hold : nil
+        let mouseHold = MouseMode.shared.isActive && key == .tv
+        independentGestures.handle(event, policy: .init(
+            doubleMs: max(0, config.settings.doubleMs),
+            holdMs: max(1, reserved?.holdMs ?? config.settings.holdMs),
+            hasDouble: reserved?.double != nil,
+            hasHold: reserved?.hold != nil || localHold != nil || mouseHold))
+    }
+
+    private func repeatIndependent(_ key: RemoteKey, token: Int, after delay: Int, global: Bool) {
+        let generation = contextGeneration
+        scheduleAfter(delay) { [weak self] in
+            guard let self, self.repeatTokens[key] == token, !self.isSuspended,
+                  self.contextGeneration == generation else { return }
+            if global {
+                self.runIndependentGlobal(self.config.globalShortcuts?[key.rawValue]?.tap
+                    ?? .system(key == .volUp ? "volume_up" : "volume_down"))
+            } else {
+                guard self.overlayHandler == nil, !MouseMode.shared.isActive else { return }
+                self.scrollRepeatingKeys.insert(key)
+                self.runIndependentLocal(self.independentTapAction(key))
+            }
+            self.repeatIndependent(key, token: token, after: 110, global: global)
+        }
+    }
+
+    private func independentGesture(_ key: RemoteKey, _ gesture: IndependentGestures.Gesture) {
+        let context = gestureContexts.removeValue(forKey: key)
+        let reserved = config.globalShortcuts?[key.rawValue]
+        let globalAction: Action?
+        switch gesture {
+        case .tap: globalAction = reserved?.tap
+        case .double: globalAction = reserved?.double
+        case .hold: globalAction = reserved?.hold
+        }
+        if let globalAction {
+            runIndependentGlobal(globalAction)
+            return
+        }
+        guard let context, context.0 == contextGeneration,
+              context.1 == MouseMode.shared.isActive else { return }
+        if gesture == .tap {
+            if let handler = overlayHandler {
+                mainDispatch {
+                    handler(ButtonEvent(key: key, isDown: true, timeNs: 0))
+                    handler(ButtonEvent(key: key, isDown: false, timeNs: 0))
+                }
+            } else if MouseMode.shared.isActive {
+                let consumed = MouseMode.shared.handle(key: key, isDown: true)
+                _ = MouseMode.shared.handle(key: key, isDown: false)
+                if !consumed { runIndependentLocal(independentTapAction(key)) }
+            } else {
+                runIndependentLocal(independentTapAction(key))
+            }
+        } else if gesture == .hold {
+            if MouseMode.shared.isActive, key == .tv {
+                MouseMode.shared.toggleScrollMode()
+            } else if overlayHandler == nil, !MouseMode.shared.isActive {
+                runIndependentLocal(binding(for: key)?.hold)
+            }
+        }
+    }
+
+    private func independentTapAction(_ key: RemoteKey) -> Action? {
+        if TransientSystemUI.isMissionControlActive() {
+            if let arrow = Self.nativeArrowName[key] { return .keyStroke(key: arrow, mods: []) }
+            if key == .back || key == .home || key == .menu {
+                _ = TransientSystemUI.consumeMissionControlExit()
+                return .keyStroke(key: "escape", mods: [])
+            }
+        }
+        if let arrow = Self.nativeArrowName[key], overlayDeclared(key)?.overrideBase != true {
+            return .keyStroke(key: arrow, mods: [])
+        }
+        if key == .back { return baseBackOverride?.tap ?? .keyStroke(key: "delete", mods: []) }
+        if key == .ok { return overlayDeclared(key)?.tap ?? .keyStroke(key: "return", mods: []) }
+        return binding(for: key)?.tap
+    }
+
+    private func runIndependentLocal(_ action: Action?) {
+        guard let action else { return }
+        switch action {
+        case .layerMomentary, .layerToggle, .voice, .none: return
+        default: runner.run(action)
+        }
+    }
+
+    private func runIndependentGlobal(_ action: Action) {
+        guard action != .none else { return }
+        switch action {
+        case .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"):
+            CodexNavigation.cancelScrolling()
+        default: break
+        }
+        switch action {
+        case .overlay, .openApp, .system("app_mru_back"):
+            MouseMode.shared.deactivate()
+        default: break
+        }
+        if action == .system("remote_reset") {
+            independentGestures.reset()
+            gestureContexts.removeAll()
+            fireEscapeHatch()
+            return
+        }
+        if let hook = onGlobalAction {
+            // 面板进入主线程前先吞掉后续按键，避免快速 OK 穿透到原应用。
+            if case .overlay = action {
+                overlayHandler = { _ in }
+                contextGeneration &+= 1
+                publishTapRoute()
+            }
+            mainDispatch { hook(action) }
+        }
+        else { runner.run(action) }
     }
 
     // MARK: - 按下
@@ -703,6 +915,80 @@ final class MappingEngine: @unchecked Sendable {
 // MARK: - 纯逻辑自测
 
 extension MappingEngine {
+
+    static func independentRoutingSelfCheck() -> Bool {
+        let clock = ManualClock()
+        let runner = RecordingRunner()
+        var cfg = MappingConfig()
+        cfg.settings.holdMs = 600
+        cfg.settings.doubleMs = 250
+        cfg.globalShortcuts = [
+            "home": KeyBinding(double: .overlay("window_picker")),
+            "menu": KeyBinding(hold: .mouseMode, double: .overlay("system_menu")),
+            "tv": KeyBinding(tap: .openApp("com.openai.codex"), double: .system("app_mru_back")),
+            "back": KeyBinding(hold: .system("remote_reset"), holdMs: 1200),
+            "power": KeyBinding(tap: .overlay("computer_power"), hold: Action.none),
+            "volUp": KeyBinding(tap: .system("volume_up"))
+        ]
+        cfg.profiles["global"] = ["back": KeyBinding(tap: .keyStroke(key: "delete", mods: []))]
+        cfg.profiles["com.openai.codex"] = [
+            "home": KeyBinding(tap: .overlay("codex_sessions"), double: .system("mute")),
+            "tv": KeyBinding(tap: .layerToggle(2)),
+            "up": KeyBinding(tap: .system("codex_scroll_up"), overrideBase: true),
+            "voice": KeyBinding(tap: .focusInput, hold: .voice),
+            "volUp": KeyBinding(tap: .system("mute"))
+        ]
+        let engine = MappingEngine(config: cfg, runner: runner, delegate: nil,
+                                   dispatch: { $0() },
+                                   scheduleAfter: { ms, work in clock.schedule(ms, work) })
+        func event(_ key: RemoteKey, _ down: Bool) {
+            engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
+        }
+        func tap(_ key: RemoteKey) { event(key, true); clock.advance(10); event(key, false) }
+        func twice(_ key: RemoteKey) { tap(key); clock.advance(40); tap(key); clock.advance(300) }
+        func equals(_ actions: [Action]) -> Bool {
+            let matches = runner.actions == actions
+            if !matches { print("[independentRouting] 实得 \(runner.actions)，预期 \(actions)") }
+            runner.actions.removeAll()
+            return matches
+        }
+        engine.setActiveProfile("com.openai.codex")
+        twice(.home)
+        guard equals([.overlay("window_picker")]), !engine.tapRoute.nativeDirections.contains(.up) else { return false }
+        tap(.home); clock.advance(250)
+        guard equals([.overlay("codex_sessions")]) else { return false }
+        var captured: [ButtonEvent] = []
+        engine.setOverlayCapture { captured.append($0) }
+        twice(.menu)
+        guard captured.isEmpty, equals([.overlay("system_menu")]) else { return false }
+        event(.menu, true); clock.advance(610); event(.menu, false)
+        guard captured.isEmpty, equals([.mouseMode]) else { return false }
+        tap(.back)
+        guard captured.map(\.key) == [.back, .back] else { return false }
+        var escaped = false
+        engine.onEscapeHatch = { escaped = true }
+        event(.back, true); clock.advance(1210); event(.back, false)
+        guard escaped, !engine.tapRoute.uiCapture else { return false }
+        tap(.voice)
+        guard equals([.focusInput]) else { return false }
+        event(.voice, true); clock.advance(610); event(.voice, false)
+        guard equals([]) else { return false }
+        event(.volUp, true); clock.advance(600); event(.volUp, false)
+        guard runner.actions.count >= 3,
+              runner.actions.allSatisfy({ $0 == .system("volume_up") }) else { return false }
+        runner.actions.removeAll(); clock.advance(1000)
+        guard equals([]) else { return false }
+        tap(.power)
+        guard equals([.overlay("computer_power")]) else { return false }
+        event(.power, true); clock.advance(610); event(.power, false)
+        guard equals([]) else { return false }
+        engine.setActiveProfile("com.example.other")
+        twice(.tv)
+        guard equals([.system("app_mru_back")]) else { return false }
+        engine.resetInputState(reason: "test")
+        event(.volUp, true); event(.volUp, false)
+        return equals([.system("volume_up")])
+    }
 
     /// 记录 runner 收到的动作，供断言。
     private final class RecordingRunner: ActionRunning {

@@ -24,6 +24,8 @@
     <false/>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>连接小米蓝牙遥控器并接收语音数据。</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>用于在你选择并确认后让电脑休眠或正常关机。</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

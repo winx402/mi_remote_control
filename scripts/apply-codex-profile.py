@@ -20,6 +20,16 @@ def merge(target, patch):
             target[key] = copy.deepcopy(value)
 
 
+def apply_preset(config, patch):
+    # 用户已确认整套替换；清掉本套装旧的模式/双击槽，其他 App 配置仍保留。
+    merge(config, {key: value for key, value in patch.items() if key not in ("profiles", "globalShortcuts")})
+    config["globalShortcuts"] = copy.deepcopy(patch["globalShortcuts"])
+    for key, value in patch["profiles"]["global"].items():
+        config["profiles"]["global"][key] = copy.deepcopy(value)
+    config["profiles"]["com.openai.codex"] = copy.deepcopy(patch["profiles"]["com.openai.codex"])
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path.home() / "Library/Application Support/MiRemote/config.json")
@@ -41,7 +51,8 @@ def main():
     if not isinstance(config.get("profiles", {}).get("global"), dict):
         parser.error("现有配置没有 global 场景，停止操作以保留原文件。")
     patch_path = Path(__file__).resolve().parent.parent / "Resources/codex-profile.patch.json"
-    merge(config, json.loads(patch_path.read_text()))
+    patch = json.loads(patch_path.read_text())
+    apply_preset(config, patch)
     config.setdefault("settings", {})["doubleMs"] = 250
     payload = (json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
 
@@ -53,7 +64,7 @@ def main():
             handle.write(payload)
         subprocess.run([str(args.binary), "--validate-config", str(temporary)], check=True)
         if args.dry_run:
-            print("预览通过：只合并全局 TV 键、Codex 场景和双击间隔，不写入配置。")
+            print("预览通过：应用独立全局快捷键和已确认的 Codex 套装，保留其他应用配置，不写入配置。")
             return
         if original == payload:
             print("Codex 预设已应用，无需修改。")

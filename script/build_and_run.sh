@@ -76,7 +76,7 @@ stop_existing() {
     for pid in $(target_pids); do
         # 在发信号前复核，避免对退出后复用的 PID 发送 TERM。
         if process_is_target "$pid"; then
-            echo "-- 等待 MiRemote 清理并退出（PID $pid）"
+            echo "-- 等待 MiRemote 清理并退出（PID ${pid}）"
             /bin/kill -TERM "$pid" 2>/dev/null || true
         fi
     done

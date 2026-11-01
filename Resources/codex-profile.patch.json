@@ -103,17 +103,17 @@
     },
     "com.openai.codex": {
       "up": {
-        "overrideBase": true,
         "tap": {
-          "type": "system",
-          "value": "codex_scroll_up"
+          "type": "key_stroke",
+          "key": "up_arrow",
+          "mods": []
         }
       },
       "down": {
-        "overrideBase": true,
         "tap": {
-          "type": "system",
-          "value": "codex_scroll_down"
+          "type": "key_stroke",
+          "key": "down_arrow",
+          "mods": []
         }
       },
       "left": {

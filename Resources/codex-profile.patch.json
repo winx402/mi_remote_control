@@ -56,6 +56,18 @@
         "type": "system",
         "value": "volume_down"
       }
+    },
+    "left": {
+      "double": {
+        "type": "system",
+        "value": "space_left"
+      }
+    },
+    "right": {
+      "double": {
+        "type": "system",
+        "value": "space_right"
+      }
     }
   },
   "profiles": {
@@ -189,6 +201,13 @@
           "type": "voice"
         }
       }
+    }
+  },
+  "voiceProfiles": {
+    "global": {
+      "keyName": "fn",
+      "mode": "hold",
+      "imeBundlePrefix": "com.tencent.inputmethod.wetype"
     }
   }
 }

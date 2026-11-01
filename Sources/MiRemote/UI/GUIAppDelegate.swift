@@ -14,6 +14,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var badgeController: FloatingBadgeController?
     private var overlayCenter: OverlayCenter?
     private var shutdownSignals: [DispatchSourceSignal] = []
+    private var voiceProbePanel: NSPanel?
+    private var voiceProbeLabel: NSTextField?
+    private var voiceProbeRunning = false
+    private var voiceProbeGeneration: UInt64 = 0
 
     init(uiPreview: Bool) {
         self.uiPreview = uiPreview
@@ -102,6 +106,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   action: #selector(showCodexSessions), keyEquivalent: "")
         sessions.target = self
         appMenu.addItem(sessions)
+        let probe = NSMenuItem(title: "验证遥控器连续收音…",
+                               action: #selector(startVoiceProbe), keyEquivalent: "")
+        probe.target = self
+        appMenu.addItem(probe)
         appMenu.addItem(.separator())
 
         let hide = NSMenuItem(title: "隐藏 MiRemote",
@@ -137,12 +145,70 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        services?.bridge.cancelVoiceContinuityProbe()
         // 退出前清理：恢复 hidutil 中转、断开语音链路（AppServices.stop 幂等）。
         services?.stop()
     }
 
     @objc private func showCodexSessions() {
         overlayCenter?.open("codex_sessions")
+    }
+
+    @objc private func startVoiceProbe() {
+        guard services != nil else { return }
+        if voiceProbeRunning { voiceProbePanel?.makeKeyAndOrderFront(nil); return }
+        if voiceProbePanel == nil {
+            let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 650, height: 270),
+                                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            panel.title = "遥控器连续收音验证"
+            panel.isReleasedWhenClosed = false
+            panel.delegate = self
+            let label = NSTextField(wrappingLabelWithString: "")
+            label.frame = CGRect(x: 24, y: 70, width: 602, height: 172)
+            label.font = .systemFont(ofSize: 14)
+            panel.contentView?.addSubview(label)
+            let cancel = NSButton(title: "结束测试", target: self, action: #selector(cancelVoiceProbe))
+            cancel.frame = CGRect(x: 510, y: 22, width: 116, height: 32)
+            panel.contentView?.addSubview(cancel)
+            let start = NSButton(title: "开始测试", target: self, action: #selector(beginVoiceProbe))
+            start.frame = CGRect(x: 380, y: 22, width: 116, height: 32)
+            panel.contentView?.addSubview(start)
+            voiceProbePanel = panel
+            voiceProbeLabel = label
+        }
+        voiceProbeLabel?.stringValue = "仅统计本机音频帧和电平，不保存或识别声音。\n准备好后点“开始测试”：按住语音键说话约 2 秒，再松开。松手 1 秒后继续说话，看到测试完成即可停止。"
+        voiceProbePanel?.center()
+        voiceProbePanel?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func beginVoiceProbe() {
+        guard let services, !voiceProbeRunning else { return }
+        voiceProbeGeneration &+= 1
+        let token = voiceProbeGeneration
+        voiceProbeRunning = true
+        // 诊断期间只禁用语音键的普通应用动作，避免测试松手后移动输入焦点。
+        var quiet = model.config
+        for name in quiet.profiles.keys {
+            quiet.profiles[name]?["voice"] = KeyBinding(tap: Action.none, hold: Action.none)
+        }
+        services.keyMapper?.engine.setConfig(quiet)
+        services.bridge.startVoiceContinuityProbe(onUpdate: { [weak self] text in
+            guard let self, self.voiceProbeGeneration == token, self.voiceProbeRunning else { return }
+            self.voiceProbeLabel?.stringValue = text
+        }, completion: { [weak self] report in
+            guard let self, self.voiceProbeGeneration == token else { return }
+            self.voiceProbeRunning = false
+            self.voiceProbeLabel?.stringValue = report.summary
+            self.services?.keyMapper?.engine.setConfig(self.model.config)
+        })
+    }
+
+    @objc private func cancelVoiceProbe() {
+        guard voiceProbeRunning else { return }
+        // 等 bridge 完成关闭与回声隔离后，由同一 completion 恢复映射。
+        // 关闭窗口只隐藏面板，不能抢先允许下一次测试。
+        services?.bridge.cancelVoiceContinuityProbe()
+        voiceProbeLabel?.stringValue = "正在关闭麦克风并恢复普通语音，请稍候。"
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -181,6 +247,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === voiceProbePanel {
+            cancelVoiceProbe()
+            return true
+        }
         // 首次关窗说明「关窗 ≠ 退出」（N-10/25/27 心智坑）：一次性面板 + 不再提示
         let d = UserDefaults.standard
         if !d.bool(forKey: Prefs.closeNoticeAcknowledged) {
@@ -253,7 +323,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 全局逃生键（长按菜单 1.5s）：引擎已自清层态与捕获态，主线程回调；
             // UI 侧同步收掉全部浮层/HUD（角标随 onLayerChanged 归零自动消失）。
             km.engine.onEscapeHatch = { [weak self] in
-                MainActor.assumeIsolated { self?.overlayCenter?.escapeHatch() }
+                MainActor.assumeIsolated {
+                    if self?.voiceProbeRunning == true { self?.cancelVoiceProbe() }
+                    self?.overlayCenter?.escapeHatch()
+                }
             }
             km.engine.onGlobalAction = { [weak self] action in
                 MainActor.assumeIsolated {

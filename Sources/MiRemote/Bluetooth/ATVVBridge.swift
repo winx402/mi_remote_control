@@ -136,6 +136,16 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private var streaming = false
 
+    // Explicitly armed diagnostic; every mutable member remains on the ATVV queue.
+    private var voiceContinuityProbe: VoiceContinuityProbe?
+    private var probeUpdate: (@MainActor @Sendable (String) -> Void)?
+    private var probeCompletion: (@MainActor @Sendable (VoiceContinuityProbe.Report) -> Void)?
+    private var probePendingReport: VoiceContinuityProbe.Report?
+    private var probeWork: DispatchWorkItem?
+    private var probeCleanupWork: DispatchWorkItem?
+    private var probeGeneration = 0
+    private var probeConnectionGeneration = 0
+
     // MARK: - 音频切帧
 
     private var accumulator = FrameAccumulator(frameSize: 120)
@@ -185,8 +195,177 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         queue.sync {
             shouldRun = false
             log("STOP requested")
+            interruptVoiceContinuityProbe(.cancelled, detail: "应用停止，诊断已取消。")
             teardownConnection(disconnect: true)
         }
+    }
+
+    /// Arms a bounded experiment; it never starts a microphone until the physical
+    /// remote requests it. Callbacks run on MainActor; no voice delegate is invoked.
+    func startVoiceContinuityProbe(
+        onUpdate: @escaping @MainActor @Sendable (String) -> Void,
+        completion: @escaping @MainActor @Sendable (VoiceContinuityProbe.Report) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.voiceContinuityProbe == nil, !self.streaming else {
+                let report = VoiceContinuityProbe.Report.unavailable(.busy, "请先结束当前会话，再开始诊断。")
+                DispatchQueue.main.async { completion(report) }
+                return
+            }
+            guard self.shouldRun, self.central.state == .poweredOn,
+                  self.peripheral?.state == .connected, self.capsReady,
+                  self.audioSubscribed, self.controlSubscribed,
+                  self.audioChar != nil, self.controlChar != nil,
+                  let tx = self.txChar,
+                  tx.properties.contains(.write) || tx.properties.contains(.writeWithoutResponse),
+                  self.selectedCodec == 0x02, (1...4096).contains(self.capsFrameLen) else {
+                let report = VoiceContinuityProbe.Report.unavailable(.notReady,
+                    "需要能力协商成功、双路通知与可写ATVV TX；本次没有开始试验。")
+                DispatchQueue.main.async { completion(report) }
+                return
+            }
+            self.probeGeneration += 1
+            self.probeConnectionGeneration = self.generation
+            self.probeUpdate = onUpdate
+            self.probeCompletion = completion
+            self.probePendingReport = nil
+            self.clearVoiceFrameState()
+            self.voiceContinuityProbe = VoiceContinuityProbe(version: self.protocolVersion,
+                frameSize: self.capsFrameLen, nowNs: DispatchTime.now().uptimeNanoseconds)
+            self.publishProbeUpdate("诊断已等待：请在15秒内短按语音键并说一句，然后松手。松手1秒后继续说话；请等待结果，期间不要再次按键。")
+            self.scheduleVoiceProbeTick()
+        }
+    }
+
+    /// Cancellation closes the current ATVV session before restoring normal delivery.
+    /// Completion may arrive after a short close-notification quarantine; callers must
+    /// wait for it before treating ordinary voice input as available again.
+    func cancelVoiceContinuityProbe() {
+        queue.async { [weak self] in
+            guard let self, let probe = self.voiceContinuityProbe else { return }
+            self.applyVoiceProbeEffects(probe.stop(.cancelled, detail: "用户取消诊断。"))
+        }
+    }
+
+    private func publishProbeUpdate(_ message: String) {
+        guard let update = probeUpdate else { return }
+        DispatchQueue.main.async { update(message) }
+    }
+
+    private func scheduleVoiceProbeTick() {
+        probeWork?.cancel()
+        guard let probe = voiceContinuityProbe, !probe.isFinished else { return }
+        let token = probeGeneration
+        let connection = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.probeGeneration == token,
+                  self.generation == connection, self.probeConnectionGeneration == connection,
+                  let probe = self.voiceContinuityProbe, !probe.isFinished else { return }
+            self.applyVoiceProbeEffects(probe.advance(nowNs: DispatchTime.now().uptimeNanoseconds))
+            if self.voiceContinuityProbe?.isFinished == false { self.scheduleVoiceProbeTick() }
+        }
+        probeWork = work
+        queue.asyncAfter(deadline: .now() + .milliseconds(100), execute: work)
+    }
+
+    private func applyVoiceProbeEffects(_ effects: [VoiceContinuityProbe.Effect]) {
+        for effect in effects {
+            guard voiceContinuityProbe != nil, probeConnectionGeneration == generation else { return }
+            switch effect {
+            case .update(let message): publishProbeUpdate(message)
+            case .openMicrophone:
+                guard peripheral?.state == .connected, capsReady, audioSubscribed,
+                      controlSubscribed, txChar != nil else {
+                    stopVoiceContinuityProbe(.disconnected, detail: "开麦前链路已失效，未继续试验。")
+                    return
+                }
+                // Known negotiated OPEN only. Its success is never signal evidence.
+                sendMicOpen()
+            case .closeMicrophone:
+                guard attemptProbeMicClose() else {
+                    interruptVoiceContinuityProbe(.disconnected, detail: "关闭旧流时链路已失效，未主动重开。")
+                    return
+                }
+            case .finished(let report): beginVoiceProbeCleanup(report)
+            }
+        }
+    }
+
+    @discardableResult private func attemptProbeMicClose() -> Bool {
+        guard central.state == .poweredOn, peripheral?.state == .connected, txChar != nil else {
+            log("PROBE MIC_CLOSE not delivered (link unavailable)")
+            return false
+        }
+        sendMicClose()
+        return true
+    }
+
+    private func beginVoiceProbeCleanup(_ report: VoiceContinuityProbe.Report) {
+        guard probePendingReport == nil else { return }
+        probeWork?.cancel()
+        probeWork = nil
+        // Exactly one final close attempt, in addition to B's optional old-flow close.
+        let closeAttempted = attemptProbeMicClose()
+        probePendingReport = VoiceContinuityProbe.Report(outcome: report.outcome,
+            phaseA: report.phaseA, phaseB: report.phaseB,
+            baselinePCMFrames: report.baselinePCMFrames,
+            hostOpenAttempted: report.hostOpenAttempted,
+            detail: report.detail + (closeAttempted ? " 已请求关闭麦克风。" : " 断连导致关闭命令无法送达。"))
+        clearVoiceFrameState()
+        publishProbeUpdate("诊断采样已结束，正在关闭麦克风并恢复普通语音。")
+        let token = probeGeneration
+        let connection = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.probeGeneration == token, self.generation == connection else { return }
+            self.completeVoiceProbeCleanup()
+        }
+        probeCleanupWork = work
+        // Consume STOP echoes and already-queued audio without re-entering VoiceBridge.
+        queue.asyncAfter(deadline: .now() + .milliseconds(500), execute: work)
+    }
+
+    private func completeVoiceProbeCleanup() {
+        guard let report = probePendingReport else { return }
+        let completion = probeCompletion
+        probeGeneration += 1 // invalidates every scheduled action from this experiment
+        probeWork?.cancel()
+        probeCleanupWork?.cancel()
+        probeWork = nil
+        probeCleanupWork = nil
+        voiceContinuityProbe = nil
+        probePendingReport = nil
+        probeUpdate = nil
+        probeCompletion = nil
+        clearVoiceFrameState()
+        if let completion { DispatchQueue.main.async { completion(report) } }
+    }
+
+    private func interruptVoiceContinuityProbe(_ outcome: VoiceContinuityProbe.Report.Outcome,
+                                               detail: String) {
+        guard let probe = voiceContinuityProbe else { return }
+        applyVoiceProbeEffects(probe.stop(outcome, detail: detail))
+        // Connection/app teardown cannot leave a timer waiting for a dead generation.
+        completeVoiceProbeCleanup()
+    }
+
+    /// A recoverable notification/value error does not detach the peripheral.
+    /// Keep the CLOSE echo quarantine so late events cannot trigger normal voice.
+    private func stopVoiceContinuityProbe(_ outcome: VoiceContinuityProbe.Report.Outcome,
+                                          detail: String) {
+        guard let probe = voiceContinuityProbe else { return }
+        applyVoiceProbeEffects(probe.stop(outcome, detail: detail))
+    }
+
+    private func clearVoiceFrameState() {
+        streaming = false
+        micOpenPending = false
+        pendingSync = nil
+        headerMode = false
+        frameFormatProbed = false
+        probeBuffer.removeAll(keepingCapacity: false)
+        waitingForResync = false
+        accumulator = FrameAccumulator(frameSize: capsFrameLen)
     }
 
     // MARK: - 连接策略
@@ -208,6 +387,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func connect(to p: CBPeripheral) {
+        interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接代次改变，诊断已终止。")
         central.stopScan()
         // 新连接开一代，旧代闭包全部作废。
         generation += 1
@@ -255,6 +435,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func teardownConnection(disconnect: Bool) {
+        interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接结束，诊断已终止。")
         if let p = peripheral {
             // 代际隔离：摘掉旧外设的 delegate，杜绝跨代的 peripheral 级回调回流。
             p.delegate = nil
@@ -306,9 +487,11 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             teardownConnection(disconnect: false)
         case .unauthorized:
             log("BT_UNAUTHORIZED")
+            stopVoiceContinuityProbe(.disconnected, detail: "蓝牙授权失效。")
             delegate?.atvvDisconnected(error: "Bluetooth unauthorized")
         case .unsupported:
             log("BT_UNSUPPORTED")
+            stopVoiceContinuityProbe(.disconnected, detail: "蓝牙不可用。")
             delegate?.atvvDisconnected(error: "Bluetooth unsupported")
         default:
             log("BT_STATE=\(central.state.rawValue)")
@@ -349,6 +532,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             return
         }
         log("CONNECT_FAILED error=\(error?.localizedDescription ?? "nil")")
+        interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接失败。")
         self.peripheral?.delegate = nil
         self.peripheral = nil
         resetSessionState()
@@ -367,6 +551,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let msg = error?.localizedDescription ?? pendingDisconnectReason
         pendingDisconnectReason = nil
         log("DISCONNECTED error=\(msg ?? "nil")")
+        interruptVoiceContinuityProbe(.disconnected, detail: "诊断期间蓝牙断连；未自动续测。")
         delegate?.atvvDisconnected(error: msg)
         peripheral.delegate = nil
         self.peripheral = nil
@@ -444,10 +629,14 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard isCurrent(peripheral) else { return }
         if let error {
             log("NOTIFY_ERROR \(characteristic.uuid) \(error.localizedDescription)")
+            stopVoiceContinuityProbe(.disconnected, detail: "蓝牙通知失效，诊断已终止。")
             return
         }
         if characteristic.uuid == audioUUID { audioSubscribed = characteristic.isNotifying }
         if characteristic.uuid == controlUUID { controlSubscribed = characteristic.isNotifying }
+        if voiceContinuityProbe != nil && (!audioSubscribed || !controlSubscribed) {
+            stopVoiceContinuityProbe(.disconnected, detail: "语音通知订阅失效，诊断已终止。")
+        }
 
         // audio + control 都订阅完成后发 GET_CAPS 启动握手。
         if audioSubscribed && controlSubscribed && !capsRequested {
@@ -462,6 +651,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard isCurrent(peripheral) else { return }
         if let error {
             log("VALUE_ERROR \(characteristic.uuid) \(error.localizedDescription)")
+            stopVoiceContinuityProbe(.interrupted, detail: "蓝牙数据读取出错，本次不判定支持。")
             return
         }
         guard let data = characteristic.value else { return }
@@ -476,6 +666,16 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             }
         default: break
         }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard isCurrent(peripheral), characteristic.uuid == txUUID,
+              let probe = voiceContinuityProbe, !probe.isFinished,
+              probeConnectionGeneration == generation, error != nil else { return }
+        applyVoiceProbeEffects(probe.stop(.interrupted,
+            detail: "ATVV命令写入报告错误，本次不判定支持。"))
     }
 
     // MARK: - 握手状态机（严格按 DESIGN.md §1.3 时序）
@@ -494,6 +694,29 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private func handleControl(_ data: Data) {
         guard let op = data.first else { return }
         let b = [UInt8](data)
+        if let probe = voiceContinuityProbe {
+            // Finished probes remain installed briefly to absorb CLOSE/STOP echoes.
+            guard !probe.isFinished, probeConnectionGeneration == generation else { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            switch op {
+            case 0x08: applyVoiceProbeEffects(probe.physicalRequest(nowNs: now))
+            case 0x04:
+                sessionID = Self.parseStreamSessionID(b)
+                applyVoiceProbeEffects(probe.streamStarted(nowNs: now))
+            case 0x00: applyVoiceProbeEffects(probe.streamStopped(nowNs: now))
+            case 0x0A:
+                if let sync = Self.parseSync(b) {
+                    probe.sync(predictor: sync.predictor, stepIndex: sync.stepIndex)
+                }
+            case 0x0B:
+                if Self.parseCapabilities(b) != Capabilities(version: protocolVersion,
+                    codecMask: codecMask, frameSize: capsFrameLen) {
+                    applyVoiceProbeEffects(probe.stop(.interrupted, detail: "诊断期间能力协商发生变化。"))
+                }
+            default: break
+            }
+            return
+        }
         switch op {
 
         case 0x0B: // 能力帧
@@ -615,6 +838,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - 音频帧
 
     private func handleAudio(_ data: Data) {
+        // Raw observer is intentionally before the production streaming guard. During
+        // A, logical streaming stays false after STOP; no audio/voice delegate escapes.
+        if let probe = voiceContinuityProbe {
+            guard probeConnectionGeneration == generation, !probe.isFinished else { return }
+            applyVoiceProbeEffects(probe.audio(data, nowNs: DispatchTime.now().uptimeNanoseconds))
+            return
+        }
         // C2：0x04 之前 / 0x00 之后到达的音频帧一律丢弃（非流内数据）。
         guard streaming else { return }
 

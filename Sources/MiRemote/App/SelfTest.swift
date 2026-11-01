@@ -237,6 +237,8 @@ enum SelfTest {
         expect(MappingEngine.backOverrideSelfCheck(), "Codex 基础返回覆盖及控制模式超时回归")
         expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
         expect(IndependentGestures.selfCheck(), "独立全局手势单击/双击/长按互斥与取消")
+        expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局双击切桌面与方向按住释放")
+        expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
         expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
@@ -507,7 +509,7 @@ enum SelfTest {
             voiceRules["com.example.bad"] = VoiceTriggerRule(
                 keyName: "invalid", mode: "invalid", imeBundlePrefix: nil)
             let safeVoice = VoiceTriggerRouting.resolve(voiceRules, bundleID: "com.example.bad")
-            expect(safeVoice.keyName == "right_option" && safeVoice.mode == .hold,
+            expect(safeVoice.keyName == "fn" && safeVoice.mode == .hold,
                    "坏语音按键/模式安全回退")
         }
 
@@ -1267,7 +1269,7 @@ enum SelfTest {
         // CZ-4. 语音触发三级合并：CLI 覆盖 配置(voiceProfiles.global) 覆盖 内置默认。
         do {
             let d = AppServices.startupVoiceTriggerConfig(globalRule: nil, cliKey: nil, cliMode: nil, cliIME: nil)
-            expect(d == VoiceTriggerConfig(), "无配置无 CLI = 内置默认（右Option/hold/豆包）")
+            expect(d == VoiceTriggerConfig(), "无配置无 CLI = 内置默认（Fn/hold/微信输入法）")
             let rule = VoiceTriggerRule(keyName: "fn", mode: "tap", imeBundlePrefix: "com.example.ime")
             let c = AppServices.startupVoiceTriggerConfig(globalRule: rule, cliKey: nil, cliMode: nil, cliIME: nil)
             expect(c.keyName == "fn" && c.mode == .tap && c.imeBundlePrefix == "com.example.ime",

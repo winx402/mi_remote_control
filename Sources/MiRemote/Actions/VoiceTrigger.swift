@@ -12,9 +12,9 @@ import CoreGraphics
 struct VoiceTriggerConfig: Equatable {
     enum Mode: String { case hold, tap, double }
 
-    var keyName: String = "right_option"
+    var keyName: String = "fn"
     var mode: Mode = .hold
-    var imeBundlePrefix: String? = "com.bytedance.inputmethod"
+    var imeBundlePrefix: String? = "com.tencent.inputmethod.wetype"
 
     /// 键名 → (keycode, 修饰 flag, IOKit 左右设备位)。普通键两项为 nil。
     static let keyTable: [String: (CGKeyCode, CGEventFlags?, UInt64?)] = [

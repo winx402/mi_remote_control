@@ -1,7 +1,7 @@
 import SwiftUI
 import Carbon.HIToolbox
 
-/// 当前键盘输入法的 InputSourceID（如 "com.bytedance.inputmethod.Doubao..."）。
+/// 当前键盘输入法的 InputSourceID。
 func currentInputSourceID() -> String? {
     guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
           let ptr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return nil }
@@ -15,13 +15,14 @@ struct VoicePage: View {
     @State private var showAddApp = false
     // 链路自检状态（N-17：跨 3 个 App 的语音链路逐项亮灯）
     @State private var hadAudioFrames = false
-    @State private var imeIsDoubao = false
+    @State private var imeMatchesSelection = false
     @State private var remoteSeen = false
     @State private var checkTimer: Timer?
 
     private let triggerKeys: [(String, String)] = [
-        ("right_option", "右 Option ⌥（推荐）"), ("left_option", "左 Option ⌥"),
-        ("f13", "F13（Typeless / Superwhisper 常用）"), ("f5", "F5"), ("fn", "Fn"),
+        ("fn", "Fn（微信输入法推荐）"),
+        ("right_option", "右 Option ⌥"), ("left_option", "左 Option ⌥"),
+        ("f13", "F13（与遥控中转冲突，不推荐）"), ("f5", "F5"),
         ("right_cmd", "右 Command ⌘"), ("left_cmd", "左 Command ⌘"),
         ("right_ctrl", "右 Control ⌃"), ("left_ctrl", "左 Control ⌃"),
         ("right_shift", "右 Shift ⇧"), ("left_shift", "左 Shift ⇧"),
@@ -53,8 +54,8 @@ struct VoicePage: View {
                     modeRow(.remoteMic, title: "遥控器麦克风（主打）",
                             subtitle: "按住语音键说话，音频经蓝牙传回并解码为 16kHz PCM")
                     RowDivider()
-                    modeRow(.macMic, title: "Mac 内置麦克风",
-                            subtitle: "按键仅触发豆包语音输入，用 Mac 麦克风收音")
+                    modeRow(.macMic, title: "Mac 当前／外接麦克风",
+                            subtitle: "通过所选语音工具，使用电脑当前输入设备收音")
                     RowDivider()
                     modeRow(.off, title: "关闭",
                             subtitle: "语音键可另行映射为普通按键")
@@ -106,6 +107,7 @@ struct VoicePage: View {
                                 Text("语音工具").font(.body)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 Picker("", selection: imeModeBinding) {
+                                    Text("微信输入法（默认，自动切换）").tag("wetype")
                                     Text("豆包输入法（自动切换）").tag("doubao")
                                     Text("独立语音 App（不切输入法）").tag("standalone")
                                 }
@@ -191,7 +193,8 @@ struct VoicePage: View {
     }
 
     private func refreshLinkCheck() {
-        imeIsDoubao = currentInputSourceID()?.hasPrefix("com.bytedance.inputmethod") == true
+        let prefix = model.voiceRule(for: selectedProfile).imeBundlePrefix
+        imeMatchesSelection = prefix == nil || currentInputSourceID()?.hasPrefix(prefix!) == true
         remoteSeen = model.connected || EnvironmentCheck.remoteConnected().state == .granted
     }
 
@@ -214,9 +217,9 @@ struct VoicePage: View {
                      fix: "现在按住遥控器语音键说一句话——下方电平表跳动即通过；不跳请确认输入模式选了「遥控器麦克风」。",
                      pendingText: "待检测（按住语音键说话）")
             RowDivider()
-            checkRow(light: imeIsDoubao ? .ok : .bad,
-                     title: "当前输入法是豆包",
-                     fix: "点菜单栏输入法图标切到豆包输入法；没装豆包则先安装并在系统设置里启用它。")
+            checkRow(light: imeMatchesSelection ? .ok : .bad,
+                     title: "当前输入法与所选语音工具一致",
+                     fix: "在菜单栏切到所选输入法；微信输入法需在系统键盘设置中启用。")
         }
     }
 
@@ -245,15 +248,15 @@ struct VoicePage: View {
         .padding(.vertical, Spacing.rowV)
     }
 
-    // MARK: 豆包麦克风设置图文（N-16；文字版分步，图占位）
+    // MARK: 语音工具音频桥接说明
 
     private var doubaoGuideGroup: some View {
-        SettingsGroup(title: "豆包麦克风设置（遥控器麦克风模式必做一次）") {
+        SettingsGroup(title: "语音工具与麦克风设置") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("1. 打开「豆包」App → 点右下角头像进入设置。")
+                Text("1. 打开微信输入法设置，开启语音输入，并设定与本页一致的触发快捷键。")
                 Text("2. 找到「语音 / 麦克风」设置项。")
-                Text("3. 把麦克风（音频输入设备）从默认改为 **BlackHole 2ch**。")
-                Text("4. 回到这里按住遥控器语音键说话——上方自检第 3 项变绿即成功。")
+                Text("3. 遥控器麦克风需要免费的 **BlackHole 2ch** 作为输入设备。")
+                Text("4. 先确认上方第 3 项有音频帧，再在空白输入框测试是否出字。")
                 doubaoMicIllustration
                 Text("只需要设置一次；说话时 MiRemote 会临时把系统输入切到 BlackHole，松开语音键约 1 秒后自动还原。")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -263,12 +266,12 @@ struct VoicePage: View {
         }
     }
 
-    /// 豆包麦克风设置示意（矢量绘制的迷你设置行，代替裸占位矩形）。
+    /// 通用音频路由示意，不冒充具体语音工具的设置界面。
     private var doubaoMicIllustration: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Image(systemName: "gearshape.fill").foregroundStyle(.secondary)
-                Text("豆包 · 设置").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text("音频桥接示意").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
             }
             Divider()
@@ -311,10 +314,12 @@ struct VoicePage: View {
 
     private var imeModeBinding: Binding<String> {
         Binding(get: {
-            model.voiceRule(for: selectedProfile).imeBundlePrefix == nil ? "standalone" : "doubao"
+            guard let prefix = model.voiceRule(for: selectedProfile).imeBundlePrefix else { return "standalone" }
+            return prefix.hasPrefix("com.tencent.inputmethod.wetype") ? "wetype" : "doubao"
         }, set: { value in
             model.updateVoiceRule(for: selectedProfile) {
-                $0.imeBundlePrefix = value == "standalone" ? nil : "com.bytedance.inputmethod"
+                $0.imeBundlePrefix = value == "standalone" ? nil
+                    : value == "wetype" ? "com.tencent.inputmethod.wetype" : "com.bytedance.inputmethod"
             }
         })
     }

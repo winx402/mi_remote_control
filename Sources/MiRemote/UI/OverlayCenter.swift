@@ -892,7 +892,8 @@ enum HintBarCatalog {
     }
 
     static func hintsForGlobal() -> [Hint] {
-        [Hint(keys: [.home], text: "双击窗口列表"),
+        [Hint(keys: [.left, .right], text: "双击切桌面空间"),
+         Hint(keys: [.home], text: "双击窗口列表"),
          Hint(keys: [.menu], text: "双击系统面板 · 长按鼠标"),
          Hint(keys: [.tv], text: "单击 Codex · 双击上个 App"),
          Hint(keys: [.power], text: "电脑电源"),
@@ -900,8 +901,8 @@ enum HintBarCatalog {
     }
 
     static func hintsForCodex() -> [Hint] {
-        [Hint(keys: [.up, .down], text: "滚动"),
-         Hint(keys: [.left, .right], text: "上 / 下会话"),
+        [Hint(keys: [.up, .down], text: "原生方向键"),
+         Hint(keys: [.left, .right], text: "单击会话 · 双击桌面空间"),
          Hint(keys: [.home], text: "单击列表 · 长按新建"),
          Hint(keys: [.menu], text: "单击命令 · 长按鼠标"),
          Hint(keys: [.tv], text: "长按模型"),
@@ -911,7 +912,7 @@ enum HintBarCatalog {
 
     static func hintsForMouse(status: String = "鼠标模式") -> [Hint] {
         [Hint(keys: [], text: status),
-         Hint(keys: [.up, .down, .left, .right], text: "移动"),
+         Hint(keys: [.up, .down, .left, .right], text: "移动 · 左右双击切桌面"),
          Hint(keys: [.ok], text: "左键"),
          Hint(keys: [.menu], text: "单击右键 · 长按退出"),
          Hint(keys: [.back], text: "退出鼠标")]

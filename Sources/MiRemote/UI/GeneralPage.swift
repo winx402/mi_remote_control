@@ -175,7 +175,7 @@ struct GeneralPage: View {
     }
 
     private func globalShortcutLines(_ shortcuts: [String: KeyBinding]) -> [String] {
-        [RemoteKey.power, .home, .menu, .tv, .back, .volUp, .volDown].flatMap { key -> [String] in
+        [RemoteKey.power, .left, .right, .home, .menu, .tv, .back, .volUp, .volDown].flatMap { key -> [String] in
             guard let binding = shortcuts[key.rawValue] else { return [] }
             let slots: [(String, Action?)] = [("单击", binding.tap), ("双击", binding.double), ("长按", binding.hold)]
             return slots.compactMap { title, action in

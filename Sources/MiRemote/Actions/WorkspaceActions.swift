@@ -123,6 +123,17 @@ enum WorkspaceModifier: String, CaseIterable, Sendable {
         case .function: .maskSecondaryFn
         }
     }
+
+    /// Left-side device bits, matching the real modifier events created by Quartz.
+    fileprivate var deviceFlag: CGEventFlags {
+        switch self {
+        case .command: CGEventFlags(rawValue: 0x08)
+        case .shift: CGEventFlags(rawValue: 0x02)
+        case .option: CGEventFlags(rawValue: 0x20)
+        case .control: CGEventFlags(rawValue: 0x01)
+        case .function: []
+        }
+    }
 }
 
 enum WorkspaceActions {
@@ -231,9 +242,22 @@ enum WorkspaceActions {
         guard shortcutActions == Set(WorkspaceAction.allCases.filter {
             $0 != .focusInput && $0 != .showDesktop
         }) else { return false }
-        return shortcuts.values.allSatisfy { shortcut in
+        guard shortcuts.values.allSatisfy({ shortcut in
             shortcut.modifiers.count == Set(shortcut.modifiers.map(\.rawValue)).count
+        }), let source = CGEventSource(stateID: .privateState) else { return false }
+        // Inspect actual, unposted Quartz events. Metadata-only tests missed the
+        // arrow's intrinsic Fn/numeric-pad flags being overwritten at the sink.
+        for (action, arrow) in [(WorkspaceAction.spaceLeft, CGKeyCode(123)), (.spaceRight, CGKeyCode(124))] {
+            guard let shortcut = shortcuts[action], let events = makeEvents(shortcut, source: source),
+                  events.map(\.type) == [.flagsChanged, .keyDown, .keyUp, .flagsChanged],
+                  events.map({ $0.getIntegerValueField(.keyboardEventKeycode) }) == [59, Int64(arrow), Int64(arrow), 59],
+                  events[0].flags.contains(.maskControl),
+                  events[0].flags.rawValue & 0x01 != 0,
+                  events[1].flags.contains([.maskControl, .maskSecondaryFn, .maskNumericPad]),
+                  events[2].flags.contains([.maskControl, .maskSecondaryFn, .maskNumericPad]),
+                  events[3].flags.rawValue == 0 else { return false }
         }
+        return true
     }
 
     private static func chord(_ keyCode: CGKeyCode, _ modifiers: [WorkspaceModifier]) -> WorkspaceShortcut {
@@ -257,28 +281,40 @@ enum WorkspaceActions {
     }
 
     private static func post(_ shortcut: WorkspaceShortcut) {
-        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        guard let source = CGEventSource(stateID: .combinedSessionState),
+              let events = makeEvents(shortcut, source: source) else { return }
+        for event in events { event.post(tap: .cghidEventTap) }
+    }
+
+    private static func makeEvents(_ shortcut: WorkspaceShortcut, source: CGEventSource) -> [CGEvent]? {
+        var events: [CGEvent] = []
         var flags: CGEventFlags = []
+
+        func append(_ keyCode: CGKeyCode, down: Bool) -> Bool {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: down) else { return false }
+            // Preserve Quartz's arrow/function flags alongside the modifier
+            // state, so system shortcuts receive the complete keyboard event.
+            let intrinsic: CGEventFlags = event.type == .flagsChanged ? []
+                : event.flags.intersection([.maskSecondaryFn, .maskNumericPad])
+            event.flags = flags.union(intrinsic)
+            events.append(event)
+            return true
+        }
 
         // 修饰键按下：flags 表示该帧发出后的状态。
         for modifier in shortcut.modifiers {
             flags.insert(modifier.flag)
-            postKey(modifier.keyCode, down: true, flags: flags, source: source)
+            flags.insert(modifier.deviceFlag)
+            guard append(modifier.keyCode, down: true) else { return nil }
         }
-        postKey(shortcut.keyCode, down: true, flags: flags, source: source)
-        postKey(shortcut.keyCode, down: false, flags: flags, source: source)
+        guard append(shortcut.keyCode, down: true), append(shortcut.keyCode, down: false) else { return nil }
 
         // 逆序释放，且释放帧不再携带刚释放的修饰位，确保系统状态归零。
         for modifier in shortcut.modifiers.reversed() {
             flags.remove(modifier.flag)
-            postKey(modifier.keyCode, down: false, flags: flags, source: source)
+            flags.remove(modifier.deviceFlag)
+            guard append(modifier.keyCode, down: false) else { return nil }
         }
-    }
-
-    private static func postKey(_ keyCode: CGKeyCode, down: Bool, flags: CGEventFlags,
-                                source: CGEventSource) {
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: down) else { return }
-        event.flags = flags
-        event.post(tap: .cghidEventTap)
+        return events
     }
 }

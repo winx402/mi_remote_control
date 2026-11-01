@@ -188,6 +188,8 @@ struct KeyBinding: Codable {
     var double: Action?
     var gesture: [String: Action]?    // "up"/"down"/"left"/"right"（仅 OK 键生效）
     var layers: [String: Action]?     // "1" → 层1 激活时的 tap 替代
+    /// 仅 App 显式开启时允许返回键替换基础 Delete，避免旧预设隐式改变输入语义。
+    var overrideBase: Bool?
 }
 
 /// 遥控器开始传音频时，要向当前 App 发送的语音工具快捷键。

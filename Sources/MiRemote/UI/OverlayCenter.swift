@@ -127,6 +127,8 @@ final class OverlayUIState: ObservableObject {
     @Published var menuConfirming = false
     @Published var wheelEntries: [AppWheelView.Entry] = []
     @Published var wheelIndex = 0
+    @Published var codexSnapshot = CodexSessions.Snapshot()
+    @Published var codexIndex = 0
 }
 
 /// 窗口选择器的菜单键三段流程：全局跨桌面 → 当前 App → 关闭。
@@ -147,6 +149,7 @@ final class OverlayCenter {
         case systemMenu = "system_menu"
         case tutorial = "tutorial"
         case appWheel = "app_wheel"
+        case codexSessions = "codex_sessions"
     }
 
     private weak var model: AppModel?
@@ -169,6 +172,9 @@ final class OverlayCenter {
     private var wheelApps: [NSRunningApplication] = []
     private var wheelIndex = 0
     private var wheelIdleTimer: Timer?
+    private let codexSessions = CodexSessions()
+    private var codexSnapshot = CodexSessions.Snapshot()
+    private var codexIndex = 0
     /// 窗口选择/系统菜单/教程不应无限占用遥控路由；10s 无操作自动收起。
     private static let overlayIdleSeconds: TimeInterval = 10
     private var overlayIdleTimer: Timer?
@@ -232,6 +238,22 @@ final class OverlayCenter {
             wheelIndex = wheelApps.count > 1 ? 1 : 0   // 默认选「上一个 App」，一确认即回切
             showPanel()
             restartWheelIdleTimer()
+        case .codexSessions:
+            codexIndex = 0
+            codexSnapshot = CodexSessions.Snapshot(isLoading: true)
+            showPanel()
+            codexSessions.load { [weak self] snapshot in
+                guard let self, self.active == .codexSessions else { return }
+                let selectedID = self.codexSnapshot.entries.indices.contains(self.codexIndex)
+                    ? self.codexSnapshot.entries[self.codexIndex].id : nil
+                self.codexSnapshot = snapshot
+                if let selectedID, let index = snapshot.entries.firstIndex(where: { $0.id == selectedID }) {
+                    self.codexIndex = index
+                } else {
+                    self.codexIndex = min(self.codexIndex, max(0, snapshot.entries.count - 1))
+                }
+                self.sync(animated: false)
+            }
         }
         if kind != .appWheel { restartOverlayIdleTimer() }
         installEscMonitor()
@@ -245,6 +267,9 @@ final class OverlayCenter {
     func close() {
         guard active != nil else { return }
         active = nil
+        codexSessions.cancel()
+        codexSnapshot = CodexSessions.Snapshot()
+        codexIndex = 0
         engine?.setOverlayCapture(nil)
         if let escMonitor { NSEvent.removeMonitor(escMonitor) }
         escMonitor = nil
@@ -305,6 +330,7 @@ final class OverlayCenter {
         case .windowPicker: handlePickerKey(event.key)
         case .systemMenu:   handleMenuKey(event.key)
         case .appWheel:     handleWheelKey(event.key)
+        case .codexSessions: handleCodexKey(event.key)
         case .tutorial:
             // 再按 Home / 返回 / OK 关闭；其余键吞掉（教程页不该有副作用）。
             if event.key == .home || event.key == .back || event.key == .ok { close() }
@@ -475,7 +501,9 @@ final class OverlayCenter {
 
     private func restartOverlayIdleTimer() {
         overlayIdleTimer?.invalidate()
-        overlayIdleTimer = Timer.scheduledTimer(withTimeInterval: Self.overlayIdleSeconds,
+        // 会话列表需要阅读标题；给它比图标菜单更长的空闲时间。
+        let idleSeconds = active == .codexSessions ? 60 : Self.overlayIdleSeconds
+        overlayIdleTimer = Timer.scheduledTimer(withTimeInterval: idleSeconds,
                                                 repeats: false) { [weak self] _ in
             Task { @MainActor in self?.close() }
         }
@@ -485,6 +513,40 @@ final class OverlayCenter {
         pickerEntries = WindowSwitcher.pickerEntries(currentAppOnly: pickerCurrentAppOnly,
                                                      frontPid: frontApp?.processIdentifier)
         pickerIndex = 0
+    }
+
+    // MARK: Codex 本地会话列表
+
+    private func codexStep(_ delta: Int) {
+        guard !codexSnapshot.entries.isEmpty else { return }
+        codexIndex = CodexSessions.movedIndex(codexIndex, delta: delta,
+                                             count: codexSnapshot.entries.count)
+        restartOverlayIdleTimer()
+        sync()
+    }
+
+    private func handleCodexKey(_ key: RemoteKey) {
+        switch key {
+        case .up, .down, .left, .right:
+            let delta = key == .up ? -1 : key == .down ? 1 : key == .left ? -6 : 6
+            codexStep(delta)
+            startRepeat(key) { [weak self] in self?.codexStep(delta) }
+        case .ok:
+            guard codexSnapshot.entries.indices.contains(codexIndex) else { return }
+            let target = codexSnapshot.entries[codexIndex]
+            if CodexSessions.open(target) {
+                close()
+            } else {
+                codexSessions.cancel()
+                codexSnapshot.isLoading = false
+                codexSnapshot.error = "无法打开 Codex。请确认已安装桌面 App 后重试。"
+                sync(animated: false)
+            }
+        case .back, .home, .tv:
+            close()
+        default:
+            break
+        }
     }
 
     // MARK: 面板（持久 HostingView：视图树只建一次，之后全部走 sync() 状态驱动）
@@ -504,6 +566,8 @@ final class OverlayCenter {
                                    bundleID: $0.bundleIdentifier)
             }
             uiState.wheelIndex = wheelIndex
+            uiState.codexSnapshot = codexSnapshot
+            uiState.codexIndex = codexIndex
         }
         if animated {
             withAnimation(Motion.select) { apply() }
@@ -712,16 +776,27 @@ enum HintBarCatalog {
                     Hint(keys: [.back], text: "取消")]
         case .tutorial:
             return [Hint(keys: [.home, .back, .ok], text: "关闭教程")]
+        case .codexSessions:
+            return [Hint(keys: [.up, .down], text: "选会话（按住加速）"),
+                    Hint(keys: [.left, .right], text: "翻页"),
+                    Hint(keys: [.ok], text: "打开"),
+                    Hint(keys: [.back, .home, .tv], text: "取消")]
         }
     }
 
     /// 基础态的 per-app 覆盖提示：切到该 App 时闪一下，告诉用户这颗键在这里变了。
-    /// 只列 profile **显式声明**且基础态确实生效的槽位——当前引擎只放行 OK 的短按
-    /// （方向/返回在基础态恒为光标/删除，见 MappingEngine.overlayDeclared），
-    /// 所以这里只看 ok.tap；将来放行更多键时在此同步扩充，别让提示条许诺引擎不认的绑定。
+    /// 只列 profile 显式声明且基础态确实生效的槽位；Back 必须额外 opt-in，
+    /// 与 MappingEngine 的保护保持一致，避免提示条许诺引擎不认的绑定。
     static func hints(forBaseProfile bundleID: String, config: MappingConfig) -> [Hint] {
-        guard let action = config.profiles[bundleID]?["ok"]?.tap else { return [] }
-        return [Hint(keys: [.ok], text: ActionSummary.describe(action))]
+        var hints: [Hint] = []
+        if let action = config.profiles[bundleID]?["ok"]?.tap {
+            hints.append(Hint(keys: [.ok], text: ActionSummary.describe(action)))
+        }
+        if let binding = config.profiles[bundleID]?["back"], binding.overrideBase == true,
+           let action = binding.tap {
+            hints.append(Hint(keys: [.back], text: ActionSummary.describe(action)))
+        }
+        return hints
     }
 
     /// 层键表：该层每个键的绑定摘要（最多 5 条 + 退出提示），数据与 HUD 同源。
@@ -820,6 +895,8 @@ private struct OverlayRootView: View {
                     SystemMenuView(selected: state.menuIndex, confirming: state.menuConfirming)
                 case .appWheel:
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
+                case .codexSessions:
+                    CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
                 default:
                     EmptyView()
                 }

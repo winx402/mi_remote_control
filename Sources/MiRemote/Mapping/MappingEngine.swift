@@ -440,7 +440,9 @@ final class MappingEngine: @unchecked Sendable {
         // 基础文字输入态保护删除键：Profile 的 hold 不能篡改它。用户明确打开开关时，
         // 长按执行“全选 + 删除”；默认关闭时仍只发送普通 Delete。
         if key == .back, effectiveLayer == 0 {
-            if config.settings.deleteAllOnHold == true {
+            if let custom = baseBackOverride {
+                perform(custom.hold ?? custom.tap, key: key, isHold: true)
+            } else if config.settings.deleteAllOnHold == true {
                 runner.run(.macro(steps: [
                     .action(.keyStroke(key: "a", mods: ["left_cmd"])),
                     .action(.keyStroke(key: "delete", mods: [])),
@@ -538,8 +540,8 @@ final class MappingEngine: @unchecked Sendable {
             //（如飞书设了「Cmd+Enter 发送」）。global 改不动——见 overlayDeclared。
             action = overlayDeclared(.ok)?.tap ?? .keyStroke(key: "return", mods: [])
         } else if layer == 0, key == .back {
-            // 无论是否启用长按删除全部，短按都必须是普通 Delete。
-            action = .keyStroke(key: "delete", mods: [])
+            // 旧预设默认仍是 Delete；只有当前 App 明确开启覆盖才认自定义返回动作。
+            action = baseBackOverride?.tap ?? .keyStroke(key: "delete", mods: [])
         } else if layer == 0, let arrow = Self.nativeArrowName[key] {
             // 通常由 TapEngine 原生直通；OK 手势未命中等回退路径仍保持光标语义。
             action = .keyStroke(key: arrow, mods: [])
@@ -620,17 +622,22 @@ final class MappingEngine: @unchecked Sendable {
 
     /// per-app overlay 对某键的【显式】声明（继承自 global 的值不算）。
     ///
-    /// 基础文字输入态里只有 **OK 的短按** 认这种覆盖：OK 的语义恒为「确认/发送」，
+    /// 基础文字输入态里 OK 的短按认这种覆盖：OK 的语义恒为「确认/发送」，
     /// per-app 换个发送键（如飞书的 ⌘+Enter）不改变这颗键的心智模型；而 global 改不动，
     /// 一次误设不会污染所有 App。此前连 per-app 的显式设置也整条忽略——GUI 允许设、
     /// config.json 存得下、引擎运行时丢弃，用户只看到「设了没用」。
     ///
-    /// 方向键与返回键**不**走这条放行：它们在基础态必须保持光标/删除语义，
+    /// 方向键不放行；返回键仅在 App 显式声明 overrideBase=true 时放行，
     /// 而内置预设（Ghostty/浏览器/微信…）的 base 槽里躺着 back=Esc、左右=切标签一类
     /// 的历史绑定，一旦放行会让文字输入态突然删不了字、移不了光标。
     /// 这些 App 专属动作的正确归属是控制模式（layers["2"]）。
     private func overlayDeclared(_ key: RemoteKey) -> KeyBinding? {
         activeOverlay?[key.rawValue]
+    }
+
+    private var baseBackOverride: KeyBinding? {
+        guard let binding = overlayDeclared(.back), binding.overrideBase == true else { return nil }
+        return binding
     }
 
     /// per-app overlay 只覆盖声明的键，其余继承 global。
@@ -641,6 +648,7 @@ final class MappingEngine: @unchecked Sendable {
         if let value = overlay.tap { merged.tap = value }
         if let value = overlay.hold { merged.hold = value }
         if let value = overlay.double { merged.double = value }
+        if let value = overlay.overrideBase { merged.overrideBase = value }
         if let values = overlay.gesture {
             var gestures = merged.gesture ?? [:]
             for (direction, action) in values { gestures[direction] = action }
@@ -1120,6 +1128,50 @@ extension MappingEngine {
         expect(runner.actions == [.keyStroke(key: "return", mods: [])],
                "切走后 OK 回到普通 Return，实得 \(runner.actions)")
         return ok
+    }
+
+    /// 返回键覆盖只作用于显式选择的 App，并在模式超时后继续保持取消语义。
+    static func backOverrideSelfCheck() -> Bool {
+        let clock = ManualClock()
+        let runner = RecordingRunner()
+        var config = makeTestConfig()
+        config.profiles["global"]?["back"]?.overrideBase = true
+        config.profiles["com.example.old"] = [
+            "back": KeyBinding(tap: .keyStroke(key: "escape", mods: []))
+        ]
+        config.profiles["com.openai.codex"] = [
+            "back": KeyBinding(tap: .keyStroke(key: "escape", mods: []), overrideBase: true),
+            "tv": KeyBinding(tap: .layerToggle(2))
+        ]
+        let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                                   dispatch: { $0() },
+                                   scheduleAfter: { ms, work in clock.schedule(ms, work) })
+        func press(_ key: RemoteKey, duration: Int = 10) {
+            engine.handle(ButtonEvent(key: key, isDown: true, timeNs: 0))
+            clock.advance(duration)
+            engine.handle(ButtonEvent(key: key, isDown: false, timeNs: 0))
+        }
+        func expect(_ action: Action) -> Bool {
+            let matches = runner.actions == [action]
+            runner.actions.removeAll()
+            return matches
+        }
+        engine.setActiveProfile("com.example.old")
+        press(.back)
+        guard expect(.keyStroke(key: "delete", mods: [])) else { return false }
+        engine.setActiveProfile("com.openai.codex")
+        press(.back)
+        guard expect(.keyStroke(key: "escape", mods: [])) else { return false }
+        press(.back, duration: 110)
+        guard expect(.keyStroke(key: "escape", mods: [])) else { return false }
+        press(.tv)
+        clock.advance(21_000)
+        press(.back)
+        guard engine.tapRoute.effectiveLayer == 0,
+              expect(.keyStroke(key: "escape", mods: [])) else { return false }
+        engine.setActiveProfile("com.apple.TextEdit")
+        press(.back)
+        return expect(.keyStroke(key: "delete", mods: []))
     }
 
     static func resetSelfCheck() -> Bool {

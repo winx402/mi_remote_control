@@ -21,12 +21,21 @@
         "tap": { "type": "key_stroke", "key": "return" },
         "layers": { "2": { "type": "key_stroke", "key": "return" } }
       },
-      "back": { "layers": { "2": { "type": "key_stroke", "key": "escape" } } },
+      "back": {
+        "overrideBase": true,
+        "tap": { "type": "key_stroke", "key": "escape", "mods": [] },
+        "hold": { "type": "key_stroke", "key": "escape", "mods": [] },
+        "layers": { "2": { "type": "key_stroke", "key": "escape", "mods": [] } }
+      },
       "menu": {
         "tap": { "type": "key_stroke", "key": "p", "mods": ["left_cmd", "left_shift"] },
         "layers": { "2": { "type": "key_stroke", "key": "p", "mods": ["left_cmd", "left_shift"] } }
       },
-      "home": { "hold": { "type": "key_stroke", "key": "n", "mods": ["left_cmd"] } },
+      "home": {
+        "tap": { "type": "overlay", "value": "codex_sessions" },
+        "hold": { "type": "key_stroke", "key": "n", "mods": ["left_cmd"] },
+        "layers": { "2": { "type": "overlay", "value": "codex_sessions" } }
+      },
       "volUp": { "layers": { "2": { "type": "system", "value": "volume_up" } } },
       "volDown": { "layers": { "2": { "type": "system", "value": "volume_down" } } }
     }

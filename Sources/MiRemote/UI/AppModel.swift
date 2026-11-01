@@ -163,6 +163,7 @@ enum ActionSummary {
         ("tutorial", "按键教程浮层"),
         ("app_wheel", "App 轮盘（最近使用）"),
         ("open_settings", "打开 MiRemote 设置"),
+        ("codex_sessions", "Codex 会话列表"),
     ]
     static func overlayDisplay(_ v: String) -> String {
         overlayNames.first(where: { $0.value == v })?.display ?? "浮层 · \(v)"

@@ -234,6 +234,8 @@ enum SelfTest {
         // M2 模块自测
         expect(MappingEngine.selfCheck(), "MappingEngine 状态机自测")
         expect(MappingEngine.tapRouteSelfCheck(), "M3 方向键分流快照/判定自测")
+        expect(MappingEngine.backOverrideSelfCheck(), "Codex 基础返回覆盖及控制模式超时回归")
+        expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
         expect(ActionRunner.selfCheck(), "ActionRunner 键表/修饰位自测")
         expect(WorkspaceActions.selfCheck(), "WorkspaceActions 工作区动作目录自测")
         expect(Set(KeyRemapper.table.map(\.key)).isSuperset(of: [.volUp, .volDown]),

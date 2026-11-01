@@ -71,11 +71,17 @@ DESIGN §3.1b 的「内容操作」原则：基础态方向=光标、返回=删�
 
 唯一例外是 **OK 的短按**：per-app profile 显式声明时放行（语义仍是「确认/发送」，
 只是换了发送键，如飞书的 ⌘+Enter），`global` 与继承值仍被挡下。
-方向键与返回键不放行——内置预设（Ghostty/浏览器/微信…）的 base 槽里躺着 `back=Esc`、
+方向键不放行；返回键仅在 per-app 绑定显式设置 `overrideBase=true` 时采用该 App 的 tap，
+没有独立 hold 时长按也沿用 tap。未开启的旧预设仍不放行——内置预设的 base 槽里躺着 `back=Esc`、
 `左右=切标签` 一类历史绑定，一旦放行会让文字输入态突然删不了字、移不了光标；
 这些 App 专属动作的正确归属是控制模式 `layers["2"]`。
 放行范围若变动，`HintBarCatalog.hints(forBaseProfile:)` 要同步扩充，
 否则提示条会许诺引擎不认的绑定。
+
+Codex 会话列表使用独立 `codex_sessions` 浮层：通过本机 `codex app-server` 的
+`initialize` / `initialized` / `thread/list` 读取元数据，再用 `codex://threads/<id>`
+打开会话。不得为浏览会话调用 `thread/start`、`thread/resume` 或 `turn/start`，
+也不读取或搬运认证令牌；会话标题和目录不得写入仓库日志。
 
 ### 模块契约
 

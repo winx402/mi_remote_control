@@ -90,6 +90,12 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appMenu.addItem(about)
         appMenu.addItem(.separator())
 
+        let sessions = NSMenuItem(title: "Codex 会话列表",
+                                  action: #selector(showCodexSessions), keyEquivalent: "")
+        sessions.target = self
+        appMenu.addItem(sessions)
+        appMenu.addItem(.separator())
+
         let hide = NSMenuItem(title: "隐藏 MiRemote",
                               action: #selector(NSApplication.hide(_:)),
                               keyEquivalent: "h")
@@ -125,6 +131,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // 退出前清理：恢复 hidutil 中转、断开语音链路（AppServices.stop 幂等）。
         services?.stop()
+    }
+
+    @objc private func showCodexSessions() {
+        overlayCenter?.open("codex_sessions")
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

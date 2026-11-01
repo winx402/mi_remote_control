@@ -61,14 +61,14 @@
       "double": {
         "type": "key_stroke",
         "key": "left_arrow",
-        "mods": ["cmd"]
+        "mods": ["left_ctrl"]
       }
     },
     "right": {
       "double": {
         "type": "key_stroke",
         "key": "right_arrow",
-        "mods": ["cmd"]
+        "mods": ["left_ctrl"]
       }
     }
   },

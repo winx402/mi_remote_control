@@ -1023,8 +1023,8 @@ extension MappingEngine {
         var mouseHeld: Set<RemoteKey> = []
         var mouseEvents: [(RemoteKey, Bool)] = []
         var dragging = false
-        let doubleLeft = Action.keyStroke(key: "left_arrow", mods: ["cmd"])
-        let doubleRight = Action.keyStroke(key: "right_arrow", mods: ["cmd"])
+        let doubleLeft = Action.keyStroke(key: "left_arrow", mods: ["left_ctrl"])
+        let doubleRight = Action.keyStroke(key: "right_arrow", mods: ["left_ctrl"])
         var cfg = MappingConfig()
         cfg.globalShortcuts = [
             "left": KeyBinding(double: doubleLeft),
@@ -1066,9 +1066,9 @@ extension MappingEngine {
         clock.advance(1)
         expect(takeActions() == [.keyStroke(key: "left_arrow", mods: [])], "App 单击只发一个原方向键")
         twice(.left); clock.advance(500)
-        expect(takeActions() == [doubleLeft], "全局双击发送⌘←，覆盖 App 错误 double 且无单击前缀")
+        expect(takeActions() == [doubleLeft], "全局双击发送⌃←，覆盖 App 错误 double 且无单击前缀")
         twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "右双击独立发送⌘→")
+        expect(takeActions() == [doubleRight], "右双击独立发送⌃→")
 
         // 重复原始 down 不能延后按住决断；按住原生左右持续发键，松开后立即停。
         event(.right, true); clock.advance(100); event(.right, true); clock.advance(150)
@@ -1082,7 +1082,7 @@ extension MappingEngine {
         var captured: [ButtonEvent] = []
         engine.setOverlayCapture { captured.append($0) }
         twice(.left); clock.advance(500)
-        expect(captured.isEmpty && takeActions() == [doubleLeft], "浮层双击穿透为全局⌘←")
+        expect(captured.isEmpty && takeActions() == [doubleLeft], "浮层双击穿透为全局⌃←")
         tap(.right); clock.advance(250)
         expect(captured.map(\.key) == [.right, .right] && captured.map(\.isDown) == [true, false],
                "浮层单击回到原上下文的一对 down/up")
@@ -1119,7 +1119,7 @@ extension MappingEngine {
         dragging = true
         event(.left, true); clock.advance(250)
         twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "鼠标中右双击仍优先发送⌘→")
+        expect(takeActions() == [doubleRight], "鼠标中右双击仍优先发送⌃→")
         expect(!mouseActive && !dragging && mouseHeld.isEmpty,
                "全局组合键释放旧方向并退出拖拽")
         expect(mouseEvents.count == 2 && mouseEvents[0].1 && !mouseEvents[1].1,

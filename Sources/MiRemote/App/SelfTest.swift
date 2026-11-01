@@ -237,7 +237,7 @@ enum SelfTest {
         expect(MappingEngine.backOverrideSelfCheck(), "Codex 基础返回覆盖及控制模式超时回归")
         expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
         expect(IndependentGestures.selfCheck(), "独立全局手势单击/双击/长按互斥与取消")
-        expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局双击⌘方向键与方向按住释放")
+        expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局双击⌃方向键与方向按住释放")
         expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")

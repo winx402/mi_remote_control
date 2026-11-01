@@ -59,16 +59,14 @@
     },
     "left": {
       "double": {
-        "type": "key_stroke",
-        "key": "left_arrow",
-        "mods": ["left_ctrl"]
+        "type": "system",
+        "value": "space_left"
       }
     },
     "right": {
       "double": {
-        "type": "key_stroke",
-        "key": "right_arrow",
-        "mods": ["left_ctrl"]
+        "type": "system",
+        "value": "space_right"
       }
     }
   },

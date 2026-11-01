@@ -48,7 +48,9 @@ final class VoiceContinuityProbe {
         let outcome: Outcome
         let phaseA: Statistics
         let phaseB: Statistics
-        let baselinePCMFrames: Int
+        let baseline: Statistics
+        var baselinePCMFrames: Int { baseline.validPCMFrames }
+        let duplicateStarts: Int
         let hostOpenAttempted: Bool
         let detail: String
 
@@ -72,13 +74,15 @@ final class VoiceContinuityProbe {
             case .interrupted: result = "诊断被新按键或异常控制事件打断"
             }
             let b = hostOpenAttempted ? "\nB：\(phaseB.summary)" : "\nB：未执行"
-            return "\(result)。\(detail)\nA：\(phaseA.summary)\(b)\n" +
+            return "\(result)。\(detail)\n" +
+                "按住基线：\(baseline.notifications)包/\(baseline.bytes)B，有效PCM \(baseline.validPCMFrames)帧；同会话重复开始\(duplicateStarts)次\n" +
+                "A：\(phaseA.summary)\(b)\n" +
                 "仅验证本次短窗口的帧与能量；未保存、播放或识别音频，未验收长期收音或微信输入法。"
         }
 
         static func unavailable(_ outcome: Outcome, _ detail: String) -> Report {
             Report(outcome: outcome, phaseA: Statistics(), phaseB: Statistics(),
-                   baselinePCMFrames: 0, hostOpenAttempted: false, detail: detail)
+                   baseline: Statistics(), duplicateStarts: 0, hostOpenAttempted: false, detail: detail)
         }
     }
 
@@ -99,7 +103,9 @@ final class VoiceContinuityProbe {
     private var framingUnknown = false
     private var partial = Data()
     private var partialStartNs: UInt64?
-    private var baselinePCMFrames = 0
+    private var baseline = Statistics()
+    private var duplicateStarts = 0
+    private var streamSessionID: UInt16?
     private var phaseA = Statistics()
     private var phaseB = Statistics()
     private var hostOpenAttempted = false
@@ -124,7 +130,10 @@ final class VoiceContinuityProbe {
         case .physical:
             return finish(.timedOut, "实体语音流开始15秒后仍未观察到松键；请松开语音键。")
         case .afterRelease:
-            if baselinePCMFrames > 0 && phaseA.hasSustainedSignal {
+            guard baseline.validPCMFrames > 0 else {
+                return finish(.inconclusive, "按住阶段未取得有效PCM，不能判断松手行为，未主动重开麦克风。")
+            }
+            if phaseA.hasSustainedSignal {
                 return finish(.signalAfterRelease, "A窗口6秒；已排除最初1秒。")
             }
             phase = .closingPhysical
@@ -142,11 +151,11 @@ final class VoiceContinuityProbe {
             resetDecode()
             return [.openMicrophone]
         case .host:
-            if baselinePCMFrames > 0 && hostStarted && phaseB.hasSustainedSignal {
+            if hostStarted && phaseB.hasSustainedSignal {
                 return finish(.signalAfterHostOpen, "B窗口5秒；已排除主动开麦后的最初1秒。")
             }
             let hasUnverifiedData = phaseA.lateBytes > 0 || phaseB.lateBytes > 0
-            return finish(hasUnverifiedData || baselinePCMFrames == 0 ? .inconclusive : .noSignal,
+            return finish(hasUnverifiedData ? .inconclusive : .noSignal,
                           "\(decodeNote)。开麦写入或STREAM_START不作为声音证据。")
         case .finished: return []
         }
@@ -168,7 +177,15 @@ final class VoiceContinuityProbe {
         }
     }
 
-    func streamStarted(nowNs: UInt64) -> [Effect] {
+    func streamStarted(nowNs: UInt64, sessionID: UInt16? = nil) -> [Effect] {
+        // A repeated notification for an identified live session is not a fresh
+        // stream. Preserve its decoder and original deadline; it proves no audio.
+        if phase == .physical || (phase == .host && hostStarted) {
+            if let sessionID, streamSessionID == sessionID {
+                duplicateStarts += 1
+                return advance(nowNs: nowNs)
+            }
+        }
         if phase == .physical || phase == .afterRelease || phase == .closingPhysical {
             return finish(.interrupted, "出现意外的新语音流，本次不判定支持。")
         }
@@ -177,6 +194,7 @@ final class VoiceContinuityProbe {
         switch phase {
         case .armed:
             phase = .physical
+            streamSessionID = sessionID
             phaseStartNs = nowNs
             deadlineNs = nowNs + 15_000_000_000
             resetDecode()
@@ -184,6 +202,7 @@ final class VoiceContinuityProbe {
         case .host:
             guard !hostStarted else { return finish(.interrupted, "B出现重复STREAM_START，流代际不明确。") }
             hostStarted = true
+            streamSessionID = sessionID
             resetDecode()
             return []
         default: return finish(.interrupted, "出现意外的新语音流，本次不判定支持。")
@@ -223,7 +242,9 @@ final class VoiceContinuityProbe {
         guard effects.isEmpty, !data.isEmpty,
               phase == .physical || phase == .afterRelease || phase == .host else { return effects }
         let eligible = phase != .physical && nowNs >= phaseStartNs + 1_000_000_000
-        if phase == .afterRelease {
+        if phase == .physical {
+            observeRaw(&baseline, data: data, eligible: true, nowNs: nowNs)
+        } else if phase == .afterRelease {
             observeRaw(&phaseA, data: data, eligible: eligible, nowNs: nowNs)
         } else if phase == .host {
             observeRaw(&phaseB, data: data, eligible: eligible, nowNs: nowNs)
@@ -252,7 +273,7 @@ final class VoiceContinuityProbe {
             // first second too, to preserve the predictor for later valid frames.
             let pcm = canDecode ? decoder.decode(partial) : []
             if phase == .physical {
-                if canDecode { baselinePCMFrames += 1 }
+                observeFrame(&baseline, pcm: pcm, nowNs: nowNs)
             } else if whollyLate {
                 if phase == .afterRelease { observeFrame(&phaseA, pcm: pcm, nowNs: nowNs) }
                 else { observeFrame(&phaseB, pcm: pcm, nowNs: nowNs) }
@@ -319,7 +340,7 @@ final class VoiceContinuityProbe {
         phase = .finished
         resetDecode()
         return [.finished(Report(outcome: outcome, phaseA: phaseA, phaseB: phaseB,
-                                 baselinePCMFrames: baselinePCMFrames,
+                                 baseline: baseline, duplicateStarts: duplicateStarts,
                                  hostOpenAttempted: hostOpenAttempted, detail: detail))]
     }
 
@@ -335,9 +356,11 @@ final class VoiceContinuityProbe {
 
         let raw = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
         _ = raw.streamStarted(nowNs: 10)
+        raw.sync(predictor: 0, stepIndex: 40)
+        _ = raw.audio(Data(repeating: 0, count: 120), nowNs: 20)
         _ = raw.streamStopped(nowNs: 100)
-        _ = raw.audio(Data(repeating: 0, count: 120), nowNs: 500_000_100)
-        _ = raw.audio(Data(repeating: 0, count: 120), nowNs: 1_500_000_100)
+        _ = raw.audio(Data(repeating: 0, count: 60), nowNs: 500_000_100)
+        _ = raw.audio(Data(repeating: 0, count: 60), nowNs: 1_500_000_100)
         let closing = raw.advance(nowNs: 6_000_000_100)
         guard closing.contains(where: { if case .closeMicrophone = $0 { return true }; return false }) else { return false }
         let opening = raw.advance(nowNs: 6_300_000_100)
@@ -347,6 +370,34 @@ final class VoiceContinuityProbe {
               !noPCM.isSupportConfirmed, noPCM.phaseA.notifications == 2,
               noPCM.phaseA.lateNotifications == 1, noPCM.phaseA.validPCMFrames == 0,
               raw.physicalRequest(nowNs: 12_000_000_000).isEmpty else { return false }
+
+        // A missing physical baseline must never be mistaken for a failed
+        // continuous-mic feature; do not send a speculative host OPEN in that case.
+        let absent = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = absent.streamStarted(nowNs: 1)
+        _ = absent.streamStopped(nowNs: 100)
+        guard let missing = report(absent.advance(nowNs: 6_000_000_100)),
+              missing.outcome == .inconclusive, !missing.hostOpenAttempted,
+              missing.baseline.notifications == 0 else { return false }
+
+        // Same-session START echoes do not reset state or extend the deadline.
+        // A genuinely different session still invalidates the experiment.
+        let duplicate = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = duplicate.streamStarted(nowNs: 1, sessionID: 7)
+        duplicate.sync(predictor: 0, stepIndex: 40)
+        _ = duplicate.audio(Data(repeating: 0, count: 120), nowNs: 10)
+        guard duplicate.streamStarted(nowNs: 20, sessionID: 7).isEmpty else { return false }
+        _ = duplicate.streamStopped(nowNs: 100)
+        _ = duplicate.advance(nowNs: 6_000_000_100)
+        _ = duplicate.advance(nowNs: 6_300_000_100)
+        _ = duplicate.streamStarted(nowNs: 6_400_000_100, sessionID: 8)
+        guard duplicate.streamStarted(nowNs: 10_000_000_100, sessionID: 8).isEmpty,
+              let silent = report(duplicate.advance(nowNs: 11_300_000_100)),
+              silent.outcome == .noSignal, silent.duplicateStarts == 2,
+              silent.baselinePCMFrames == 1, !silent.isSupportConfirmed else { return false }
+        let changed = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = changed.streamStarted(nowNs: 1, sessionID: 7)
+        guard report(changed.streamStarted(nowNs: 2, sessionID: 8))?.outcome == .interrupted else { return false }
 
         let split = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
         _ = split.streamStarted(nowNs: 1)

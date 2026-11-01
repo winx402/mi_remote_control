@@ -158,13 +158,13 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard services != nil else { return }
         if voiceProbeRunning { voiceProbePanel?.makeKeyAndOrderFront(nil); return }
         if voiceProbePanel == nil {
-            let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 650, height: 270),
+            let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 650, height: 370),
                                 styleMask: [.titled, .closable], backing: .buffered, defer: false)
             panel.title = "遥控器连续收音验证"
             panel.isReleasedWhenClosed = false
             panel.delegate = self
             let label = NSTextField(wrappingLabelWithString: "")
-            label.frame = CGRect(x: 24, y: 70, width: 602, height: 172)
+            label.frame = CGRect(x: 24, y: 70, width: 602, height: 272)
             label.font = .systemFont(ofSize: 14)
             panel.contentView?.addSubview(label)
             let cancel = NSButton(title: "结束测试", target: self, action: #selector(cancelVoiceProbe))

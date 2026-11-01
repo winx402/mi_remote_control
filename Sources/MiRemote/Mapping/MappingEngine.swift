@@ -627,7 +627,7 @@ final class MappingEngine: @unchecked Sendable {
     private func runIndependentGlobal(_ action: Action) {
         guard action != .none else { return }
         switch action {
-        case .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
+        case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
              .system("space_left"), .system("space_right"):
             reservedDirectionGestures.reset()
             CodexNavigation.cancelScrolling()
@@ -636,7 +636,7 @@ final class MappingEngine: @unchecked Sendable {
         switch action {
         case .overlay, .openApp, .system("app_mru_back"):
             MouseMode.shared.deactivate()
-        case .system("space_left"), .system("space_right"):
+        case .keyStroke, .system("space_left"), .system("space_right"):
             reservedMouseDeactivate()
         default: break
         }
@@ -1023,10 +1023,12 @@ extension MappingEngine {
         var mouseHeld: Set<RemoteKey> = []
         var mouseEvents: [(RemoteKey, Bool)] = []
         var dragging = false
+        let doubleLeft = Action.keyStroke(key: "left_arrow", mods: ["cmd"])
+        let doubleRight = Action.keyStroke(key: "right_arrow", mods: ["cmd"])
         var cfg = MappingConfig()
         cfg.globalShortcuts = [
-            "left": KeyBinding(double: .system("space_left")),
-            "right": KeyBinding(double: .system("space_right")),
+            "left": KeyBinding(double: doubleLeft),
+            "right": KeyBinding(double: doubleRight),
         ]
         cfg.profiles["com.example.editor"] = [
             "left": KeyBinding(tap: .keyStroke(key: "left_arrow", mods: []),
@@ -1064,9 +1066,9 @@ extension MappingEngine {
         clock.advance(1)
         expect(takeActions() == [.keyStroke(key: "left_arrow", mods: [])], "App 单击只发一个原方向键")
         twice(.left); clock.advance(500)
-        expect(takeActions() == [.system("space_left")], "全局双击覆盖 App 错误 double 且无单击前缀")
+        expect(takeActions() == [doubleLeft], "全局双击发送⌘←，覆盖 App 错误 double 且无单击前缀")
         twice(.right); clock.advance(500)
-        expect(takeActions() == [.system("space_right")], "右双击独立切右侧 Space")
+        expect(takeActions() == [doubleRight], "右双击独立发送⌘→")
 
         // 重复原始 down 不能延后按住决断；按住原生左右持续发键，松开后立即停。
         event(.right, true); clock.advance(100); event(.right, true); clock.advance(150)
@@ -1080,7 +1082,7 @@ extension MappingEngine {
         var captured: [ButtonEvent] = []
         engine.setOverlayCapture { captured.append($0) }
         twice(.left); clock.advance(500)
-        expect(captured.isEmpty && takeActions() == [.system("space_left")], "浮层双击穿透为全局 Space")
+        expect(captured.isEmpty && takeActions() == [doubleLeft], "浮层双击穿透为全局⌘←")
         tap(.right); clock.advance(250)
         expect(captured.map(\.key) == [.right, .right] && captured.map(\.isDown) == [true, false],
                "浮层单击回到原上下文的一对 down/up")
@@ -1117,11 +1119,11 @@ extension MappingEngine {
         dragging = true
         event(.left, true); clock.advance(250)
         twice(.right); clock.advance(500)
-        expect(takeActions() == [.system("space_right")], "鼠标中右双击仍优先切 Space")
+        expect(takeActions() == [doubleRight], "鼠标中右双击仍优先发送⌘→")
         expect(!mouseActive && !dragging && mouseHeld.isEmpty,
-               "Space 动作释放旧方向并退出拖拽")
+               "全局组合键释放旧方向并退出拖拽")
         expect(mouseEvents.count == 2 && mouseEvents[0].1 && !mouseEvents[1].1,
-               "Space 动作只给已转发方向补一次 up")
+               "全局组合键只给已转发方向补一次 up")
         event(.left, false); event(.right, false); clock.advance(500)
         expect(takeActions().isEmpty && mouseHeld.isEmpty, "两侧方向松开后无遗留动作")
 

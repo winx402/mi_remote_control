@@ -233,7 +233,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             self.clearVoiceFrameState()
             self.voiceContinuityProbe = VoiceContinuityProbe(version: self.protocolVersion,
                 frameSize: self.capsFrameLen, nowNs: DispatchTime.now().uptimeNanoseconds)
-            self.publishProbeUpdate("诊断已等待：请在15秒内短按语音键并说一句，然后松手。松手1秒后继续说话；请等待结果，期间不要再次按键。")
+            self.publishProbeUpdate("诊断已等待：请在15秒内按住语音键说话约2秒，再松手。松手1秒后继续说话；请等待结果，期间不要再次按键。")
             self.scheduleVoiceProbeTick()
         }
     }
@@ -309,7 +309,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let closeAttempted = attemptProbeMicClose()
         probePendingReport = VoiceContinuityProbe.Report(outcome: report.outcome,
             phaseA: report.phaseA, phaseB: report.phaseB,
-            baselinePCMFrames: report.baselinePCMFrames,
+            baseline: report.baseline, duplicateStarts: report.duplicateStarts,
             hostOpenAttempted: report.hostOpenAttempted,
             detail: report.detail + (closeAttempted ? " 已请求关闭麦克风。" : " 断连导致关闭命令无法送达。"))
         clearVoiceFrameState()
@@ -702,7 +702,8 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             case 0x08: applyVoiceProbeEffects(probe.physicalRequest(nowNs: now))
             case 0x04:
                 sessionID = Self.parseStreamSessionID(b)
-                applyVoiceProbeEffects(probe.streamStarted(nowNs: now))
+                applyVoiceProbeEffects(probe.streamStarted(nowNs: now,
+                    sessionID: b.count >= 4 ? sessionID : nil))
             case 0x00: applyVoiceProbeEffects(probe.streamStopped(nowNs: now))
             case 0x0A:
                 if let sync = Self.parseSync(b) {

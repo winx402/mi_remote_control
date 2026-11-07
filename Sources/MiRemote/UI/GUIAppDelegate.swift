@@ -336,6 +336,11 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     case .mouseMode:
                         self.overlayCenter?.close()
                         MouseMode.shared.toggle()
+                    case .system("quit_app"):
+                        // Capture the foreground application before closing panels.
+                        ActionRunner().run(action)
+                        self.overlayCenter?.close()
+                        MouseMode.shared.deactivate()
                     case .openApp, .system("app_mru_back"):
                         self.overlayCenter?.close()
                         MouseMode.shared.deactivate()

@@ -29,7 +29,7 @@ enum SystemMenuCatalog {
         .init(title: "播放 / 暂停", symbol: "playpause",                   action: .system("play_pause")),
         .init(title: "静音",       symbol: "speaker.slash",               action: .system("mute")),
         .init(title: "打开 MiRemote 设置", symbol: "gearshape",           action: .overlay("open_settings")),
-        .init(title: "退出当前 App", symbol: "escape",                    action: .keyStroke(key: "q", mods: ["left_cmd"]), dangerous: true),
+        .init(title: "退出当前 App", symbol: "escape",                    action: .system("quit_app"), dangerous: true),
         .init(title: "锁屏",       symbol: "lock",                        action: .system("lock_screen"), dangerous: true),
         .init(title: "睡眠",       symbol: "moon.zzz",                    action: .system("display_sleep"), dangerous: true),
     ]
@@ -84,7 +84,7 @@ enum SystemMenuCatalog {
             switch item.action {
             case .system(let name): if !known.contains(name) { return false }
             case .focusInput: break
-            case .keyStroke: break   // 退出当前 App = ⌘Q
+            case .keyStroke: break
             case .overlay(let name): if name != "open_settings" { return false }
             default: return false
             }
@@ -897,7 +897,7 @@ enum HintBarCatalog {
          Hint(keys: [.menu], text: "双击系统面板 · 长按鼠标"),
          Hint(keys: [.tv], text: "单击 Codex · 双击上个 App"),
          Hint(keys: [.power], text: "电脑电源"),
-         Hint(keys: [.back], text: "长按 1.2 秒退出模式")]
+         Hint(keys: [.back], text: "长按 1.2 秒退出当前应用")]
     }
 
     static func hintsForCodex() -> [Hint] {
@@ -907,7 +907,7 @@ enum HintBarCatalog {
          Hint(keys: [.menu], text: "单击命令 · 长按鼠标"),
          Hint(keys: [.tv], text: "长按模型"),
          Hint(keys: [.voice], text: "单击聚焦"),
-         Hint(keys: [.back], text: "长按 1.2 秒退出模式")]
+         Hint(keys: [.back], text: "长按 1.2 秒退出当前应用")]
     }
 
     static func hintsForMouse(status: String = "鼠标模式") -> [Hint] {
@@ -915,7 +915,7 @@ enum HintBarCatalog {
          Hint(keys: [.up, .down, .left, .right], text: "移动 · 左右双击 ⌃← / ⌃→"),
          Hint(keys: [.ok], text: "左键"),
          Hint(keys: [.menu], text: "单击右键 · 长按退出"),
-         Hint(keys: [.back], text: "退出鼠标")]
+         Hint(keys: [.back], text: "单击退出鼠标 · 长按退出应用")]
     }
 
     /// 基础态的 per-app 覆盖提示：切到该 App 时闪一下，告诉用户这颗键在这里变了。

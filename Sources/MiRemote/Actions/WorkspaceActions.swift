@@ -64,6 +64,7 @@ enum WorkspaceAction: String, CaseIterable, Sendable {
     case minimizeWindow = "minimize_window"
     case minimizeApplicationWindows = "minimize_app_windows"
     case closeWindow = "close_window"
+    case quitApplication = "quit_app"
     case toggleFullScreen = "toggle_full_screen"
     case hideApplication = "hide_app"
     case hideOtherApplications = "hide_other_apps"
@@ -156,6 +157,7 @@ enum WorkspaceActions {
         .init(action: .minimizeWindow, title: "最小化当前窗口", category: "当前窗口", shortcut: "⌘M"),
         .init(action: .minimizeApplicationWindows, title: "最小化当前应用全部窗口", category: "当前窗口", shortcut: "⌥⌘M"),
         .init(action: .closeWindow, title: "关闭当前窗口", category: "当前窗口", shortcut: "⌘W"),
+        .init(action: .quitApplication, title: "退出当前应用", category: "当前窗口", shortcut: "正常退出"),
         .init(action: .toggleFullScreen, title: "进入或退出全屏", category: "当前窗口", shortcut: "⌃⌘F"),
         .init(action: .hideApplication, title: "隐藏当前应用", category: "当前窗口", shortcut: "⌘H"),
         .init(action: .hideOtherApplications, title: "隐藏其他应用", category: "当前窗口", shortcut: "⌥⌘H"),
@@ -217,6 +219,10 @@ enum WorkspaceActions {
     }
 
     static func perform(_ action: WorkspaceAction) {
+        if action == .quitApplication {
+            quitFrontmostApplication()
+            return
+        }
         if action == .focusInput {
             FocusInput.perform()
             return
@@ -240,7 +246,7 @@ enum WorkspaceActions {
 
         let shortcutActions = Set(shortcuts.keys)
         guard shortcutActions == Set(WorkspaceAction.allCases.filter {
-            $0 != .focusInput && $0 != .showDesktop
+            $0 != .focusInput && $0 != .showDesktop && $0 != .quitApplication
         }) else { return false }
         guard shortcuts.values.allSatisfy({ shortcut in
             shortcut.modifiers.count == Set(shortcut.modifiers.map(\.rawValue)).count
@@ -262,6 +268,21 @@ enum WorkspaceActions {
 
     private static func chord(_ keyCode: CGKeyCode, _ modifiers: [WorkspaceModifier]) -> WorkspaceShortcut {
         WorkspaceShortcut(keyCode: keyCode, modifiers: modifiers)
+    }
+
+    /// Snapshot the target before UI cleanup can change focus. Request normal
+    /// termination, allowing the application's own save/cancel flow to run.
+    private static func quitFrontmostApplication() {
+        guard let target = NSWorkspace.shared.frontmostApplication,
+              target.activationPolicy == .regular, !target.isTerminated else { return }
+        DispatchQueue.main.async {
+            guard !target.isTerminated else { return }
+            if target == NSRunningApplication.current {
+                NSApp.terminate(nil)
+            } else if !target.terminate() {
+                log("退出当前应用：正常退出请求未能发送")
+            }
+        }
     }
 
     /// 合成 Fn+F11 受用户功能键设置与系统符号快捷键状态影响，实机可完全无响应。

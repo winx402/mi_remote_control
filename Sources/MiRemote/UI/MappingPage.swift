@@ -227,7 +227,7 @@ struct MappingPage: View {
             }
 
             Text(model.config.globalShortcuts != nil
-                 ? "独立全局快捷键可在「通用」页查看。本页编辑未被保留的应用动作；返回长按退出临时模式。"
+                 ? "独立全局快捷键可在「通用」页查看。本页编辑未被保留的应用动作；返回长按 1.2 秒退出当前应用。"
                  : "绑定组合键可点击「录制快捷键」。如果不确定当前状态，可再按一下 TV 键退出 App 控制模式。")
                 .font(.footnote)
                 .foregroundStyle(.tertiary)

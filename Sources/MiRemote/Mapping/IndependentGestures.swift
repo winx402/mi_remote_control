@@ -24,6 +24,8 @@ final class IndependentGestures {
 
     func reset() { serial &+= 1; states.removeAll() }
 
+    func isTracking(_ key: RemoteKey) -> Bool { states[key] != nil }
+
     func handle(_ event: ButtonEvent, policy: Policy) {
         let key = event.key
         if event.isDown {

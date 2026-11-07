@@ -41,7 +41,7 @@
     "back": {
       "hold": {
         "type": "system",
-        "value": "remote_reset"
+        "value": "quit_app"
       },
       "holdMs": 1200
     },

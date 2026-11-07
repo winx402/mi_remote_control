@@ -467,7 +467,7 @@ final class MappingEngine: @unchecked Sendable {
             if let handler = overlayHandler { mainDispatch { handler(event) }; return }
             if MouseMode.shared.handle(key: key, isDown: event.isDown) { return }
         }
-        if event.isDown, gestureContexts[key] == nil {
+        if event.isDown, !independentGestures.isTracking(key) {
             gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
         }
         let reserved = config.globalShortcuts?[key.rawValue]
@@ -628,7 +628,7 @@ final class MappingEngine: @unchecked Sendable {
         guard action != .none else { return }
         switch action {
         case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
-             .system("space_left"), .system("space_right"):
+             .system("space_left"), .system("space_right"), .system("quit_app"):
             reservedDirectionGestures.reset()
             CodexNavigation.cancelScrolling()
         default: break
@@ -636,7 +636,7 @@ final class MappingEngine: @unchecked Sendable {
         switch action {
         case .overlay, .openApp, .system("app_mru_back"):
             MouseMode.shared.deactivate()
-        case .keyStroke, .system("space_left"), .system("space_right"):
+        case .keyStroke, .system("space_left"), .system("space_right"), .system("quit_app"):
             reservedMouseDeactivate()
         default: break
         }
@@ -1210,6 +1210,40 @@ extension MappingEngine {
         engine.setActiveProfile("com.example.other")
         twice(.tv)
         guard equals([.system("app_mru_back")]) else { return false }
+
+        // Global Back hold must override App/panel bindings, fire once, and never
+        // replay a tap into the application focused by the quit operation.
+        var quitConfig = cfg
+        quitConfig.globalShortcuts?["back"] = KeyBinding(hold: .system("quit_app"), holdMs: 1200)
+        quitConfig.profiles["com.openai.codex"]?["back"] = KeyBinding(
+            tap: .keyStroke(key: "escape", mods: []), hold: .system("mute"), overrideBase: true)
+        engine.setConfig(quitConfig)
+        engine.setActiveProfile("com.openai.codex")
+        tap(.back)
+        guard equals([.keyStroke(key: "escape", mods: [])]) else { return false }
+        captured.removeAll()
+        engine.setOverlayCapture { captured.append($0) }
+        event(.back, true); clock.advance(1199)
+        guard equals([]), captured.isEmpty else { return false }
+        clock.advance(1)
+        guard equals([.system("quit_app")]), captured.isEmpty else { return false }
+        event(.back, true) // repeated raw down while still physically held
+        engine.setActiveProfile("com.example.next")
+        clock.advance(1800); event(.back, false)
+        guard equals([]), captured.isEmpty else { return false }
+        engine.setOverlayCapture(nil)
+        tap(.back)
+        guard equals([.keyStroke(key: "delete", mods: [])]) else { return false }
+        event(.back, true); clock.advance(1200)
+        guard equals([.system("quit_app")]) else { return false }
+        event(.back, true)
+        engine.setActiveProfile("com.example.afterQuit")
+        event(.back, false)
+        guard equals([]) else { return false }
+        tap(.back)
+        guard equals([.keyStroke(key: "delete", mods: [])]) else { return false }
+        event(.back, true); clock.advance(1199); event(.back, false)
+        guard equals([.keyStroke(key: "delete", mods: [])]) else { return false }
         engine.resetInputState(reason: "test")
         event(.volUp, true); event(.volUp, false)
         return equals([.system("volume_up")])

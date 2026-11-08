@@ -124,6 +124,19 @@ final class ApplicationNavigationController {
         if suspended { disable() } else { refresh() }
     }
 
+    /// Explicit diagnostic only: does not navigate, change selection, or issue native fallback.
+    func diagnoseDouyin(completion: @escaping @MainActor @Sendable (String) -> Void) {
+        refresh()
+        guard isEnabled, let context, let session,
+              context.bundleID == "com.bytedance.douyin.desktop",
+              let front = NSWorkspace.shared.frontmostApplication,
+              front.bundleIdentifier == context.bundleID, front.processIdentifier == context.pid else {
+            completion("生产AX诊断未执行：请将已启用应用导航的抖音切到前台。")
+            return
+        }
+        accessibility.diagnosticScan(session: session, completion: completion)
+    }
+
     /// Only the caller's resolved directional, OK and short-Back events should arrive here.
     /// Direction key-down selects immediately; repeat is bounded and key-up cancels its timer.
     func handle(_ key: RemoteKey, isDown: Bool) {

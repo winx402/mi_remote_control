@@ -8,6 +8,7 @@ struct GeneralPage: View {
     var onShowHealthCheck: () -> Void
 
     @State private var loginItemOn = false
+    @State private var navigationDiagnosticsExpanded = false
 
     var body: some View {
         ScrollView {
@@ -34,6 +35,13 @@ struct GeneralPage: View {
                             set: { model.config.appNavigationProfiles = $0; model.saveConfig() }),
                         status: model.applicationNavigationStatus)
                         .padding(14)
+                    if !model.applicationNavigationDiagnostics.isEmpty {
+                        DisclosureGroup("导航诊断结果", isExpanded: $navigationDiagnosticsExpanded) {
+                            Text(model.applicationNavigationDiagnostics)
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                        }.padding(14)
+                    }
                 }
 
                 SettingsGroup(title: "Dock 应用选择") {

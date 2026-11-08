@@ -134,6 +134,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let dockMenu = NSMenuItem(title: "Dock 应用选择…", action: #selector(showDockPicker), keyEquivalent: "")
         dockMenu.target = self
         appMenu.addItem(dockMenu)
+        let diagnostics = NSMenuItem(title: "检查抖音导航…", action: #selector(diagnoseDouyinNavigation), keyEquivalent: "")
+        diagnostics.target = self
+        appMenu.addItem(diagnostics)
         let probe = NSMenuItem(title: "验证遥控器连续收音…",
                                action: #selector(startVoiceProbe), keyEquivalent: "")
         probe.target = self
@@ -186,6 +189,25 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showSystemMenu() { openOverlay("system_menu") }
     @objc private func showDockPicker() { openOverlay("dock_picker") }
+
+    @objc private func diagnoseDouyinNavigation() {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.bytedance.douyin.desktop")
+            .first(where: { !$0.isTerminated }) else {
+            model.applicationNavigationDiagnostics = "请先打开抖音，再检查导航。"
+            return
+        }
+        model.applicationNavigationDiagnostics = "正在检查；结果显示在通用 → 应用内遥控 → 导航诊断结果。"
+        let settleDelay: TimeInterval = app.isActive ? 0 : 0.8
+        WindowSwitcher.activateApplication(app) { [weak self] _ in
+            // Fullscreen activation can deliver a later Space notification. Let the
+            // controller establish the final session before a read-only scan.
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
+                self?.applicationNavigation.diagnoseDouyin { [weak self] production in
+                    self?.model.applicationNavigationDiagnostics = production
+                }
+            }
+        }
+    }
 
     private func openOverlay(_ name: String) {
         if name == "dock_picker" {

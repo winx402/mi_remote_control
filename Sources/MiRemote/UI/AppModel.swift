@@ -246,6 +246,7 @@ final class AppModel: ObservableObject {
     @Published var lastPressedKey: RemoteKey?
     @Published var dockNavigationStatus = "尚未开启 Dock 选择"
     @Published var applicationNavigationStatus = "当前应用使用原有按键"
+    @Published var applicationNavigationDiagnostics = ""
     var onApplicationNavigationConfigChanged: (([String: AppNavigationProfile]) -> Void)?
     /// inline「已保存」微提示（自增触发）
     @Published var savedTick = 0

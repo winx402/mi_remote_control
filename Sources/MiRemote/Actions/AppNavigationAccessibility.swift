@@ -6,6 +6,7 @@ import os
 // BEGIN PURE APP NAVIGATION ACCESSIBILITY LOGIC
 /// Pure policies used by the worker. Can be extracted with Foundation/CoreGraphics only.
 enum AppNavigationAccessibilityLogic {
+    static let hierarchyLimit = 64
     static let containerRoles: Set<String> = [
         "AXGroup", "AXList", "AXOutline", "AXTable", "AXBrowser", "AXTabGroup", "AXSplitGroup",
         "AXToolbar", "AXScrollArea", "AXRadioGroup", "AXGrid", "AXLayoutArea", "AXWebArea", "AXRow",
@@ -20,6 +21,37 @@ enum AppNavigationAccessibilityLogic {
         "button", "push button", "toggle button", "menu button", "pop up button", "checkbox", "radio button",
         "按钮", "切换按钮", "菜单按钮", "弹出式按钮", "复选框", "单选按钮"
     ]
+
+    enum IdentityInsertion: Equatable { case inserted, collision, duplicate }
+    struct IdentityBuckets<Element> {
+        private var buckets: [UInt: [Element]] = [:]
+        mutating func insert(_ element: Element, hash: UInt,
+                             equals: (Element, Element) -> Bool) -> IdentityInsertion {
+            let bucket = buckets[hash] ?? []
+            if bucket.contains(where: { equals($0, element) }) { return .duplicate }
+            buckets[hash, default: []].append(element)
+            return bucket.isEmpty ? .inserted : .collision
+        }
+    }
+
+    enum ChildFailure: Equatable { case temporary, unsupported, noValue, other }
+    static func mayRetryChildren(_ failure: ChildFailure, container: Bool,
+                                 recoveryAttempts: Int, remaining: TimeInterval) -> Bool {
+        failure == .temporary && container && recoveryAttempts < 3 && remaining >= 0.04
+    }
+    static func childrenFailureIsPartial(_ failure: ChildFailure, container: Bool) -> Bool {
+        switch failure {
+        case .noValue: false
+        case .unsupported: container
+        case .temporary, .other: true
+        }
+    }
+    static func pruneSubtree(hiddenExplicit: Bool, visible: Bool?, hasFrame: Bool) -> Bool {
+        hiddenExplicit || (visible == false && hasFrame)
+    }
+    static func childrenTruncated(returned: Int, limit: Int, reportedCount: Int?) -> Bool {
+        returned >= limit && (reportedCount == nil || reportedCount! > returned)
+    }
 
     static func isButtonCandidate(role: String, roleDescription: String, actions: [String],
                                   selectableRow: Bool) -> Bool {
@@ -49,7 +81,7 @@ enum AppNavigationAccessibilityLogic {
     static func hitBelongsToTarget(_ path: [HitStep], expectedPID: Int32) -> Bool {
         let inputRoles: Set<String> = ["AXTextArea", "AXTextField", "AXSearchField", "AXComboBox"]
         let transientRoles: Set<String> = ["AXSheet", "AXDialog", "AXWindow", "AXMenu", "AXMenuItem"]
-        guard !path.isEmpty, path.count <= 22 else { return false }
+        guard !path.isEmpty, path.count <= hierarchyLimit else { return false }
         for step in path {
             guard step.ownerPID == expectedPID, step.enabled, !step.hidden,
                   !inputRoles.contains(step.role), step.subrole != "AXSecureTextField" else { return false }
@@ -102,7 +134,7 @@ enum AppNavigationAccessibilityLogic {
         for container in containers where valid(container.frame) {
             var parent = container.parentID
             var visited: Set<Int> = [container.id]
-            for _ in 0..<24 {
+            for _ in 0..<hierarchyLimit {
                 guard let id = parent, visited.insert(id).inserted else { break }
                 add(container.frame, to: id)
                 parent = parents[id]
@@ -112,6 +144,22 @@ enum AppNavigationAccessibilityLogic {
     }
 
     static func selfCheck() -> Bool {
+        var identities = IdentityBuckets<String>()
+        guard identities.insert("first", hash: 8, equals: ==) == .inserted,
+              identities.insert("second", hash: 8, equals: ==) == .collision,
+              identities.insert("first", hash: 8, equals: ==) == .duplicate,
+              !pruneSubtree(hiddenExplicit: false, visible: false, hasFrame: false),
+              pruneSubtree(hiddenExplicit: false, visible: false, hasFrame: true),
+              pruneSubtree(hiddenExplicit: true, visible: nil, hasFrame: false),
+              mayRetryChildren(.temporary, container: true, recoveryAttempts: 0, remaining: 0.1),
+              !mayRetryChildren(.temporary, container: true, recoveryAttempts: 3, remaining: 0.1),
+              !mayRetryChildren(.temporary, container: true, recoveryAttempts: 0, remaining: 0.01),
+              childrenFailureIsPartial(.temporary, container: false),
+              childrenFailureIsPartial(.unsupported, container: true),
+              !childrenFailureIsPartial(.unsupported, container: false),
+              !childrenTruncated(returned: 160, limit: 160, reportedCount: 160),
+              childrenTruncated(returned: 160, limit: 160, reportedCount: 161),
+              childrenTruncated(returned: 160, limit: 160, reportedCount: nil) else { return false }
         guard containerRoles.contains("AXVideo"), containerRoles.contains("AXPlayer") else { return false }
         guard isButtonCandidate(role: "AXButton", roleDescription: "", actions: [], selectableRow: false),
               isButtonCandidate(role: "AXLink", roleDescription: "", actions: [], selectableRow: false),
@@ -269,13 +317,69 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         let roleDescription: String
         let frame: CGRect?
         let enabled: Bool
-        let hidden: Bool
+        let hiddenExplicit: Bool
+        let visible: Bool?
         let focused: Bool
+        var hidden: Bool { hiddenExplicit || visible == false }
     }
 
     private struct Budget {
         let deadline: TimeInterval
         let generation: UInt64
+    }
+
+    /// Queue-owned counters only. No AX references, titles, labels, values, URLs or coordinates.
+    private final class ScanMetrics {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        var stages: [String: TimeInterval] = [:]
+        var counts: [String: Int] = [
+            "visited": 0, "unique": 0, "enqueued": 0, "hashCollision": 0, "trueDup": 0,
+            "disabled": 0, "hiddenExplicit": 0, "visibleFalse": 0, "visiblePrune": 0,
+            "nonvisualWrapperRetained": 0, "incompleteReads": 0, "children.calls": 0,
+            "children.retries": 0, "children.fullFallback": 0, "bulk.calls": 0, "bulk.retries": 0
+        ]
+        var roles: [String: Int] = [:]
+        var errors: [String: [Int32: Int]] = [:]
+        var focusedPIDs: [pid_t] = []
+        var exitStage = "start"
+
+        func count(_ key: String, _ amount: Int = 1) { counts[key, default: 0] += amount }
+        func error(_ group: String, _ error: AXError) {
+            guard error != .success else { return }
+            errors[group, default: [:]][error.rawValue, default: 0] += 1
+            if error == .cannotComplete { count("\(group).cannotComplete/timeoutLike") }
+        }
+        func role(_ role: String) {
+            let safe = role.hasPrefix("AX") && role.count <= 40
+                && role.unicodeScalars.allSatisfy { $0.isASCII && CharacterSet.alphanumerics.contains($0) }
+            roles[safe ? role : "OtherRole", default: 0] += 1
+        }
+        func report(reply: Reply, sessionPID: pid_t, workspacePID: pid_t?, ticketValid: Bool) -> String {
+            let result: String
+            switch reply {
+            case .snapshot(let snapshot):
+                result = "snapshot nodes=\(snapshot.nodes.count) containers=\(snapshot.containers.count) limited=\(snapshot.limited)"
+            case .cancelled: result = "cancelled"
+            case .menu: result = "menu"
+            case .unavailable: result = "unavailable"
+            case .staleSelection: result = "staleSelection"
+            case .performed, .editing, .menuPerformed: result = "unexpected-non-scan-result"
+            }
+            let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+            let timings = stages.keys.sorted().map { "\($0)=\(String(format: "%.1f", (stages[$0] ?? 0) * 1000))" }.joined(separator: " ")
+            let counters = counts.keys.sorted().map { "\($0)=\(counts[$0] ?? 0)" }.joined(separator: " ")
+            let histogram = roles.keys.sorted().map { "\($0):\(roles[$0] ?? 0)" }.joined(separator: " ")
+            let failures = errors.keys.sorted().map { group in
+                let values = (errors[group] ?? [:]).sorted { $0.key < $1.key }
+                    .map { "\($0.key):\($0.value)" }.joined(separator: ",")
+                return "\(group)=[\(values)]"
+            }.joined(separator: " ")
+            let focus = focusedPIDs.map { String($0) }.joined(separator: ",")
+            return "生产AX扫描 forcedFresh=1 result=\(result) exit=\(exitStage) ticketValid=\(ticketValid)\n"
+                + "PID session=\(sessionPID) workspaceStart=\(workspacePID.map { String($0) } ?? "nil") focused=[\(focus)]\n"
+                + "time(ms) total=\(String(format: "%.1f", elapsed * 1000)) \(timings)\n"
+                + "counts \(counters)\nroles \(histogram)\nerrors \(failures)"
+        }
     }
 
     private let queue = DispatchQueue(label: "com.miremote.app-navigation.ax", qos: .userInitiated)
@@ -285,7 +389,14 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     private var nextContainerID = 0
     private var nextWindowID: UInt64 = 0
     private var initializedElectronGeneration: UInt64?
-    private let messageTimeout: Float = 0.018
+    private var activeMetrics: ScanMetrics?
+    private var scanning = false
+    private var scanReadIncomplete = false
+    private var scanRecoveryAttempts = 0
+    private var lastChildrenComplete = true
+    // AX messages from web-backed apps routinely exceed a display frame. These
+    // execute on our serial worker; a short UI-frame timeout only discards valid trees.
+    private let messageTimeout: Float = 0.12
     private static let inputRoles: Set<String> = ["AXTextArea", "AXTextField", "AXSearchField", "AXComboBox"]
     private static let excludedSubroles: Set<String> = [
         "AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton", "AXSecureTextField"
@@ -314,6 +425,49 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         return true
     }
 
+    /// Explicit Douyin-only production-path diagnostic. It never requests an action or key.
+    /// Invalidate only the cache age, preserving identities and the controller's selection.
+    @MainActor
+    func diagnosticScan(session: Session, completion: @escaping @MainActor @Sendable (String) -> Void) {
+        let front = NSWorkspace.shared.frontmostApplication
+        guard session.bundleID == "com.bytedance.douyin.desktop",
+              front?.bundleIdentifier == session.bundleID, front?.processIdentifier == session.pid else {
+            completion("生产AX诊断未执行：需要已配置且位于前台的抖音。")
+            return
+        }
+        guard gate.withLock({ $0.begin(session.generation) }) else {
+            completion("生产AX诊断未执行：扫描繁忙或会话已失效。")
+            return
+        }
+        let workspacePID = front?.processIdentifier
+        queue.async { [self] in
+            let metrics = ScanMetrics()
+            activeMetrics = metrics
+            cache?.scannedAt = 0
+            let reply = run(.scan, session: session)
+            let report = metrics.report(reply: reply, sessionPID: session.pid,
+                                        workspacePID: workspacePID, ticketValid: current(session))
+            activeMetrics = nil
+            gate.withLock { $0.finish(session.generation) }
+            Task { @MainActor in
+                let finalPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                completion(report + "\nPID workspaceEnd=\(finalPID.map { String($0) } ?? "nil")")
+            }
+        }
+    }
+
+    private func timed<T>(_ stage: String, _ body: () -> T) -> T {
+        guard let metrics = activeMetrics else { return body() }
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { metrics.stages[stage, default: 0] += ProcessInfo.processInfo.systemUptime - start }
+        return body()
+    }
+
+    private func incompleteRead() {
+        if scanning { scanReadIncomplete = true }
+        activeMetrics?.count("incompleteReads")
+    }
+
     private func current(_ session: Session) -> Bool {
         gate.withLock { $0.accepts(session.generation) }
     }
@@ -324,20 +478,33 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     }
 
     private func run(_ request: Request, session: Session) -> Reply {
+        let isScan: Bool
+        if case .scan = request { isScan = true } else { isScan = false }
+        if isScan {
+            scanning = true
+            scanReadIncomplete = false
+            scanRecoveryAttempts = 0
+        }
+        defer { if isScan { scanning = false } }
+        activeMetrics?.exitStage = "ticket"
         guard current(session) else { return .cancelled }
+        activeMetrics?.exitStage = "permission"
         guard AXIsProcessTrusted() else { return .unavailable("应用导航需要辅助功能权限，方向键保留原生行为。") }
-        let budget = Budget(deadline: ProcessInfo.processInfo.systemUptime + 0.42,
+        let budget = Budget(deadline: ProcessInfo.processInfo.systemUptime + 0.85,
                             generation: session.generation)
         if case .native = request {
             // Native requests independently distinguish menu, input and ordinary navigation.
         } else {
+            activeMetrics?.exitStage = "focusedPID"
             guard focusedPID(budget: budget) == session.pid else { return .cancelled }
+            activeMetrics?.exitStage = "menuFocus"
             let app = AXUIElementCreateApplication(session.pid)
             if focusedMenu(app, pid: session.pid, budget: budget) != nil { return .menu }
         }
         switch request {
         case .scan:
-            initializeElectronIfNeeded(session: session, budget: budget)
+            activeMetrics?.exitStage = "electronInitialization"
+            timed("initialization") { initializeElectronIfNeeded(session: session, budget: budget) }
             return scan(session: session, budget: budget)
         case .activate(let nodeID, let windowID):
             guard let context = validCache(session: session, windowID: windowID, budget: budget),
@@ -389,7 +556,10 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     }
 
     private func scan(session: Session, budget: Budget) -> Reply {
-        guard let (app, window, root, windowFrame, outerFrame) = frontWindow(session: session, budget: budget) else {
+        activeMetrics?.exitStage = "frontWindow"
+        guard let (app, window, root, windowFrame, outerFrame) = timed("frontWindow", {
+            frontWindow(session: session, budget: budget)
+        }) else {
             return current(session) ? .unavailable("当前窗口未提供可用的辅助功能控件，方向键保留原生行为。") : .cancelled
         }
         let old = cache
@@ -399,6 +569,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
                 && $0.windowFrame == outerFrame
         } == true
         if sameWindow, let old, ProcessInfo.processInfo.systemUptime - old.scannedAt < 1.0 {
+            activeMetrics?.count("cacheHit")
+            activeMetrics?.exitStage = "snapshot-cache"
             return .snapshot(Snapshot(windowID: old.windowID, frame: old.frame,
                                       nodes: old.nodes.map(\.value), limited: old.limited,
                                       containers: old.containers.map(\.value)))
@@ -406,16 +578,34 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         if !sameWindow { nextWindowID &+= 1 }
         var entries: [(AXUIElement, Int, CGRect, [Int])] = [(root, 0, windowFrame, [])]
         var head = 0
-        var visited = Set<CFHashCode>()
+        var visited = AppNavigationAccessibilityLogic.IdentityBuckets<AXUIElement>()
         var found: [CachedNode] = []
         var foundContainers: [CachedContainer] = []
         var limited = false
+        activeMetrics?.count("enqueued", 1)
+        activeMetrics?.exitStage = "traversal"
+        let traversalStart = ProcessInfo.processInfo.systemUptime
         while head < entries.count, head < 720, allowed(budget) {
             let (element, depth, clip, ancestors) = entries[head]
             head += 1
-            // AX trees occasionally contain cycles. Hash collisions only omit a node; they cannot activate another.
-            guard visited.insert(CFHash(element)).inserted else { continue }
-            guard let info = structure(element, budget: budget), !info.hidden, info.enabled else { continue }
+            activeMetrics?.count("visited")
+            switch visited.insert(element, hash: CFHash(element), equals: { CFEqual($0, $1) }) {
+            case .duplicate: activeMetrics?.count("trueDup"); continue
+            case .collision: activeMetrics?.count("hashCollision")
+            case .inserted: break
+            }
+            activeMetrics?.count("unique")
+            guard let info = structure(element, budget: budget) else { incompleteRead(); continue }
+            activeMetrics?.role(info.role)
+            if !info.enabled { activeMetrics?.count("disabled") }
+            if info.hiddenExplicit { activeMetrics?.count("hiddenExplicit") }
+            if info.visible == false { activeMetrics?.count("visibleFalse") }
+            if AppNavigationAccessibilityLogic.pruneSubtree(hiddenExplicit: info.hiddenExplicit,
+                visible: info.visible, hasFrame: info.frame != nil) {
+                activeMetrics?.count("visiblePrune")
+                continue
+            }
+            if info.visible == false, info.frame == nil { activeMetrics?.count("nonvisualWrapperRetained") }
             let visible = info.frame.flatMap { visibleFrame($0, clip: clip, screens: session.screens) }
             var containerID: Int?
             if AppNavigationAccessibilityLogic.containerRoles.contains(info.role) {
@@ -457,51 +647,65 @@ final class AppNavigationAccessibility: @unchecked Sendable {
                     if let rawFrame = info.frame { found.append(CachedNode(value: value, element: element, rawFrame: rawFrame)) }
                 }
             }
-            guard depth < 18 else { limited = true; continue }
+            guard depth < AppNavigationAccessibilityLogic.hierarchyLimit else {
+                limited = true; activeMetrics?.count("depthLimit"); continue
+            }
             // Descendants of scroll areas are clipped, including offscreen virtual list buttons.
             let childClip = info.role == kAXScrollAreaRole as String && info.frame != nil ? (visible ?? .null) : clip
-            guard !childClip.isNull else { continue }
-            let children = children(element, budget: budget)
+            guard !childClip.isNull else { activeMetrics?.count("offscreenScrollPrune"); continue }
+            let childContainer = AppNavigationAccessibilityLogic.containerRoles.contains(info.role)
+                || info.role == "AXWindow" || info.role == "AXSheet"
+            let children = children(element, budget: budget, container: childContainer)
             if children.count == 160 { limited = true }
             for child in children.prefix(max(0, 960 - entries.count)) {
                 entries.append((child, depth + 1, childClip, path))
+                activeMetrics?.count("enqueued")
             }
-            if entries.count >= 960 { limited = true }
+            if entries.count >= 960 { limited = true; activeMetrics?.count("queueLimit") }
         }
-        limited = limited || head < entries.count
-        let resolved = AppNavigationAccessibilityLogic.resolvedContainerFrames(
+        activeMetrics?.stages["traversal", default: 0] += ProcessInfo.processInfo.systemUptime - traversalStart
+        if !allowed(budget) { activeMetrics?.count("budgetOrTicketStop") }
+        limited = limited || head < entries.count || scanReadIncomplete
+        let resolved = timed("containerResolution") { AppNavigationAccessibilityLogic.resolvedContainerFrames(
             containers: foundContainers.map { ($0.value.id, $0.value.parentID, $0.value.frame) },
-            nodes: found.map { ($0.value.frame, $0.value.containerIDs) })
+            nodes: found.map { ($0.value.frame, $0.value.containerIDs) }) }
         let containers = foundContainers.compactMap { cached -> CachedContainer? in
             guard let frame = resolved[cached.value.id] else { return nil }
             let value = AppNavigationContainer(id: cached.value.id, parentID: cached.value.parentID,
                 label: cached.value.label, role: cached.value.role, frame: frame)
             return CachedContainer(value: value, element: cached.element)
         }
-        guard current(session), allowed(budget),
-              sameFrontWindow(app: app, window: window, root: root, session: session, budget: budget),
-              sameGeometry(window: window, root: root, windowFrame: outerFrame,
-                           rootFrame: windowFrame, budget: budget) else {
+        activeMetrics?.exitStage = "validation"
+        guard current(session), allowed(budget), timed("validation", {
+            sameFrontWindow(app: app, window: window, root: root, session: session, budget: budget)
+                && sameGeometry(window: window, root: root, windowFrame: outerFrame, rootFrame: windowFrame, budget: budget)
+        }) else {
             // A fully spent budget may still return a partial snapshot after one short revalidation.
             guard current(session) else { return .cancelled }
-            let validation = Budget(deadline: ProcessInfo.processInfo.systemUptime + 0.09,
+            let validation = Budget(deadline: ProcessInfo.processInfo.systemUptime + 0.25,
                                     generation: session.generation)
-            guard sameFrontWindow(app: app, window: window, root: root, session: session, budget: validation),
-                  sameGeometry(window: window, root: root, windowFrame: outerFrame,
-                               rootFrame: windowFrame, budget: validation) else {
+            activeMetrics?.exitStage = "validationRetry"
+            guard timed("validationRetry", {
+                sameFrontWindow(app: app, window: window, root: root, session: session, budget: validation)
+                    && sameGeometry(window: window, root: root, windowFrame: outerFrame,
+                                    rootFrame: windowFrame, budget: validation)
+            }) else {
                 return current(session) ? .unavailable("当前窗口控件正在变化，方向键使用原生行为。") : .cancelled
             }
             cache = WindowCache(session: session.generation, app: app, window: window, root: root,
                                 windowID: nextWindowID, frame: windowFrame, windowFrame: outerFrame,
                                 nodes: found, containers: containers, limited: true,
-                                scannedAt: ProcessInfo.processInfo.systemUptime)
+                                scannedAt: scanReadIncomplete ? 0 : ProcessInfo.processInfo.systemUptime)
+            activeMetrics?.exitStage = "snapshot-partial"
             return .snapshot(Snapshot(windowID: nextWindowID, frame: windowFrame,
                                       nodes: found.map(\.value), limited: true, containers: containers.map(\.value)))
         }
+        limited = limited || scanReadIncomplete
         cache = WindowCache(session: session.generation, app: app, window: window, root: root,
                             windowID: nextWindowID, frame: windowFrame, windowFrame: outerFrame,
                             nodes: found, containers: containers, limited: limited,
-                            scannedAt: ProcessInfo.processInfo.systemUptime)
+                            scannedAt: scanReadIncomplete ? 0 : ProcessInfo.processInfo.systemUptime)
+        activeMetrics?.exitStage = "snapshot"
         return .snapshot(Snapshot(windowID: nextWindowID, frame: windowFrame,
                                   nodes: found.map(\.value), limited: limited, containers: containers.map(\.value)))
     }
@@ -531,7 +735,9 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         for sheet in advertisedSheets.reversed() {
             if let info = structure(sheet, budget: budget), info.role == "AXSheet", !info.hidden { return sheet }
         }
-        for child in children(window, budget: budget).reversed() {
+        let windowChildren = children(window, budget: budget, container: true, limit: 960)
+        guard lastChildrenComplete else { return nil }
+        for child in windowChildren.reversed() {
             if string(child, kAXRoleAttribute, budget: budget) == "AXSheet",
                let info = structure(child, budget: budget), !info.hidden { return child }
         }
@@ -628,9 +834,9 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
               var ancestor = hit else { return false }
         var path: [AppNavigationAccessibilityLogic.HitStep] = []
-        var seen = Set<CFHashCode>()
-        for _ in 0..<22 {
-            guard allowed(budget), seen.insert(CFHash(ancestor)).inserted else { return false }
+        var seen = AppNavigationAccessibilityLogic.IdentityBuckets<AXUIElement>()
+        for _ in 0..<AppNavigationAccessibilityLogic.hierarchyLimit {
+            guard allowed(budget), seen.insert(ancestor, hash: CFHash(ancestor), equals: { CFEqual($0, $1) }) != .duplicate else { return false }
             var pid: pid_t = 0
             guard AXUIElementGetPid(ancestor, &pid) == .success, pid == session.pid,
                   let info = structure(ancestor, budget: budget), !info.hidden, info.enabled else { return false }
@@ -678,12 +884,14 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         }
         var ancestor = node.element
         var visible = frame.intersection(cache.frame)
-        for _ in 0..<22 {
+        for _ in 0..<AppNavigationAccessibilityLogic.hierarchyLimit {
             if CFEqual(ancestor, cache.root) {
                 return Self.geometryUnchanged(displayed: node.value.frame, current: visible)
             }
             guard let parent = element(ancestor, kAXParentAttribute, budget: budget) else { return false }
-            guard let parentInfo = structure(parent, budget: budget), !parentInfo.hidden, parentInfo.enabled else { return false }
+            guard let parentInfo = structure(parent, budget: budget),
+                  !AppNavigationAccessibilityLogic.pruneSubtree(hiddenExplicit: parentInfo.hiddenExplicit,
+                      visible: parentInfo.visible, hasFrame: parentInfo.frame != nil) else { return false }
             if parentInfo.role == kAXScrollAreaRole as String, let parentFrame = parentInfo.frame {
                 visible = visible.intersection(parentFrame)
                 guard !visible.isNull else { return false }
@@ -831,10 +1039,18 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     }
 
     private func focusedPID(budget: Budget) -> pid_t? {
-        let system = AXUIElementCreateSystemWide()
-        guard let app = element(system, kAXFocusedApplicationAttribute, budget: budget) else { return nil }
-        var pid: pid_t = 0
-        return AXUIElementGetPid(app, &pid) == .success ? pid : nil
+        timed("focusedPID") {
+            activeMetrics?.count("focusedPID.calls")
+            let system = AXUIElementCreateSystemWide()
+            guard let app = element(system, kAXFocusedApplicationAttribute, budget: budget) else {
+                activeMetrics?.count("focusedPID.nil")
+                return nil
+            }
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(app, &pid) == .success else { return nil }
+            if let metrics = activeMetrics, metrics.focusedPIDs.count < 24 { metrics.focusedPIDs.append(pid) }
+            return pid
+        }
     }
 
     private func menuHasFocus(_ app: AXUIElement, budget: Budget) -> Bool {
@@ -862,14 +1078,37 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     }
 
     private func structure(_ element: AXUIElement, budget: Budget) -> Structure? {
-        guard allowed(budget) else { return nil }
+        guard allowed(budget) else { incompleteRead(); return nil }
         AXUIElementSetMessagingTimeout(element, messageTimeout)
         let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXPositionAttribute, kAXSizeAttribute,
                      kAXEnabledAttribute, kAXFocusedAttribute, "AXHidden", "AXVisible", "AXRoleDescription"] as CFArray
         var values: CFArray?
-        guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
+        activeMetrics?.count("bulk.calls")
+        var error = timed("bulk") { AXUIElementCopyMultipleAttributeValues(element, names, [], &values) }
+        activeMetrics?.error("bulk", error)
+        if scanning, error == .cannotComplete, scanRecoveryAttempts < 3,
+           budget.deadline - ProcessInfo.processInfo.systemUptime >= 0.04, allowed(budget) {
+            scanRecoveryAttempts += 1
+            activeMetrics?.count("bulk.retries")
+            AXUIElementSetMessagingTimeout(element, min(0.18, Float(budget.deadline - ProcessInfo.processInfo.systemUptime - 0.004)))
+            error = timed("bulk") { AXUIElementCopyMultipleAttributeValues(element, names, [], &values) }
+            activeMetrics?.error("bulk", error)
+        }
+        guard error == .success,
               let result = values as? [Any], result.count == 9,
-              let role = result[0] as? String else { return nil }
+              let role = result[0] as? String else { incompleteRead(); return nil }
+        if let metrics = activeMetrics {
+            for value in result {
+                let ref = value as CFTypeRef
+                if CFGetTypeID(ref) == AXValueGetTypeID() {
+                    let ax = unsafeBitCast(ref, to: AXValue.self)
+                    if AXValueGetType(ax) == .axError {
+                        var memberError = AXError.success
+                        if AXValueGetValue(ax, .axError, &memberError) { metrics.error("bulkMember", memberError) }
+                    }
+                }
+            }
+        }
         var point = CGPoint.zero
         var size = CGSize.zero
         var frame: CGRect?
@@ -884,7 +1123,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         return Structure(role: role, subrole: result[1] as? String ?? "",
                          roleDescription: result[8] as? String ?? "", frame: frame,
                          enabled: (result[4] as? Bool) != false,
-                         hidden: (result[6] as? Bool) == true || (result[7] as? Bool) == false,
+                         hiddenExplicit: (result[6] as? Bool) == true,
+                         visible: result[7] as? Bool,
                          focused: (result[5] as? Bool) == true)
     }
 
@@ -915,10 +1155,15 @@ final class AppNavigationAccessibility: @unchecked Sendable {
 
     private func containerLabel(_ element: AXUIElement, budget: Budget) -> String {
         guard allowed(budget) else { return "" }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        defer { activeMetrics?.stages["containerLabels", default: 0] += ProcessInfo.processInfo.systemUptime - startedAt }
         AXUIElementSetMessagingTimeout(element, messageTimeout)
         var values: CFArray?
         let names = [kAXTitleAttribute, "AXIdentifier"] as CFArray
-        guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
+        let error = AXUIElementCopyMultipleAttributeValues(element, names, [], &values)
+        activeMetrics?.count("labelBulk.calls")
+        activeMetrics?.error("labelBulk", error)
+        guard error == .success,
               let values = values as? [Any] else { return "" }
         for value in values {
             if let label = AppNavigationAccessibilityLogic.shortLabel(value as? String) { return label }
@@ -930,7 +1175,9 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         guard allowed(budget) else { return nil }
         AXUIElementSetMessagingTimeout(element, messageTimeout)
         var value: CFTypeRef?
-        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+        let error = timed("attributes") { AXUIElementCopyAttributeValue(element, name as CFString, &value) }
+        activeMetrics?.error("attribute", error)
+        return error == .success ? value : nil
     }
 
     private func element(_ owner: AXUIElement, _ name: String, budget: Budget) -> AXUIElement? {
@@ -959,17 +1206,88 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         guard allowed(budget) else { return [] }
         AXUIElementSetMessagingTimeout(element, messageTimeout)
         var value: CFArray?
-        return AXUIElementCopyActionNames(element, &value) == .success ? (value as? [String] ?? []) : []
+        let error = timed("actions") { AXUIElementCopyActionNames(element, &value) }
+        activeMetrics?.error("actions", error)
+        if error == .cannotComplete { incompleteRead() }
+        let names = error == .success ? (value as? [String] ?? []) : []
+        if names.contains("AXPress") { activeMetrics?.count("actions.callsWithPress") }
+        return names
     }
 
-    private func children(_ element: AXUIElement, budget: Budget) -> [AXUIElement] {
-        guard allowed(budget) else { return [] }
-        AXUIElementSetMessagingTimeout(element, messageTimeout)
-        var value: CFArray?
-        guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, 160, &value) == .success else {
-            return []
+    private static func childFailure(_ error: AXError) -> AppNavigationAccessibilityLogic.ChildFailure {
+        switch error {
+        case .cannotComplete: .temporary
+        case .attributeUnsupported, .notImplemented: .unsupported
+        case .noValue: .noValue
+        default: .other
         }
-        return value as? [AXUIElement] ?? []
+    }
+
+    private func children(_ element: AXUIElement, budget: Budget, container: Bool = false, limit: Int = 160) -> [AXUIElement] {
+        timed("children") {
+            lastChildrenComplete = true
+            guard allowed(budget) else {
+                lastChildrenComplete = false
+                incompleteRead(); activeMetrics?.count("children.budgetSkip"); return []
+            }
+            AXUIElementSetMessagingTimeout(element, messageTimeout)
+            var values: CFArray?
+            activeMetrics?.count("children.calls")
+            var error = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, limit, &values)
+            activeMetrics?.error("children", error)
+            if scanning, AppNavigationAccessibilityLogic.mayRetryChildren(Self.childFailure(error), container: container,
+                recoveryAttempts: scanRecoveryAttempts, remaining: budget.deadline - ProcessInfo.processInfo.systemUptime),
+               allowed(budget) {
+                scanRecoveryAttempts += 1
+                activeMetrics?.count("children.retries")
+                AXUIElementSetMessagingTimeout(element, min(0.18, Float(budget.deadline - ProcessInfo.processInfo.systemUptime - 0.004)))
+                error = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, limit, &values)
+                activeMetrics?.error("children", error)
+            }
+            if error != .success,
+               error == .attributeUnsupported || error == .notImplemented || error == .illegalArgument
+                || (error == .cannotComplete && container),
+               allowed(budget), budget.deadline - ProcessInfo.processInfo.systemUptime >= 0.02 {
+                // Some toolkits expose AXChildren but do not implement ranged reads. Still cap
+                // retained references and traversal, and do not mistake transfer failure for a leaf.
+                activeMetrics?.count("children.fullFallback")
+                AXUIElementSetMessagingTimeout(element, min(0.18, Float(budget.deadline - ProcessInfo.processInfo.systemUptime - 0.004)))
+                var fullValue: CFTypeRef?
+                error = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &fullValue)
+                activeMetrics?.error("childrenFallback", error)
+                if error == .success {
+                    guard let full = fullValue as? [AXUIElement] else {
+                        lastChildrenComplete = false
+                        incompleteRead()
+                        return []
+                    }
+                    if full.count > limit {
+                        lastChildrenComplete = false
+                        incompleteRead(); activeMetrics?.count("children.truncated")
+                    }
+                    return Array(full.prefix(limit))
+                }
+            }
+            guard error == .success, let children = values as? [AXUIElement] else {
+                if error == .success || AppNavigationAccessibilityLogic.childrenFailureIsPartial(Self.childFailure(error), container: container) {
+                    lastChildrenComplete = false
+                    incompleteRead()
+                }
+                return []
+            }
+            var reportedCount: Int?
+            if children.count >= limit, allowed(budget) {
+                var count = 0
+                let countError = AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute as CFString, &count)
+                activeMetrics?.error("childrenCount", countError)
+                if countError == .success { reportedCount = count }
+            }
+            if AppNavigationAccessibilityLogic.childrenTruncated(returned: children.count, limit: limit, reportedCount: reportedCount) {
+                lastChildrenComplete = false
+                incompleteRead(); activeMetrics?.count("children.truncated")
+            }
+            return children
+        }
     }
 
     /// Pure checks: no AX objects, workspace reads, event sources, or OS events are created.

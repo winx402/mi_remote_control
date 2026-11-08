@@ -63,6 +63,7 @@ final class ApplicationNavigationController {
     private var selection = AppNavigationSelectionState()
     private var snapshot: AppNavigationAccessibility.Snapshot?
     private var snapshotAt: TimeInterval = 0
+    private var navigationPending = false
     private var suspended = false
     private var stopped = false
     private var lastActivity: TimeInterval = 0
@@ -193,6 +194,11 @@ final class ApplicationNavigationController {
 
     private func process(_ key: RemoteKey) {
         guard isEnabled, context != nil else { return }
+        if key == .ok, navigationPending {
+            invalidateSelection()
+            setStatus("界面正在更新，请重新选中控件后确认。")
+            return
+        }
         if selection.editing {
             submit(.native(key, .editing, windowID: selection.windowID)) { [weak self] reply in
                 self?.handleEffectReply(reply, editing: true, originalKey: key)
@@ -200,8 +206,9 @@ final class ApplicationNavigationController {
             return
         }
         if key == .ok, let selectedID = selection.selectedID, let windowID = selection.windowID {
+            overlay.hide()
             snapshotAt = 0
-            submit(.activate(nodeID: selectedID, windowID: windowID)) { [weak self] reply in
+            let accepted = submit(.activate(nodeID: selectedID, windowID: windowID)) { [weak self] reply in
                 guard let self else { return }
                 switch reply {
                 case .editing: enterEditing()
@@ -213,19 +220,28 @@ final class ApplicationNavigationController {
                     snapshot = nil
                     overlay.hide()
                     setStatus("控件或窗口已变化，请重新选择。")
-                case .unavailable(let message): setStatus(message)
+                case .unavailable(let message):
+                    invalidateSelection()
+                    setStatus(message)
                 case .menu: routeMenu(.ok)
                 case .menuPerformed: clearForNativeMenu()
                 case .staleSelection: clearStaleSelection()
                 case .snapshot: break
                 }
             }
+            if !accepted {
+                invalidateSelection()
+                setStatus("界面正在更新，请重新选中控件后确认。")
+            }
             return
         }
         // The worker's short-lived snapshot cache avoids DOM rescans. Its lightweight focus
         // check still runs for every key so opening a native menu cannot leave arrows trapped.
-        submit(.scan) { [weak self] reply in
+        guard !navigationPending else { return }
+        navigationPending = true
+        let accepted = submit(.scan) { [weak self] reply in
             guard let self, let context = self.context else { return }
+            navigationPending = false
             switch reply {
             case .snapshot(let snapshot):
                 self.snapshot = snapshot
@@ -248,6 +264,7 @@ final class ApplicationNavigationController {
             case .performed, .editing: break
             }
         }
+        if !accepted { navigationPending = false }
     }
 
     private func navigate(_ key: RemoteKey, snapshot: AppNavigationAccessibility.Snapshot,
@@ -272,7 +289,10 @@ final class ApplicationNavigationController {
             setStatus(snapshot.limited ? "按钮导航 · 已显示可用控件，部分界面未暴露或超出查询预算" : "按钮导航 · OK 激活 · 返回取消")
         case .regions:
             let regions = AppNavigationGeometry.regions(nodes: snapshot.nodes, window: snapshot.frame,
-                                                        layout: profile.layout)
+                                                        layout: profile.layout, containers: snapshot.containers)
+            let count = snapshot.nodes.filter { $0.kind != .scrollArea }.count
+            setStatus("分区导航 · \(regions.count) 个区域 · \(count) 个可导航控件"
+                + (snapshot.limited ? " · 部分界面暂未识别" : ""))
             guard !regions.isEmpty else {
                 overlay.hide()
                 if Self.isDirection(key) { nativeFallback(key, windowID: snapshot.windowID) }
@@ -336,7 +356,7 @@ final class ApplicationNavigationController {
 
     private func routeMenu(_ key: RemoteKey) {
         clearForNativeMenu()
-        submit(.native(key, .menu, windowID: nil)) { [weak self] reply in
+        submit(.native(key, .menu, windowID: nil), retryWhenBusy: true) { [weak self] reply in
             self?.handleEffectReply(reply)
         }
     }
@@ -375,9 +395,10 @@ final class ApplicationNavigationController {
         }
     }
 
+    @discardableResult
     private func submit(_ request: AppNavigationAccessibility.Request, retryWhenBusy: Bool = false,
-                        completion: @escaping @MainActor @Sendable (AppNavigationAccessibility.Reply) -> Void) {
-        guard let session, isEnabled else { return }
+                        completion: @escaping @MainActor @Sendable (AppNavigationAccessibility.Reply) -> Void) -> Bool {
+        guard let session, isEnabled else { return false }
         let receive: @MainActor @Sendable (AppNavigationAccessibility.Reply) -> Void = { [weak self] reply in
             guard let self, isEnabled, self.session == session else { return }
             // A workspace switch may precede delivery of its notification. Recheck metadata first.
@@ -385,8 +406,8 @@ final class ApplicationNavigationController {
             guard self.session == session else { return }
             completion(reply)
         }
-        if accessibility.request(request, session: session, completion: receive) { return }
-        guard retryWhenBusy else { return }
+        if accessibility.request(request, session: session, completion: receive) { return true }
+        guard retryWhenBusy else { return false }
         retryTask?.cancel()
         retryTask = Task { @MainActor [weak self] in
             for _ in 0..<8 {
@@ -394,7 +415,10 @@ final class ApplicationNavigationController {
                 guard !Task.isCancelled, let self, self.isEnabled, self.session == session else { return }
                 if self.accessibility.request(request, session: session, completion: receive) { return }
             }
+            guard !Task.isCancelled else { return }
+            receive(.unavailable("界面正在更新，请稍后重新操作。"))
         }
+        return true
     }
 
     private func updateHighlight() {
@@ -403,7 +427,7 @@ final class ApplicationNavigationController {
         let region: AppNavigationRegion?
         if let context, context.profile.mode == .regions {
             region = AppNavigationGeometry.regions(nodes: snapshot.nodes, window: snapshot.frame,
-                layout: context.profile.layout).first { $0.id == selection.regionID }
+                layout: context.profile.layout, containers: snapshot.containers).first { $0.id == selection.regionID }
         } else { region = nil }
         overlay.show(node: node, region: region, editing: selection.editing)
     }
@@ -439,6 +463,7 @@ final class ApplicationNavigationController {
         selection.reset()
         snapshot = nil
         snapshotAt = 0
+        navigationPending = false
         overlay.hide()
     }
 

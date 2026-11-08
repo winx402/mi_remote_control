@@ -102,7 +102,7 @@ struct ApplicationNavigationSettingsView: View {
                 .pickerStyle(.menu)
 
                 if currentProfile.mode == .regions {
-                    Picker("界面布局", selection: layoutBinding) {
+                    Picker("区域行为", selection: layoutBinding) {
                         Text("自动识别").tag(AppNavigationLayout.automatic)
                         Text("聊天界面").tag(AppNavigationLayout.chat)
                         Text("视频界面").tag(AppNavigationLayout.video)
@@ -118,6 +118,7 @@ struct ApplicationNavigationSettingsView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("按钮导航：方向单按选中并高亮按钮，OK 激活。")
                 Text("分区导航：左右切换区域，上下选择区域内菜单或滚动。")
+                Text("区域来自当前控件层级；聊天／视频只补充操作行为，不预设区域位置。")
                 Text("输入框：OK 进入输入，返回回到导航。全局长按和双击仍保留。")
             }
             .font(.caption)

@@ -3,9 +3,161 @@ import ApplicationServices
 import CoreGraphics
 import os
 
+// BEGIN PURE APP NAVIGATION ACCESSIBILITY LOGIC
+/// Pure policies used by the worker. Can be extracted with Foundation/CoreGraphics only.
+enum AppNavigationAccessibilityLogic {
+    static let containerRoles: Set<String> = [
+        "AXGroup", "AXList", "AXOutline", "AXTable", "AXBrowser", "AXTabGroup", "AXSplitGroup",
+        "AXToolbar", "AXScrollArea", "AXRadioGroup", "AXGrid", "AXLayoutArea", "AXWebArea", "AXRow",
+        "AXVideo", "AXPlayer"
+    ]
+    static let semanticButtonRoles: Set<String> = [
+        "AXButton", "AXLink", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton",
+        "AXDisclosureTriangle"
+    ]
+    private static let genericRoles: Set<String> = ["AXGroup", "AXGenericElement", "AXUnknown"]
+    private static let buttonDescriptions: Set<String> = [
+        "button", "push button", "toggle button", "menu button", "pop up button", "checkbox", "radio button",
+        "按钮", "切换按钮", "菜单按钮", "弹出式按钮", "复选框", "单选按钮"
+    ]
+
+    static func isButtonCandidate(role: String, roleDescription: String, actions: [String],
+                                  selectableRow: Bool) -> Bool {
+        if semanticButtonRoles.contains(role) { return true }
+        if role == "AXRow" {
+            return selectableRow || actions.contains("AXPress") || actions.contains("AXConfirm")
+        }
+        guard genericRoles.contains(role) else { return false }
+        return actions.contains("AXPress") || buttonDescriptions.contains(roleDescription.lowercased())
+    }
+
+    static func permitsPointerActivation(role: String, selectableRow: Bool) -> Bool {
+        semanticButtonRoles.contains(role) || (role == "AXRow" && selectableRow)
+    }
+
+    struct HitStep {
+        let isTarget: Bool
+        let ownerPID: Int32
+        let role: String
+        var subrole: String = ""
+        var enabled = true
+        var hidden = false
+    }
+
+    /// Facts are gathered from the actual hit element upward via AXParent. The target flag
+    /// comes from CFEqual, never from labels or matching rectangles.
+    static func hitBelongsToTarget(_ path: [HitStep], expectedPID: Int32) -> Bool {
+        let inputRoles: Set<String> = ["AXTextArea", "AXTextField", "AXSearchField", "AXComboBox"]
+        let transientRoles: Set<String> = ["AXSheet", "AXDialog", "AXWindow", "AXMenu", "AXMenuItem"]
+        guard !path.isEmpty, path.count <= 22 else { return false }
+        for step in path {
+            guard step.ownerPID == expectedPID, step.enabled, !step.hidden,
+                  !inputRoles.contains(step.role), step.subrole != "AXSecureTextField" else { return false }
+            if step.isTarget { return true }
+            // A nested, distinct control is not a decorative descendant of the target button.
+            if semanticButtonRoles.contains(step.role) || step.role == "AXRow" || transientRoles.contains(step.role) {
+                return false
+            }
+        }
+        return false
+    }
+
+    static func containerPath(ancestors: [Int], ownID: Int?) -> [Int] {
+        guard let ownID, !ancestors.contains(ownID) else { return ancestors }
+        return ancestors + [ownID]
+    }
+
+    /// Reject aggregated prose rather than truncating it into a misleading container name.
+    static func shortLabel(_ value: String?, limit: Int = 48) -> String? {
+        guard let value else { return nil }
+        let prefix = String(value.prefix(limit + 1))
+        guard prefix.count <= limit else { return nil }
+        let label = prefix.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return label.isEmpty ? nil : label
+    }
+
+    /// Anonymous Electron wrappers may not expose geometry. Only missing frames are filled,
+    /// using visible descendant nodes/containers, never estimated window percentages.
+    static func resolvedContainerFrames(
+        containers: [(id: Int, parentID: Int?, frame: CGRect)],
+        nodes: [(frame: CGRect, containerIDs: [Int])]
+    ) -> [Int: CGRect] {
+        func valid(_ frame: CGRect) -> Bool {
+            !frame.isNull && !frame.isInfinite && frame.minX.isFinite && frame.minY.isFinite
+                && frame.width.isFinite && frame.height.isFinite && frame.width >= 3 && frame.height >= 3
+        }
+        var derived: [Int: CGRect] = [:]
+        var ownFrames: [Int: CGRect] = [:]
+        var parents: [Int: Int] = [:]
+        for container in containers {
+            if let parentID = container.parentID { parents[container.id] = parentID }
+            if valid(container.frame) { ownFrames[container.id] = container.frame }
+        }
+        func add(_ frame: CGRect, to id: Int) {
+            derived[id] = derived[id].map { $0.union(frame) } ?? frame
+        }
+        for node in nodes where valid(node.frame) {
+            for id in node.containerIDs { add(node.frame, to: id) }
+        }
+        for container in containers where valid(container.frame) {
+            var parent = container.parentID
+            var visited: Set<Int> = [container.id]
+            for _ in 0..<24 {
+                guard let id = parent, visited.insert(id).inserted else { break }
+                add(container.frame, to: id)
+                parent = parents[id]
+            }
+        }
+        return derived.merging(ownFrames) { _, actual in actual }
+    }
+
+    static func selfCheck() -> Bool {
+        guard containerRoles.contains("AXVideo"), containerRoles.contains("AXPlayer") else { return false }
+        guard isButtonCandidate(role: "AXButton", roleDescription: "", actions: [], selectableRow: false),
+              isButtonCandidate(role: "AXLink", roleDescription: "", actions: [], selectableRow: false),
+              isButtonCandidate(role: "AXRow", roleDescription: "", actions: [], selectableRow: true),
+              !isButtonCandidate(role: "AXRow", roleDescription: "", actions: [], selectableRow: false),
+              isButtonCandidate(role: "AXGroup", roleDescription: "", actions: ["AXPress"], selectableRow: false),
+              isButtonCandidate(role: "AXGroup", roleDescription: "按钮", actions: [], selectableRow: false),
+              !isButtonCandidate(role: "AXGroup", roleDescription: "button group", actions: [], selectableRow: false),
+              !isButtonCandidate(role: "AXImage", roleDescription: "button", actions: [], selectableRow: false),
+              !isButtonCandidate(role: "AXStaticText", roleDescription: "", actions: [], selectableRow: false),
+              permitsPointerActivation(role: "AXButton", selectableRow: false),
+              permitsPointerActivation(role: "AXRow", selectableRow: true),
+              !permitsPointerActivation(role: "AXRow", selectableRow: false),
+              !permitsPointerActivation(role: "AXGroup", selectableRow: false),
+              !permitsPointerActivation(role: "AXImage", selectableRow: false) else { return false }
+        let outer = containerPath(ancestors: [], ownID: 3)
+        let inner = containerPath(ancestors: outer, ownID: 8)
+        let scroll = containerPath(ancestors: inner, ownID: 12)
+        let child = CGRect(x: 20, y: 30, width: 180, height: 70)
+        let sibling = CGRect(x: 250, y: 30, width: 100, height: 70)
+        let frames = resolvedContainerFrames(containers: [
+            (3, nil, .null), (8, 3, .null), (12, 8, child), (15, 3, sibling)
+        ], nodes: [(child.insetBy(dx: 5, dy: 5), scroll)])
+        return outer == [3] && inner == [3, 8] && inner.last == 8
+            && scroll == [3, 8, 12] && containerPath(ancestors: scroll, ownID: 12) == scroll
+            && shortLabel("  Navigation\n items ") == "Navigation items"
+            && shortLabel(String(repeating: "正文", count: 40)) == nil
+            && frames[3] == child.union(sibling) && frames[8] == child && frames[12] == child
+            && hitBelongsToTarget([.init(isTarget: true, ownerPID: 42, role: "AXButton")], expectedPID: 42)
+            && hitBelongsToTarget([.init(isTarget: false, ownerPID: 42, role: "AXStaticText"),
+                                  .init(isTarget: true, ownerPID: 42, role: "AXButton")], expectedPID: 42)
+            && !hitBelongsToTarget([.init(isTarget: true, ownerPID: 43, role: "AXButton")], expectedPID: 42)
+            && !hitBelongsToTarget([.init(isTarget: false, ownerPID: 42, role: "AXTextField"),
+                                   .init(isTarget: true, ownerPID: 42, role: "AXButton")], expectedPID: 42)
+            && !hitBelongsToTarget([.init(isTarget: false, ownerPID: 42, role: "AXButton"),
+                                   .init(isTarget: true, ownerPID: 42, role: "AXButton")], expectedPID: 42)
+            && !hitBelongsToTarget([.init(isTarget: false, ownerPID: 42, role: "AXGroup")], expectedPID: 42)
+    }
+}
+// END PURE APP NAVIGATION ACCESSIBILITY LOGIC
+
 /// Only this serial worker owns AX references. Public requests and replies contain values only.
 /// Electron initialization is restricted to configured, known apps, on a user's first scan.
-/// No text values, coordinate clicks, or wheel events are used.
+/// Input values and body text are not read; no screenshots or guessed coordinates are used.
+/// Pointer activation happens only on user OK, after PID/window/sheet/geometry/identity and hit
+/// verification. Runtime compatibility still depends on the target application's AX exposure.
 final class AppNavigationAccessibility: @unchecked Sendable {
     struct Session: Equatable, Sendable {
         let generation: UInt64
@@ -19,6 +171,7 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         let frame: CGRect
         let nodes: [AppNavigationNode]
         let limited: Bool
+        var containers: [AppNavigationContainer] = []
     }
 
     enum NativeReason: Sendable {
@@ -91,6 +244,11 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         let rawFrame: CGRect
     }
 
+    private struct CachedContainer {
+        let value: AppNavigationContainer
+        let element: AXUIElement
+    }
+
     private struct WindowCache {
         let session: UInt64
         let app: AXUIElement
@@ -100,12 +258,15 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         let frame: CGRect
         let windowFrame: CGRect
         var nodes: [CachedNode]
+        let containers: [CachedContainer]
+        let limited: Bool
         var scannedAt: TimeInterval
     }
 
     private struct Structure {
         let role: String
         let subrole: String
+        let roleDescription: String
         let frame: CGRect?
         let enabled: Bool
         let hidden: Bool
@@ -121,6 +282,7 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     private let gate = OSAllocatedUnfairLock(initialState: Gate())
     private var cache: WindowCache?
     private var nextNodeID = 0
+    private var nextContainerID = 0
     private var nextWindowID: UInt64 = 0
     private var initializedElectronGeneration: UInt64?
     private let messageTimeout: Float = 0.018
@@ -193,12 +355,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
                 }
                 return .editing
             }
-            guard node.value.kind == .button,
-                  actions(node.element, budget: budget).contains(kAXPressAction as String),
-                  preflight(context, session: session, budget: budget),
-                  cachedFrameUnchanged(node.element, in: context, budget: budget) else { return stale(session) }
-            return effect(session, { AXUIElementPerformAction(node.element, kAXPressAction as CFString) == .success })
-                ? .performed : .unavailable("这个控件暂时无法通过辅助功能激活。")
+            guard node.value.kind == .button else { return .unavailable("这个区域不是可激活控件。") }
+            return activateButton(node, in: context, session: session, budget: budget)
         case .scroll(let nodeID, let windowID, let up):
             guard let context = validCache(session: session, windowID: windowID, budget: budget),
                   let node = context.nodes.first(where: { $0.value.id == nodeID && $0.value.kind == .scrollArea }),
@@ -242,29 +400,45 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         } == true
         if sameWindow, let old, ProcessInfo.processInfo.systemUptime - old.scannedAt < 1.0 {
             return .snapshot(Snapshot(windowID: old.windowID, frame: old.frame,
-                                      nodes: old.nodes.map(\.value), limited: false))
+                                      nodes: old.nodes.map(\.value), limited: old.limited,
+                                      containers: old.containers.map(\.value)))
         }
         if !sameWindow { nextWindowID &+= 1 }
-        var entries: [(AXUIElement, Int, CGRect)] = [(root, 0, windowFrame)]
+        var entries: [(AXUIElement, Int, CGRect, [Int])] = [(root, 0, windowFrame, [])]
         var head = 0
         var visited = Set<CFHashCode>()
         var found: [CachedNode] = []
+        var foundContainers: [CachedContainer] = []
         var limited = false
         while head < entries.count, head < 720, allowed(budget) {
-            let (element, depth, clip) = entries[head]
+            let (element, depth, clip, ancestors) = entries[head]
             head += 1
             // AX trees occasionally contain cycles. Hash collisions only omit a node; they cannot activate another.
             guard visited.insert(CFHash(element)).inserted else { continue }
-            guard let info = structure(element, budget: budget), !info.hidden else { continue }
+            guard let info = structure(element, budget: budget), !info.hidden, info.enabled else { continue }
             let visible = info.frame.flatMap { visibleFrame($0, clip: clip, screens: session.screens) }
+            var containerID: Int?
+            if AppNavigationAccessibilityLogic.containerRoles.contains(info.role) {
+                let id: Int
+                if sameWindow, let previous = old?.containers.first(where: { CFEqual($0.element, element) }) {
+                    id = previous.value.id
+                } else {
+                    nextContainerID &+= 1
+                    id = nextContainerID
+                }
+                containerID = id
+                let value = AppNavigationContainer(id: id, parentID: ancestors.last,
+                    label: containerLabel(element, budget: budget), role: info.role, frame: visible ?? .null)
+                foundContainers.append(CachedContainer(value: value, element: element))
+            }
+            let path = AppNavigationAccessibilityLogic.containerPath(ancestors: ancestors, ownID: containerID)
             if let visible, info.enabled, !Self.excludedSubroles.contains(info.subrole) {
                 let kind: AppNavigationNode.Kind?
                 if Self.inputRoles.contains(info.role), focusableInput(element, budget: budget) {
                     kind = .input
                 } else if info.role == kAXScrollAreaRole as String {
                     kind = .scrollArea
-                } else if actions(element, budget: budget).contains(kAXPressAction as String) {
-                    // Includes custom groups only when AX explicitly exposes AXPress.
+                } else if isButtonCandidate(element, info: info, budget: budget) {
                     kind = .button
                 } else {
                     kind = nil
@@ -279,22 +453,31 @@ final class AppNavigationAccessibility: @unchecked Sendable {
                     }
                     let value = AppNavigationNode(id: id,
                         label: label(element, kind: kind, role: info.role, budget: budget),
-                        role: info.role, frame: visible, kind: kind, focused: info.focused)
+                        role: info.role, frame: visible, kind: kind, focused: info.focused, containerIDs: path)
                     if let rawFrame = info.frame { found.append(CachedNode(value: value, element: element, rawFrame: rawFrame)) }
                 }
             }
             guard depth < 18 else { limited = true; continue }
             // Descendants of scroll areas are clipped, including offscreen virtual list buttons.
-            let childClip = info.role == kAXScrollAreaRole as String ? (visible ?? .null) : clip
+            let childClip = info.role == kAXScrollAreaRole as String && info.frame != nil ? (visible ?? .null) : clip
             guard !childClip.isNull else { continue }
             let children = children(element, budget: budget)
             if children.count == 160 { limited = true }
             for child in children.prefix(max(0, 960 - entries.count)) {
-                entries.append((child, depth + 1, childClip))
+                entries.append((child, depth + 1, childClip, path))
             }
             if entries.count >= 960 { limited = true }
         }
         limited = limited || head < entries.count
+        let resolved = AppNavigationAccessibilityLogic.resolvedContainerFrames(
+            containers: foundContainers.map { ($0.value.id, $0.value.parentID, $0.value.frame) },
+            nodes: found.map { ($0.value.frame, $0.value.containerIDs) })
+        let containers = foundContainers.compactMap { cached -> CachedContainer? in
+            guard let frame = resolved[cached.value.id] else { return nil }
+            let value = AppNavigationContainer(id: cached.value.id, parentID: cached.value.parentID,
+                label: cached.value.label, role: cached.value.role, frame: frame)
+            return CachedContainer(value: value, element: cached.element)
+        }
         guard current(session), allowed(budget),
               sameFrontWindow(app: app, window: window, root: root, session: session, budget: budget),
               sameGeometry(window: window, root: root, windowFrame: outerFrame,
@@ -310,15 +493,17 @@ final class AppNavigationAccessibility: @unchecked Sendable {
             }
             cache = WindowCache(session: session.generation, app: app, window: window, root: root,
                                 windowID: nextWindowID, frame: windowFrame, windowFrame: outerFrame,
-                                nodes: found, scannedAt: ProcessInfo.processInfo.systemUptime)
+                                nodes: found, containers: containers, limited: true,
+                                scannedAt: ProcessInfo.processInfo.systemUptime)
             return .snapshot(Snapshot(windowID: nextWindowID, frame: windowFrame,
-                                      nodes: found.map(\.value), limited: true))
+                                      nodes: found.map(\.value), limited: true, containers: containers.map(\.value)))
         }
         cache = WindowCache(session: session.generation, app: app, window: window, root: root,
                             windowID: nextWindowID, frame: windowFrame, windowFrame: outerFrame,
-                            nodes: found, scannedAt: ProcessInfo.processInfo.systemUptime)
+                            nodes: found, containers: containers, limited: limited,
+                            scannedAt: ProcessInfo.processInfo.systemUptime)
         return .snapshot(Snapshot(windowID: nextWindowID, frame: windowFrame,
-                                  nodes: found.map(\.value), limited: limited))
+                                  nodes: found.map(\.value), limited: limited, containers: containers.map(\.value)))
     }
 
     private func validCache(session: Session, windowID: UInt64, budget: Budget) -> WindowCache? {
@@ -388,6 +573,98 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         return Self.geometryUnchanged(displayed: node.rawFrame, current: frame)
     }
 
+    private func isButtonCandidate(_ element: AXUIElement, info: Structure, budget: Budget) -> Bool {
+        if AppNavigationAccessibilityLogic.semanticButtonRoles.contains(info.role) { return true }
+        let names = actions(element, budget: budget)
+        let selectable = info.role == "AXRow" && settable(element, kAXSelectedAttribute, budget: budget)
+        return AppNavigationAccessibilityLogic.isButtonCandidate(role: info.role,
+            roleDescription: info.roleDescription, actions: names, selectableRow: selectable)
+    }
+
+    /// Invoked only by a user's OK on an existing selection. AX actions stay first; pointer
+    /// fallback is restricted to semantic buttons/selectable rows and a verified real hit.
+    private func activateButton(_ node: CachedNode, in context: WindowCache,
+                                session: Session, budget: Budget) -> Reply {
+        let names = actions(node.element, budget: budget)
+        for action in ["AXPress", "AXConfirm"] where names.contains(action) {
+            guard preflight(context, session: session, budget: budget),
+                  cachedFrameUnchanged(node.element, in: context, budget: budget) else { return stale(session) }
+            var outcome = AXError.failure
+            if effect(session, {
+                outcome = AXUIElementPerformAction(node.element, action as CFString)
+                return outcome == .success
+            }) { return .performed }
+            guard current(session) else { return .cancelled }
+            // cannotComplete/timeout may already have reached the app: a second click could
+            // toggle a checkbox back. Only definite unsupported actions permit a fallback.
+            guard outcome == .actionUnsupported || outcome == .notImplemented else {
+                return .unavailable("控件响应尚未确认，请重新选择后重试。")
+            }
+        }
+        let selectableRow = node.value.role == "AXRow" && settable(node.element, kAXSelectedAttribute, budget: budget)
+        guard AppNavigationAccessibilityLogic.permitsPointerActivation(role: node.value.role, selectableRow: selectableRow) else {
+            return .unavailable("此控件没有提供可验证的辅助功能激活方式。")
+        }
+        guard preflight(context, session: session, budget: budget),
+              validNode(node, in: context, session: session, budget: budget) else { return stale(session) }
+        // AX and CGEvent locations share the primary display's top-left coordinate system.
+        let point = CGPoint(x: node.value.frame.midX, y: node.value.frame.midY)
+        guard node.rawFrame.contains(point), context.frame.contains(point),
+              point.x.isFinite, point.y.isFinite,
+              label(node.element, kind: .button, role: node.value.role, budget: budget) == node.value.label,
+              hitBelongsToTarget(at: point, node: node, session: session, budget: budget),
+              preflight(context, session: session, budget: budget),
+              cachedFrameUnchanged(node.element, in: context, budget: budget),
+              focusedPID(budget: budget) == session.pid, allowed(budget) else { return stale(session) }
+        return effect(session, { Self.postClick(at: point, pid: session.pid) }) ? .performed : .cancelled
+    }
+
+    private func hitBelongsToTarget(at point: CGPoint, node: CachedNode,
+                                    session: Session, budget: Budget) -> Bool {
+        guard allowed(budget) else { return false }
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, messageTimeout)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+              var ancestor = hit else { return false }
+        var path: [AppNavigationAccessibilityLogic.HitStep] = []
+        var seen = Set<CFHashCode>()
+        for _ in 0..<22 {
+            guard allowed(budget), seen.insert(CFHash(ancestor)).inserted else { return false }
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(ancestor, &pid) == .success, pid == session.pid,
+                  let info = structure(ancestor, budget: budget), !info.hidden, info.enabled else { return false }
+            let isTarget = CFEqual(ancestor, node.element)
+            path.append(.init(isTarget: isTarget, ownerPID: pid, role: info.role,
+                              subrole: info.subrole, enabled: info.enabled, hidden: info.hidden))
+            if isTarget {
+                guard info.role == node.value.role, let frame = info.frame,
+                      Self.geometryUnchanged(displayed: node.rawFrame, current: frame) else { return false }
+                return AppNavigationAccessibilityLogic.hitBelongsToTarget(path, expectedPID: session.pid)
+            }
+            guard let parent = element(ancestor, kAXParentAttribute, budget: budget) else { return false }
+            ancestor = parent
+        }
+        return false
+    }
+
+    private static func postClick(at point: CGPoint, pid: pid_t) -> Bool {
+        guard let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                                 mouseCursorPosition: point, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                               mouseCursorPosition: point, mouseButton: .left) else { return false }
+        for event in [down, up] {
+            event.flags = []
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+            event.setIntegerValueField(.eventSourceUserData, value: syntheticEventTag)
+            // PID targeting prevents a late foreground transition from clicking a new app at
+            // this old location. It does not activate or reposition any application window.
+            event.postToPid(pid)
+        }
+        return true
+    }
+
     private func validNode(_ node: CachedNode, in cache: WindowCache, session: Session, budget: Budget) -> Bool {
         var pid: pid_t = 0
         guard allowed(budget), AXUIElementGetPid(node.element, &pid) == .success, pid == session.pid,
@@ -406,7 +683,7 @@ final class AppNavigationAccessibility: @unchecked Sendable {
                 return Self.geometryUnchanged(displayed: node.value.frame, current: visible)
             }
             guard let parent = element(ancestor, kAXParentAttribute, budget: budget) else { return false }
-            guard let parentInfo = structure(parent, budget: budget), !parentInfo.hidden else { return false }
+            guard let parentInfo = structure(parent, budget: budget), !parentInfo.hidden, parentInfo.enabled else { return false }
             if parentInfo.role == kAXScrollAreaRole as String, let parentFrame = parentInfo.frame {
                 visible = visible.intersection(parentFrame)
                 guard !visible.isNull else { return false }
@@ -509,7 +786,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
             guard !inputFocused, layout == .video, key == .up || key == .down,
                   let cache, cache.session == session.generation,
                   preflight(cache, session: session, budget: budget),
-                  AppNavigationGeometry.regions(nodes: cache.nodes.map(\.value), window: cache.frame, layout: layout)
+                  AppNavigationGeometry.regions(nodes: cache.nodes.map(\.value), window: cache.frame, layout: layout,
+                                                containers: cache.containers.map(\.value))
                     .contains(where: { $0.id == regionID && $0.vertical == .native }) else { return .cancelled }
         case .navigation, .escape, .menu: return .cancelled
         }
@@ -587,10 +865,10 @@ final class AppNavigationAccessibility: @unchecked Sendable {
         guard allowed(budget) else { return nil }
         AXUIElementSetMessagingTimeout(element, messageTimeout)
         let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXPositionAttribute, kAXSizeAttribute,
-                     kAXEnabledAttribute, kAXFocusedAttribute, "AXHidden", "AXVisible"] as CFArray
+                     kAXEnabledAttribute, kAXFocusedAttribute, "AXHidden", "AXVisible", "AXRoleDescription"] as CFArray
         var values: CFArray?
         guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
-              let result = values as? [Any], result.count == 8,
+              let result = values as? [Any], result.count == 9,
               let role = result[0] as? String else { return nil }
         var point = CGPoint.zero
         var size = CGSize.zero
@@ -603,7 +881,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
            size.width >= 3, size.height >= 3 {
             frame = CGRect(origin: point, size: size)
         }
-        return Structure(role: role, subrole: result[1] as? String ?? "", frame: frame,
+        return Structure(role: role, subrole: result[1] as? String ?? "",
+                         roleDescription: result[8] as? String ?? "", frame: frame,
                          enabled: (result[4] as? Bool) != false,
                          hidden: (result[6] as? Bool) == true || (result[7] as? Bool) == false,
                          focused: (result[5] as? Bool) == true)
@@ -618,17 +897,33 @@ final class AppNavigationAccessibility: @unchecked Sendable {
 
     private func label(_ element: AXUIElement, kind: AppNavigationNode.Kind,
                        role: String, budget: Budget) -> String {
-        for name in [kAXTitleAttribute, kAXDescriptionAttribute, "AXPlaceholderValue"] {
-            if let value = string(element, name, budget: budget) {
-                let compact = value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-                if !compact.isEmpty { return String(compact.prefix(90)) }
+        // Container descriptions may aggregate an entire conversation. Do not request them.
+        let names = AppNavigationAccessibilityLogic.containerRoles.contains(role)
+            ? [kAXTitleAttribute, "AXIdentifier"]
+            : [kAXTitleAttribute, kAXDescriptionAttribute, "AXPlaceholderValue"]
+        for name in names {
+            if let label = AppNavigationAccessibilityLogic.shortLabel(string(element, name, budget: budget), limit: 90) {
+                return label
             }
         }
         switch kind {
         case .input: return "输入框"
         case .scrollArea: return "滚动区域"
-        case .button: return role == "AXLink" ? "链接" : "按钮"
+        case .button: return role == "AXLink" ? "链接" : (role == "AXRow" ? "列表项" : "按钮")
         }
+    }
+
+    private func containerLabel(_ element: AXUIElement, budget: Budget) -> String {
+        guard allowed(budget) else { return "" }
+        AXUIElementSetMessagingTimeout(element, messageTimeout)
+        var values: CFArray?
+        let names = [kAXTitleAttribute, "AXIdentifier"] as CFArray
+        guard AXUIElementCopyMultipleAttributeValues(element, names, [], &values) == .success,
+              let values = values as? [Any] else { return "" }
+        for value in values {
+            if let label = AppNavigationAccessibilityLogic.shortLabel(value as? String) { return label }
+        }
+        return ""
     }
 
     private func attribute(_ element: AXUIElement, _ name: String, budget: Budget) -> CFTypeRef? {
@@ -680,7 +975,8 @@ final class AppNavigationAccessibility: @unchecked Sendable {
     /// Pure checks: no AX objects, workspace reads, event sources, or OS events are created.
     static func selfCheck() -> Bool {
         let frame = CGRect(x: -40, y: 60, width: 200, height: 100)
-        return Gate.selfCheck() && keyCode(.ok) == 36 && keyCode(.back) == 53 && keyCode(.voice) == nil
+        return AppNavigationAccessibilityLogic.selfCheck() && Gate.selfCheck()
+            && keyCode(.ok) == 36 && keyCode(.back) == 53 && keyCode(.voice) == nil
             && geometryUnchanged(displayed: frame, current: frame)
             && !geometryUnchanged(displayed: frame, current: frame.offsetBy(dx: 1, dy: 0))
             && !geometryUnchanged(displayed: frame, current: frame.insetBy(dx: 1, dy: 0))

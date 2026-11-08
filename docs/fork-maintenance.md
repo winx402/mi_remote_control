@@ -105,7 +105,7 @@ bash -n script/build_and_run.sh
 
 独立全局手势仍优先。应用内左右首按立即移动虚拟选择，第二按命中全局双击则执行 Ctrl＋左右，不再激活任何控件；菜单和 Dock 打开时暂时暂停应用导航。返回长按仍退出当前 App。窗口、控件位置或应用改变会清掉旧选择，避免操作与旧蓝框不一致的目标。
 
-通用部分沉淀在 `AppNavigationAccessibility`（后台控件发现、缓存、动作验证）、`AppNavigationGeometry`（四向选择与区域划分）、`ApplicationNavigationController`（会话、输入与取消）和 `NavigationFocusOverlay`。`appNavigationProfiles` 的 `mode` 可为 `native`／`buttons`／`regions`，`layout` 可为 `automatic`／`chat`／`video`。自绘界面没有提供可操作控件时，无法承诺通用导航；原生方向回退不盲点坐标，OK 也不会无选择地发送回车。当前版本不使用截图识别、聊天正文或输入框内容，也不保存界面数据。
+通用部分沉淀在 `AppNavigationAccessibility`（后台控件发现、缓存、动作验证）、`AppNavigationGeometry`（四向选择与区域划分）、`ApplicationNavigationController`（会话、输入与取消）和 `NavigationFocusOverlay`。分区使用当前 AX 容器父子关系、列表、分栏和滚动区，父容器直接控件与内层列表分别归属；匿名同集合包装链会压缩。缺少容器信息时只用实际控件或滚动区降级，不按窗口比例虚构侧栏。`appNavigationProfiles` 的 `mode` 可为 `native`／`buttons`／`regions`，`layout` 的 `automatic`／`chat`／`video` 只补充纵向操作语义。自绘界面没有提供可操作控件时，无法承诺通用导航；OK 不会无选择地发送回车。当前版本不使用截图识别、聊天正文或输入框内容，也不保存界面数据。
 
 ### 微信输入法与连续收音诊断
 

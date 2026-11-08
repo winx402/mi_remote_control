@@ -48,18 +48,15 @@ enum AppNavigationGeometry {
     }
 
     static func regions(nodes: [AppNavigationNode], window: CGRect,
-                        layout: AppNavigationLayout) -> [AppNavigationRegion] {
+                        layout: AppNavigationLayout,
+                        containers: [AppNavigationContainer] = []) -> [AppNavigationRegion] {
         guard valid(window) else { return [] }
         let visible = cleaned(nodes, within: window)
         guard !visible.isEmpty else { return [] }
-        switch layout {
-        case .automatic: return automaticRegions(visible)
-        case .chat: return arrangedRegions(visible, window: window, video: false)
-        case .video: return arrangedRegions(visible, window: window, video: true)
-        }
+        return containerRegions(visible, containers: containers, window: window, layout: layout)
     }
 
-    /// Region arrays define the semantic order: navigation, content, comments, then composer.
+    /// Region arrays follow the observed container hierarchy, with direct controls before children.
     /// At an edge the current region remains selected; an absent/stale selection starts at the first.
     static func movedRegion(currentID: String?, direction: Int,
                             regions: [AppNavigationRegion]) -> String? {
@@ -130,7 +127,7 @@ enum AppNavigationGeometry {
             let frame = window.map { node.frame.intersection($0) } ?? node.frame
             guard valid(frame) else { return nil }
             return AppNavigationNode(id: node.id, label: node.label, role: node.role,
-                                     frame: frame, kind: node.kind, focused: node.focused)
+                                     frame: frame, kind: node.kind, focused: node.focused, containerIDs: node.containerIDs)
         }.sorted { a, b in
             if a.id != b.id { return a.id < b.id }
             if (a.kind == .scrollArea) != (b.kind == .scrollArea) { return a.kind != .scrollArea }
@@ -138,7 +135,8 @@ enum AppNavigationGeometry {
             if a.frame != b.frame { return frameOrder(a.frame, b.frame) }
             if a.kind != b.kind { return a.kind.rawValue < b.kind.rawValue }
             if a.label != b.label { return a.label < b.label }
-            return a.role < b.role
+            if a.role != b.role { return a.role < b.role }
+            return Set(a.containerIDs).sorted().lexicographicallyPrecedes(Set(b.containerIDs).sorted())
         }
         var seen = Set<Int>()
         return visible.filter { seen.insert($0.id).inserted }
@@ -162,179 +160,304 @@ enum AppNavigationGeometry {
         return valid(frame) ? frame : nil
     }
 
-    private static func makeRegion(id: String, title: String, nodes: [AppNavigationNode],
-                                   anchor: AppNavigationNode? = nil,
-                                   vertical: AppNavigationRegion.Vertical,
-                                   clip: CGRect? = nil) -> AppNavigationRegion? {
-        let controls = nodes.filter { $0.kind != .scrollArea }.filter {
-            guard let clip else { return true }
-            return valid($0.frame.intersection(clip))
-        }.sorted(by: readingOrder)
-        let anchorFrame = anchor.flatMap { node -> CGRect? in
-            let frame = clip.map { node.frame.intersection($0) } ?? node.frame
-            return valid(frame) ? frame : nil
+    private enum ContainerKind {
+        case group, list, menu, tabs, toolbar, scroll, media
+
+        init(_ role: String) {
+            switch role.lowercased() {
+            case "axlist", "axoutline", "axtable", "axgrid", "axbrowser": self = .list
+            case "axmenu", "axmenubar": self = .menu
+            case "axtabgroup", "axradiogroup": self = .tabs
+            case "axtoolbar": self = .toolbar
+            case "axscrollarea": self = .scroll
+            case "axvideo", "axplayer": self = .media
+            default: self = .group
+            }
         }
-        let frames = controls.map { node in clip.map { node.frame.intersection($0) } ?? node.frame }
-            + (anchorFrame.map { [$0] } ?? [])
-        guard let frame = union(frames) else { return nil }
-        // No synthetic scroll target or point can be introduced by a preset.
-        guard vertical != .scroll || anchorFrame != nil else { return nil }
-        return AppNavigationRegion(id: id, title: title, frame: frame,
-                                   nodeIDs: controls.map(\.id), vertical: vertical,
-                                   scrollNodeID: anchorFrame == nil ? nil : anchor?.id)
     }
 
-    private static func largestAnchor(_ nodes: [AppNavigationNode], in clip: CGRect) -> AppNavigationNode? {
-        nodes.filter { $0.kind == .scrollArea && valid($0.frame.intersection(clip)) }.sorted { a, b in
-            let first = a.frame.intersection(clip), second = b.frame.intersection(clip)
-            let firstArea = first.width * first.height, secondArea = second.width * second.height
-            if firstArea != secondArea { return firstArea > secondArea }
-            // For equivalent visible coverage prefer the more specific actual container.
-            let firstFull = a.frame.width * a.frame.height, secondFull = b.frame.width * b.frame.height
-            if firstFull != secondFull { return firstFull < secondFull }
-            return a.id < b.id
+    private struct Partition {
+        var region: AppNavigationRegion
+        let owner: Int?
+        let input: Bool
+        let path: [Int]
+    }
+
+    private static func mediaLabel(_ label: String) -> Bool {
+        let label = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["视频", "视频区域", "播放器", "视频播放器", "video", "player",
+                "video player", "playback", "video playback"].contains(label)
+    }
+
+    /// The tree supplies boundaries; geometry only clips observed frames to the visible window.
+    /// Container membership is reconstructed from parent IDs, independent of AX enumeration order.
+    private static func containerRegions(_ nodes: [AppNavigationNode], containers: [AppNavigationContainer],
+                                         window: CGRect, layout: AppNavigationLayout) -> [AppNavigationRegion] {
+        var byID: [Int: AppNavigationContainer] = [:]
+        for value in containers.filter({ valid($0.frame) }).sorted(by: {
+            if $0.id != $1.id { return $0.id < $1.id }
+            if $0.frame != $1.frame { return frameOrder($0.frame, $1.frame) }
+            if $0.label != $1.label { return $0.label < $1.label }
+            if $0.role != $1.role { return $0.role < $1.role }
+            return ($0.parentID ?? Int.min) < ($1.parentID ?? Int.min)
+        }) {
+            let frame = value.frame.intersection(window)
+            guard valid(frame), byID[value.id] == nil else { continue }
+            byID[value.id] = AppNavigationContainer(id: value.id, parentID: value.parentID,
+                                                     label: value.label, role: value.role, frame: frame)
+        }
+        guard !byID.isEmpty else { return genericRegions(nodes, layout: layout) }
+        let kinds = byID.mapValues { ContainerKind($0.role) }
+        var ancestors: [Int: [Int]] = [:]
+        for id in byID.keys {
+            var path: [Int] = [], seen: Set<Int> = [id]
+            var parent = byID[id]?.parentID
+            while let next = parent, byID[next] != nil, seen.insert(next).inserted {
+                path.append(next)
+                parent = byID[next]?.parentID
+            }
+            ancestors[id] = path
+        }
+        func depth(_ id: Int) -> Int { ancestors[id]?.count ?? 0 }
+        func path(_ id: Int) -> [Int] { Array((ancestors[id] ?? []).reversed()) + [id] }
+        var memberships: [Int: Set<Int>] = [:]
+        for node in nodes {
+            var membership = Set(node.containerIDs.filter { byID[$0] != nil })
+            for id in membership { membership.formUnion(ancestors[id] ?? []) }
+            memberships[node.id] = membership
+        }
+        let controls = nodes.filter { $0.kind != .scrollArea }
+        var members: [Int: Set<Int>] = [:]
+        for node in controls {
+            for id in memberships[node.id] ?? [] { members[id, default: []].insert(node.id) }
+        }
+        // A real scroll node must back every scroll operation. Exact frame matches also support
+        // snapshots whose older reader omitted the scroll container itself from containerIDs.
+        var anchors: [Int: AppNavigationNode] = [:]
+        var matchedScrollIDs = Set<Int>()
+        for node in nodes where node.kind == .scrollArea {
+            var matching = (memberships[node.id] ?? []).filter { kinds[$0] == .scroll }
+            if matching.isEmpty {
+                matching = Set(byID.values.filter { kinds[$0.id] == .scroll && $0.frame == node.frame }.map(\.id))
+            }
+            if let owner = matching.sorted(by: { depth($0) == depth($1) ? $0 < $1 : depth($0) > depth($1) }).first {
+                if anchors[owner] == nil { anchors[owner] = node }
+                matchedScrollIDs.insert(node.id)
+            }
+        }
+        let semantic = Set(byID.keys.filter {
+            kinds[$0] != .group && (!(members[$0] ?? []).isEmpty || anchors[$0] != nil || kinds[$0] == .media)
+        })
+        var candidates = semantic
+        var inputGroups = Set<Int>()
+        for (id, container) in byID where kinds[id] == .group {
+            let own = members[id] ?? []
+            guard own.count >= 2 || (layout == .video && mediaLabel(container.label)) else { continue }
+            let semanticChildren = semantic.filter { (ancestors[$0] ?? []).contains(id) }
+            let childMembers = semanticChildren.reduce(into: Set<Int>()) { $0.formUnion(members[$1] ?? []) }
+            let direct = own.subtracting(childMembers)
+            let hasInput = controls.contains { own.contains($0.id) && $0.kind == .input }
+            let collectionAncestor = (ancestors[id] ?? []).contains {
+                kinds[$0] != .group && kinds[$0] != .media
+            }
+            // Anonymous message/row wrappers inside a scroll/list stay with that collection.
+            // A real input group or a group with its own controls AND a nested semantic list
+            // remains a boundary, including when the two menus occupy the same X coordinates.
+            let dedicatedInput = hasInput && semanticChildren.isEmpty
+            if dedicatedInput { inputGroups.insert(id) }
+            if dedicatedInput || (!collectionAncestor && semanticChildren.isEmpty)
+                || (!semanticChildren.isEmpty && !direct.isEmpty)
+                || (layout == .video && mediaLabel(container.label)) {
+                candidates.insert(id)
+            }
+        }
+        // Collapse equal-membership wrapping chains. Semantic collections beat generic DOM
+        // wrappers, and a more specific semantic child beats an enclosing scroll/root wrapper.
+        let initial = candidates
+        candidates = candidates.filter { id in
+            let own = members[id] ?? []
+            if kinds[id] == .group && !own.isEmpty && (ancestors[id] ?? []).contains(where: {
+                initial.contains($0) && kinds[$0] != .group && kinds[$0] != .scroll && members[$0] == own
+            }) { return false }
+            return !initial.contains { child in
+                child != id && !own.isEmpty && members[child] == own
+                    && (ancestors[child] ?? []).contains(id)
+                    && (kinds[child] != .group || kinds[id] == .group)
+            }
+        }
+        func closestCandidate(_ ids: Set<Int>) -> Int? {
+            ids.intersection(candidates).sorted {
+                depth($0) == depth($1) ? $0 < $1 : depth($0) > depth($1)
+            }.first
+        }
+        func parentCandidate(_ id: Int) -> Int? {
+            (ancestors[id] ?? []).first { candidates.contains($0) }
+        }
+        func anchor(_ id: Int) -> AppNavigationNode? {
+            ([id] + (ancestors[id] ?? [])).compactMap { anchors[$0] }.first
+        }
+        func baseID(_ id: Int) -> String { "container-\(id)" }
+        func title(_ id: Int, direct: Bool) -> String {
+            let chain = [id] + (ancestors[id] ?? []).prefix { members[$0] == members[id] }
+            if let label = chain.compactMap({ byID[$0]?.label.trimmingCharacters(in: .whitespacesAndNewlines) })
+                .first(where: { !$0.isEmpty }) { return label }
+            let nested = parentCandidate(id) != nil
+            switch kinds[id] ?? .group {
+            case .list: return nested ? "内层列表" : "列表"
+            case .menu: return nested ? "内层菜单" : "外层菜单"
+            case .tabs: return "标签栏"
+            case .toolbar: return "工具栏"
+            case .scroll: return "滚动内容"
+            case .media: return "播放器"
+            case .group:
+                if inputGroups.contains(id) { return "输入" }
+                let insideMenu = (ancestors[id] ?? []).contains {
+                    kinds[$0] == .list || kinds[$0] == .menu || kinds[$0] == .tabs
+                }
+                return direct ? (insideMenu ? "内层控件" : "外层菜单") : "控件"
+            }
+        }
+        var ownerByNode: [Int: Int] = [:]
+        for node in controls { ownerByNode[node.id] = closestCandidate(memberships[node.id] ?? []) }
+        var buckets: [Int: [AppNavigationNode]] = [:]
+        var inputNodes: [(AppNavigationNode, Int?)] = []
+        var unowned: [AppNavigationNode] = []
+        for node in controls {
+            guard let owner = ownerByNode[node.id] else {
+                if node.kind == .input { inputNodes.append((node, nil)) } else { unowned.append(node) }
+                continue
+            }
+            if node.kind == .input && !inputGroups.contains(owner) && kinds[owner] != .toolbar {
+                inputNodes.append((node, owner))
+            } else { buckets[owner, default: []].append(node) }
+        }
+        var partitions: [Partition] = []
+        for id in candidates.sorted() {
+            guard let container = byID[id] else { continue }
+            let own = buckets[id] ?? []
+            let ownIDs = Set(own.map(\.id)), allIDs = members[id] ?? []
+            let subdivided = ownIDs != allIDs
+            let hasChildFace = candidates.contains { $0 != id && (ancestors[$0] ?? []).contains(id) }
+            let backing = anchor(id)
+            let isMedia = layout == .video && (kinds[id] == .media || mediaLabel(container.label))
+            let emptyScroll = allIDs.isEmpty && !hasChildFace && anchors[id] != nil
+            guard !own.isEmpty || emptyScroll || (isMedia && !hasChildFace) else { continue }
+            let vertical: AppNavigationRegion.Vertical = isMedia ? .native
+                : (kinds[id] == .scroll && anchors[id] != nil ? .scroll : .buttons)
+            // A parent exposing only some direct controls uses those controls' union, rather
+            // than its entire frame, so its inner list is a distinct selectable face.
+            let frame: CGRect?
+            if vertical == .scroll || isMedia { frame = container.frame }
+            else if subdivided { frame = union(own.map(\.frame)) }
+            else { frame = union([container.frame] + own.map(\.frame)) }
+            guard let frame, valid(frame) else { continue }
+            let ownRegionID = subdivided ? "\(baseID(id))-direct" : baseID(id)
+            let parentID = subdivided ? baseID(id) : parentCandidate(id).map(baseID)
+            partitions.append(Partition(region: AppNavigationRegion(
+                id: ownRegionID, title: title(id, direct: subdivided), frame: frame,
+                nodeIDs: own.sorted(by: readingOrder).map(\.id), vertical: vertical,
+                scrollNodeID: backing?.id, parentID: parentID), owner: id, input: false, path: path(id)))
+        }
+        for (node, owner) in inputNodes {
+            partitions.append(Partition(region: AppNavigationRegion(
+                id: "input-\(node.id)", title: node.label.isEmpty ? "输入" : node.label,
+                frame: node.frame, nodeIDs: [node.id], vertical: .buttons,
+                parentID: owner.map(baseID)), owner: owner, input: true,
+                path: owner.map(path) ?? [Int.max, node.id]))
+        }
+        // Only actual descendant faces are subtracted; spatial proximity never establishes
+        // a parent/child relation. This keeps an enclosing scroll highlight off a real composer.
+        for index in partitions.indices where partitions[index].region.vertical != .buttons {
+            guard let owner = partitions[index].owner else { continue }
+            let exclusions = partitions.enumerated().compactMap { otherIndex, other -> CGRect? in
+                guard otherIndex != index, let otherOwner = other.owner,
+                      (otherOwner == owner && other.input) || (ancestors[otherOwner] ?? []).contains(owner) else { return nil }
+                return other.region.frame
+            }
+            let points = (buckets[owner] ?? []).map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) }
+            if let frame = remainingFrame(partitions[index].region.frame, excluding: exclusions, preferring: points) {
+                partitions[index].region = replacingFrame(partitions[index].region, frame)
+            }
+        }
+        partitions.sort {
+            if $0.path != $1.path { return $0.path.lexicographicallyPrecedes($1.path) }
+            if $0.input != $1.input { return !$0.input }
+            return $0.region.id < $1.region.id
+        }
+        let represented = Set(partitions.flatMap { $0.region.nodeIDs })
+        let unknownScrolls = nodes.filter { $0.kind == .scrollArea && !matchedScrollIDs.contains($0.id) }
+        let rest = unowned.filter { !represented.contains($0.id) } + unknownScrolls
+        let result = partitions.map(\.region) + genericRegions(rest, layout: layout)
+        return result.isEmpty ? genericRegions(nodes, layout: layout) : result
+    }
+
+    private static func replacingFrame(_ region: AppNavigationRegion, _ frame: CGRect) -> AppNavigationRegion {
+        AppNavigationRegion(id: region.id, title: region.title, frame: frame, nodeIDs: region.nodeIDs,
+                            vertical: region.vertical, scrollNodeID: region.scrollNodeID, parentID: region.parentID)
+    }
+
+    /// Return an actual rectangular portion of a scroll frame after removing observed child
+    /// regions. No point or area outside the original AX frame can be created here.
+    private static func remainingFrame(_ frame: CGRect, excluding: [CGRect], preferring points: [CGPoint] = []) -> CGRect? {
+        var fragments = [frame]
+        for exclusion in excluding {
+            fragments = fragments.flatMap { source -> [CGRect] in
+                let cut = source.intersection(exclusion)
+                guard valid(cut) else { return [source] }
+                return [CGRect(x: source.minX, y: source.minY, width: source.width, height: cut.minY - source.minY),
+                        CGRect(x: source.minX, y: cut.maxY, width: source.width, height: source.maxY - cut.maxY),
+                        CGRect(x: source.minX, y: cut.minY, width: cut.minX - source.minX, height: cut.height),
+                        CGRect(x: cut.maxX, y: cut.minY, width: source.maxX - cut.maxX, height: cut.height)].filter(valid)
+            }
+            // A bounded fallback remains deterministic for unusually large AX trees.
+            if fragments.count > 128 { fragments = Array(fragments.sorted { $0.width * $0.height > $1.width * $1.height }.prefix(128)) }
+        }
+        return fragments.sorted { a, b in
+            let first = points.filter { a.contains($0) }.count, second = points.filter { b.contains($0) }.count
+            if first != second { return first > second }
+            let firstArea = a.width * a.height, secondArea = b.width * b.height
+            return firstArea == secondArea ? frameOrder(a, b) : firstArea > secondArea
         }.first
     }
 
-    private static func hasColumnEvidence(_ nodes: [AppNavigationNode], window: CGRect,
-                                          acceptsLowerInput: Bool = false) -> Bool {
-        if nodes.contains(where: { $0.kind == .scrollArea && $0.frame.height >= window.height * 0.25 }) {
-            return true
-        }
-        let controls = nodes.filter { $0.kind != .scrollArea }
-        if acceptsLowerInput && controls.contains(where: {
-            $0.kind == .input && $0.frame.midY >= window.minY + window.height * 0.4
-        }) { return true }
-        guard controls.count >= 2,
-              let low = controls.map({ $0.frame.midY }).min(),
-              let high = controls.map({ $0.frame.midY }).max() else { return false }
-        return high - low >= window.height * 0.16
-    }
-
-    private static func arrangedRegions(_ nodes: [AppNavigationNode], window: CGRect,
-                                        video: Bool) -> [AppNavigationRegion] {
-        let leftCandidates = nodes.filter {
-            $0.frame.midX <= window.minX + window.width * 0.29
-                && $0.frame.maxX <= window.minX + window.width * 0.4
-        }
-        let sidebar = hasColumnEvidence(leftCandidates, window: window) ? leftCandidates : []
-        let sidebarIDs = Set(sidebar.map(\.id))
-        let leftEdge = union(sidebar.map(\.frame))?.maxX ?? window.minX
-
-        let rightCandidates = video ? nodes.filter {
-            !sidebarIDs.contains($0.id)
-                && $0.frame.midX >= window.minX + window.width * 0.72
-                && $0.frame.minX >= window.minX + window.width * 0.58
-        } : []
-        let comments = hasColumnEvidence(rightCandidates, window: window, acceptsLowerInput: true)
-            ? rightCandidates : []
-        let commentIDs = Set(comments.map(\.id))
-        let rightEdge = union(comments.map(\.frame))?.minX ?? window.maxX
-
-        let bottomInputs = video ? [] : nodes.filter {
-            $0.kind == .input && !sidebarIDs.contains($0.id)
-                && $0.frame.midY >= window.minY + window.height * 0.6
-                && $0.frame.midX >= leftEdge
-        }
-        let inputTop = bottomInputs.map({ $0.frame.minY }).min()
-        let inputIDs = Set(bottomInputs.map(\.id))
-        let composer = inputTop.map { top in nodes.filter {
-            $0.kind != .scrollArea && !sidebarIDs.contains($0.id)
-                && (inputIDs.contains($0.id) || ($0.frame.midY >= top && $0.frame.midX >= leftEdge))
-        } } ?? []
-        let composerIDs = Set(composer.map(\.id))
-
-        // Boundaries come from the observed side columns and input edge. Intersecting a large
-        // real scroll container with these bounds keeps it from covering a separate input region.
-        let contentBounds = CGRect(x: leftEdge, y: window.minY,
-                                   width: rightEdge - leftEdge,
-                                   height: (inputTop ?? window.maxY) - window.minY)
-        let content = nodes.filter {
-            !sidebarIDs.contains($0.id) && !commentIDs.contains($0.id) && !composerIDs.contains($0.id)
-                && valid($0.frame.intersection(contentBounds))
-        }
-
-        var result: [AppNavigationRegion] = []
-        if let frame = union(sidebar.map(\.frame)),
-           let region = makeRegion(id: "navigation", title: "导航", nodes: sidebar,
-                                   anchor: largestAnchor(sidebar, in: frame),
-                                   vertical: sidebar.contains(where: { $0.kind != .scrollArea }) ? .buttons : .scroll) {
-            result.append(region)
-        }
-        if valid(contentBounds) {
-            let anchor = largestAnchor(content, in: contentBounds)
-            let vertical: AppNavigationRegion.Vertical = video ? .native : (anchor == nil ? .buttons : .scroll)
-            if let region = makeRegion(id: "content", title: video ? "视频" : "内容", nodes: content,
-                                       anchor: anchor, vertical: vertical, clip: contentBounds) {
-                result.append(region)
-            }
-        }
-        if let frame = union(comments.map(\.frame)) {
-            let anchor = largestAnchor(comments, in: frame)
-            if let region = makeRegion(id: "comments", title: "评论", nodes: comments, anchor: anchor,
-                                       vertical: anchor == nil ? .buttons : .scroll) {
-                result.append(region)
-            }
-        }
-        if let region = makeRegion(id: "input", title: "输入", nodes: composer, vertical: .buttons) {
-            result.append(region)
-        }
-        if result.isEmpty || (result.count == 1 && result[0].id == "content" && result[0].vertical == .buttons) {
-            return fallbackRegion(nodes)
-        }
-        return result
-    }
-
-    private static func automaticRegions(_ nodes: [AppNavigationNode]) -> [AppNavigationRegion] {
-        let scrolls = nodes.filter { $0.kind == .scrollArea }
-        // Prefer inner scroll views over a broad enclosing root. No AX hierarchy is inferred;
-        // this is only a geometric fallback for apps without a chosen layout.
-        let leaves = scrolls.filter { outer in
+    /// Missing hierarchy means a conservative generic fallback, shared by every app layout.
+    /// Only actual scroll views and input nodes introduce boundaries; no sidebar is guessed.
+    private static func genericRegions(_ nodes: [AppNavigationNode], layout: AppNavigationLayout) -> [AppNavigationRegion] {
+        guard !nodes.isEmpty else { return [] }
+        let scrolls = nodes.filter { $0.kind == .scrollArea }.sorted { $0.id < $1.id }
+        let anchors = scrolls.filter { outer in
             !scrolls.contains { inner in
-                guard inner.id != outer.id else { return false }
-                let outerArea = outer.frame.width * outer.frame.height
-                let innerArea = inner.frame.width * inner.frame.height
-                return innerArea < outerArea * 0.95 && outer.frame.contains(inner.frame)
+                inner.id != outer.id && outer.frame.contains(inner.frame)
+                    && (inner.frame != outer.frame || inner.id < outer.id)
             }
-        }.sorted {
-            let a = $0.frame.width * $0.frame.height, b = $1.frame.width * $1.frame.height
-            return a == b ? $0.id < $1.id : a < b
         }
-        var anchors: [AppNavigationNode] = []
-        for leaf in leaves {
-            // Equivalent/overlapping AX scroll representations must not create duplicate regions.
-            let overlaps = anchors.contains { anchor in
-                let overlap = leaf.frame.intersection(anchor.frame)
-                return valid(overlap) && overlap.width * overlap.height
-                    > min(leaf.frame.width * leaf.frame.height, anchor.frame.width * anchor.frame.height) * 0.25
-            }
-            if !overlaps { anchors.append(leaf) }
-        }
-        guard !anchors.isEmpty else { return fallbackRegion(nodes) }
         let controls = nodes.filter { $0.kind != .scrollArea }
-        var assigned = Set<Int>()
-        var result: [AppNavigationRegion] = []
+        let inputs = controls.filter { $0.kind == .input }
+        var assigned = Set<Int>(), result: [AppNavigationRegion] = []
         for anchor in anchors.sorted(by: readingOrder) {
             let members = controls.filter {
-                !assigned.contains($0.id) && anchor.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
+                $0.kind != .input && !assigned.contains($0.id)
+                    && anchor.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
             }
             assigned.formUnion(members.map(\.id))
-            if let region = makeRegion(id: "scroll-\(anchor.id)", title: "滚动区域 \(result.count + 1)",
-                                       nodes: members, anchor: anchor,
-                                       vertical: members.isEmpty ? .scroll : .buttons) {
-                result.append(region)
-            }
+            let frame = remainingFrame(anchor.frame, excluding: inputs.map(\.frame),
+                                       preferring: members.map { CGPoint(x: $0.frame.midX, y: $0.frame.midY) }) ?? anchor.frame
+            result.append(AppNavigationRegion(id: "scroll-\(anchor.id)",
+                                              title: anchor.label.isEmpty ? "滚动内容" : anchor.label,
+                                              frame: frame, nodeIDs: members.sorted(by: readingOrder).map(\.id),
+                                              vertical: layout == .video && mediaLabel(anchor.label) ? .native : .scroll,
+                                              scrollNodeID: anchor.id))
         }
-        let remaining = controls.filter { !assigned.contains($0.id) }
-        result.append(contentsOf: fallbackRegion(remaining))
+        let remaining = controls.filter { $0.kind != .input && !assigned.contains($0.id) }
+        if let frame = union(remaining.map(\.frame)) {
+            result.append(AppNavigationRegion(id: "controls", title: "控件", frame: frame,
+                                              nodeIDs: remaining.sorted(by: readingOrder).map(\.id), vertical: .buttons))
+        }
+        for input in inputs.sorted(by: readingOrder) {
+            result.append(AppNavigationRegion(id: "input-\(input.id)", title: input.label.isEmpty ? "输入" : input.label,
+                                              frame: input.frame, nodeIDs: [input.id], vertical: .buttons))
+        }
         return result
-    }
-
-    private static func fallbackRegion(_ nodes: [AppNavigationNode]) -> [AppNavigationRegion] {
-        guard let region = makeRegion(id: "controls", title: "控件", nodes: nodes, vertical: .buttons) else {
-            return []
-        }
-        return [region]
     }
 
     /// Synthetic snapshots only: no application lookup, event posting, AX access, or UI side effects.
@@ -383,58 +506,150 @@ enum AppNavigationGeometry {
             return failure("invalid frames, focused input, duplicates, and ties")
         }
 
-        let window = CGRect(x: 100, y: 200, width: 1_000, height: 800)
-        let chat = [node(1, 120, 240, 180, 36), node(2, 120, 440, 180, 36),
-                    node(20, 100, 220, 220, 740, .scrollArea),
-                    node(21, 100, 200, 1_000, 800, .scrollArea), node(41, 500, 400),
-                    node(31, 400, 880, 480, 70, .input), node(32, 900, 900)]
-        let chatRegions = regions(nodes: chat, window: window, layout: .chat)
-        guard chatRegions.map(\.id) == ["navigation", "content", "input"],
-              chatRegions[0].vertical == .buttons, chatRegions[0].nodeIDs == [1, 2],
-              chatRegions[1].vertical == .scroll, chatRegions[1].scrollNodeID == 21,
-              chatRegions[1].nodeIDs == [41], chatRegions[1].frame.minX == 320,
-              chatRegions[1].frame.maxY == 880, chatRegions[2].nodeIDs == [31, 32],
-              !chatRegions.flatMap(\.nodeIDs).contains(20), !chatRegions.flatMap(\.nodeIDs).contains(21),
-              movedRegion(currentID: "navigation", direction: -1, regions: chatRegions) == "navigation",
-              movedRegion(currentID: "content", direction: 1, regions: chatRegions) == "input",
-              movedRegion(currentID: "input", direction: 1, regions: chatRegions) == "input",
-              movedRegion(currentID: nil, direction: -1, regions: chatRegions) == "navigation" else {
-            return failure("chat partitions and region edges")
+        func scoped(_ node: AppNavigationNode, _ ids: [Int]) -> AppNavigationNode {
+            var node = node
+            node.containerIDs = ids
+            return node
+        }
+        func container(_ id: Int, _ parent: Int?, _ role: String, _ label: String,
+                       _ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ height: CGFloat) -> AppNavigationContainer {
+            AppNavigationContainer(id: id, parentID: parent, label: label, role: role,
+                                   frame: CGRect(x: x, y: y, width: width, height: height))
+        }
+        let window = CGRect(x: 0, y: 0, width: 1_200, height: 800)
+        let tree = [container(100, nil, "AXGroup", "", 0, 0, 1_200, 800),
+                    container(110, 100, "AXGroup", "导航", 0, 0, 300, 700),
+                    container(111, 110, "AXGroup", "", 0, 0, 300, 700),
+                    container(112, 111, "AXGroup", "", 0, 0, 300, 700),
+                    container(120, 112, "AXList", "历史列表", 0, 200, 300, 500),
+                    container(121, 120, "AXGroup", "", 10, 250, 280, 60),
+                    container(122, 120, "AXGroup", "", 10, 350, 280, 60),
+                    container(200, 100, "AXScrollArea", "对话", 300, 0, 900, 700),
+                    container(210, 200, "AXGroup", "", 320, 100, 840, 100),
+                    container(211, 210, "AXGroup", "", 320, 100, 840, 100),
+                    container(220, 200, "AXGroup", "", 320, 300, 840, 100),
+                    container(300, 100, "AXToolbar", "输入工具栏", 300, 700, 900, 100),
+                    container(301, 300, "AXGroup", "", 300, 700, 900, 100)]
+        let chat = [scoped(node(1, 20, 20, 60, 30), [112]), scoped(node(2, 20, 80, 60, 30), [112]),
+                    scoped(node(3, 20, 250, 200, 30), [121]), scoped(node(4, 20, 350, 200, 30), [122]),
+                    scoped(node(5, 240, 350, 30, 30), [122]),
+                    scoped(node(50, 300, 0, 900, 700, .scrollArea), [200]),
+                    scoped(node(6, 400, 120), [211]), scoped(node(7, 500, 120), [211]),
+                    scoped(node(8, 400, 320), [220]), scoped(node(9, 500, 320), [220]),
+                    scoped(node(10, 400, 720, 600, 50, .input), [301]), scoped(node(11, 1_040, 730), [301])]
+        let chatRegions = regions(nodes: chat, window: window, layout: .chat, containers: tree)
+        guard chatRegions.map(\.id) == ["container-112-direct", "container-120", "container-200", "container-300"],
+              chatRegions.map(\.nodeIDs) == [[1, 2], [3, 4, 5], [6, 7, 8, 9], [10, 11]],
+              chatRegions[0].title == "导航", chatRegions[1].title == "历史列表",
+              chatRegions[0].parentID == "container-112", chatRegions[1].parentID == "container-112",
+              chatRegions[0].frame.maxY < chatRegions[1].frame.minY,
+              chatRegions[0].vertical == .buttons, chatRegions[1].vertical == .buttons,
+              chatRegions[2].vertical == .scroll, chatRegions[2].scrollNodeID == 50,
+              chatRegions[3].vertical == .buttons, chatRegions[3].title == "输入工具栏",
+              chatRegions[2].frame.maxY <= chatRegions[3].frame.minY,
+              Set(chatRegions.flatMap(\.nodeIDs)).count == 11,
+              !chatRegions.flatMap(\.nodeIDs).contains(50),
+              movedRegion(currentID: chatRegions[0].id, direction: -1, regions: chatRegions) == chatRegions[0].id,
+              movedRegion(currentID: chatRegions[0].id, direction: 1, regions: chatRegions) == chatRegions[1].id,
+              movedRegion(currentID: chatRegions[3].id, direction: 1, regions: chatRegions) == chatRegions[3].id else {
+            return failure("nested same-X menus, DOM wrappers, message wrappers, and input toolbar")
         }
 
-        let videoWindow = CGRect(x: 0, y: 0, width: 1_200, height: 800)
-        let video = [node(1, 20, 100, 160, 40), node(2, 20, 300, 160, 40),
-                     node(20, 0, 0, 1_200, 800, .scrollArea), node(3, 500, 650),
-                     node(21, 850, 100, 330, 650, .scrollArea),
-                     node(4, 950, 400), node(5, 860, 700, 270, 40, .input)]
-        let videoRegions = regions(nodes: video, window: videoWindow, layout: .video)
-        let fallback = regions(nodes: [node(1, 30, 30)], window: videoWindow, layout: .chat)
-        let automatic = regions(nodes: [node(20, 0, 0, 200, 200, .scrollArea), node(1, 10, 10),
-                                        node(2, 300, 300)], window: videoWindow, layout: .automatic)
-        guard videoRegions.map(\.id) == ["navigation", "content", "comments"],
-              videoRegions[1].vertical == .native, videoRegions[1].frame.maxX == 850,
-              videoRegions[2].vertical == .scroll, videoRegions[2].scrollNodeID == 21,
-              videoRegions[2].nodeIDs == [4, 5],
-              fallback.count == 1, fallback[0].id == "controls", fallback[0].nodeIDs == [1],
-              automatic.map(\.id) == ["scroll-20", "controls"],
-              automatic[0].nodeIDs == [1], automatic[1].nodeIDs == [2],
-              regions(nodes: chat, window: .null, layout: .chat).isEmpty,
-              regions(nodes: invalid, window: videoWindow, layout: .chat).count == 1,
-              movedRegion(currentID: nil, direction: 1, regions: []) == nil else {
-            return failure("video partitions, automatic fallback, and invalid windows")
+        let expandedTree = tree + [container(123, 120, "AXOutline", "展开列表", 20, 420, 260, 220),
+                                   container(124, 123, "AXList", "更深列表", 20, 560, 260, 60)]
+        let expandedNodes = chat + [scoped(node(12, 40, 450), [123]), scoped(node(13, 40, 510), [123]),
+                                    scoped(node(14, 40, 570), [124])]
+        let expanded = regions(nodes: expandedNodes, window: window, layout: .chat, containers: expandedTree)
+        guard expanded.map(\.id) == ["container-112-direct", "container-120-direct", "container-123-direct",
+                                      "container-124", "container-200", "container-300"],
+              expanded[1].nodeIDs == [3, 4, 5], expanded[2].nodeIDs == [12, 13], expanded[3].nodeIDs == [14],
+              expanded[2].parentID == "container-123", expanded[3].parentID == "container-123",
+              Set(expanded.flatMap(\.nodeIDs)).count == 14 else {
+            return failure("multiple expanded list levels preserve direct controls")
         }
 
-        // Both classification and selection must work away from the primary screen origin.
-        let shifted = chat.map { value in
+        let enclosingScrollTree = tree.map { value in
+            AppNavigationContainer(id: value.id, parentID: value.id == 300 ? 200 : value.parentID,
+                                   label: value.label, role: value.role,
+                                   frame: value.id == 200 ? CGRect(x: 300, y: 0, width: 900, height: 800) : value.frame)
+        }
+        let enclosingScrollNodes = chat.map { value in
             AppNavigationNode(id: value.id, label: value.label, role: value.role,
-                              frame: value.frame.offsetBy(dx: -2_000, dy: 500), kind: value.kind,
-                              focused: value.focused)
+                              frame: value.id == 50 ? CGRect(x: 300, y: 0, width: 900, height: 800) : value.frame,
+                              kind: value.kind, focused: value.focused, containerIDs: value.containerIDs)
         }
-        let shiftedRegions = regions(nodes: shifted, window: window.offsetBy(dx: -2_000, dy: 500), layout: .chat)
-        guard shiftedRegions.map(\.id) == chatRegions.map(\.id),
-              shiftedRegions.map(\.nodeIDs) == chatRegions.map(\.nodeIDs),
-              target(currentID: 1, direction: .down, nodes: shifted) == 2 else {
-            return failure("translated window and controls")
+        let enclosingScroll = regions(nodes: enclosingScrollNodes, window: window, layout: .chat,
+                                      containers: enclosingScrollTree)
+        guard let scrolling = enclosingScroll.first(where: { $0.vertical == .scroll }),
+              let toolbar = enclosingScroll.first(where: { $0.id == "container-300" }),
+              scrolling.nodeIDs == [6, 7, 8, 9], scrolling.frame.maxY == 700,
+              toolbar.nodeIDs == [10, 11], toolbar.parentID == "container-200",
+              !scrolling.frame.intersects(toolbar.frame) else {
+            return failure("enclosing scroll excludes its real descendant input toolbar")
+        }
+
+        // Anisotropic resize and translation move a narrow outer menu and its same-X inner
+        // list together. Membership, rather than a fraction of the window width, defines them.
+        func transform(_ frame: CGRect) -> CGRect {
+            CGRect(x: frame.minX * 0.37 - 1_800, y: frame.minY * 0.7 + 500,
+                   width: frame.width * 0.37, height: frame.height * 0.7)
+        }
+        let resizedNodes = chat.map { value in
+            AppNavigationNode(id: value.id, label: value.label, role: value.role,
+                              frame: transform(value.frame), kind: value.kind, focused: value.focused,
+                              containerIDs: value.containerIDs.reversed())
+        }
+        let resizedTree = tree.reversed().map { value in
+            AppNavigationContainer(id: value.id, parentID: value.parentID, label: value.label,
+                                   role: value.role, frame: transform(value.frame))
+        }
+        let resized = regions(nodes: resizedNodes, window: transform(window), layout: .chat, containers: resizedTree)
+        guard resized.map(\.id) == chatRegions.map(\.id), resized.map(\.nodeIDs) == chatRegions.map(\.nodeIDs),
+              resized.map(\.vertical) == chatRegions.map(\.vertical),
+              target(currentID: 1, direction: .down, nodes: resizedNodes) == 2 else {
+            return failure("narrow menu, resized/translated window, and unordered containers")
+        }
+
+        let playerTree = [container(450, nil, "AXGroup", "播放器", 300, 0, 700, 600)]
+        let playerNodes = [scoped(node(70, 600, 500), [450])]
+        let player = regions(nodes: playerNodes, window: window, layout: .video, containers: playerTree)
+        let plainVideo = regions(nodes: [node(71, 600, 500)], window: window, layout: .video)
+        let missingTreeNodes = [node(80, 0, 0, 1_200, 800, .scrollArea), node(81, 20, 20),
+                                node(82, 900, 300), node(83, 300, 700, 600, 100, .input)]
+        let missingTree = regions(nodes: missingTreeNodes, window: window, layout: .chat)
+        let missingTreeVideo = regions(nodes: missingTreeNodes, window: window, layout: .video)
+        let onlyControls = regions(nodes: [node(91, 20, 20), node(92, 1_100, 700)], window: window, layout: .chat)
+        guard player.count == 1, player[0].vertical == .native,
+              plainVideo.count == 1, plainVideo[0].vertical == .buttons,
+              missingTree.map(\.id) == ["scroll-80", "input-83"], missingTree[0].nodeIDs == [81, 82],
+              missingTree[0].frame.maxY == 700, missingTree[0].vertical == .scroll,
+              missingTree.map(\.id) == missingTreeVideo.map(\.id),
+              missingTree.map(\.vertical) == missingTreeVideo.map(\.vertical),
+              onlyControls.count == 1, onlyControls[0].id == "controls", onlyControls[0].nodeIDs == [91, 92],
+              regions(nodes: chat, window: .null, layout: .chat, containers: tree).isEmpty,
+              regions(nodes: invalid, window: window, layout: .chat).count == 1,
+              movedRegion(currentID: nil, direction: 1, regions: []) == nil else {
+            return failure("real player label, no-tree generic fallback, input clipping, and invalid windows")
+        }
+
+        let anonymousTree = [container(600, nil, "AXGroup", "", 0, 0, 400, 400),
+                             container(601, 600, "AXGroup", "", 0, 0, 400, 400),
+                             container(602, 601, "AXGroup", "", 0, 0, 400, 400),
+                             container(603, 602, "AXGroup", "", 0, 0, 200, 100),
+                             container(604, 602, "AXGroup", "", 0, 200, 200, 100)]
+        let anonymousNodes = [scoped(node(93, 20, 20), [603]), scoped(node(94, 20, 220), [604])]
+        let anonymous = regions(nodes: anonymousNodes, window: window, layout: .chat, containers: anonymousTree)
+        let unnamedNested = regions(nodes: chat, window: window, layout: .chat,
+                                    containers: tree.map { AppNavigationContainer(id: $0.id, parentID: $0.parentID,
+                                                                                 label: "", role: $0.role, frame: $0.frame) })
+        let cycle = [container(700, 701, "AXGroup", "", 0, 0, 400, 400),
+                     container(701, 700, "AXGroup", "", 0, 0, 400, 400)]
+        let cyclic = regions(nodes: [scoped(node(95, 20, 20), [700]), scoped(node(96, 20, 220), [701])],
+                             window: window, layout: .chat, containers: cycle)
+        guard anonymous.count == 1, anonymous[0].nodeIDs == [93, 94],
+              unnamedNested[0].title == "外层菜单", unnamedNested[1].title == "内层列表",
+              Set(cyclic.flatMap(\.nodeIDs)) == [95, 96], cyclic.flatMap(\.nodeIDs).count == 2 else {
+            return failure("anonymous same-set wrappers, hierarchy titles, and malformed parent cycle")
         }
         return true
     }

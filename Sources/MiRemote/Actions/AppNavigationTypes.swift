@@ -33,6 +33,15 @@ struct AppNavigationNode: Identifiable, Equatable, Sendable {
     let frame: CGRect
     let kind: Kind
     var focused: Bool = false
+    var containerIDs: [Int] = []
+}
+
+struct AppNavigationContainer: Identifiable, Equatable, Sendable {
+    let id: Int
+    let parentID: Int?
+    let label: String
+    let role: String
+    let frame: CGRect
 }
 
 struct AppNavigationRegion: Identifiable, Equatable, Sendable {
@@ -43,4 +52,5 @@ struct AppNavigationRegion: Identifiable, Equatable, Sendable {
     let nodeIDs: [Int]
     let vertical: Vertical
     var scrollNodeID: Int? = nil
+    var parentID: String? = nil
 }

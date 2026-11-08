@@ -248,6 +248,10 @@ enum SelfTest {
         expect(ActionRunner.selfCheck(), "ActionRunner 键表/修饰位自测")
         expect(WorkspaceActions.selfCheck(), "WorkspaceActions 工作区动作目录自测")
         expect(DockNavigationController.selfCheck(), "真实Dock四向选择、沿轴发键与取消代次")
+        expect(ApplicationNavigationGestures.selfCheck(), "应用导航首按即时选中、全局双击与取消")
+        expect(MappingEngine.applicationNavigationSelfCheck(), "应用导航路由、菜单优先和全局长按/双击")
+        expect(AppNavigationGeometry.selfCheck(), "通用控件四向几何选择与分区")
+        expect(ApplicationNavigationController.selfCheck(), "应用导航会话/取消与输入状态")
         expect(Set(KeyRemapper.table.map(\.key)).isSuperset(of: [.volUp, .volDown]),
                "音量键进入映射引擎（基础音量 / AI 数字 2、3）")
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @MainActor
 struct GeneralPage: View {
@@ -23,6 +24,16 @@ struct GeneralPage: View {
                             }
                         }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
                     }
+                }
+
+                SettingsGroup(title: "应用内遥控") {
+                    ApplicationNavigationSettingsView(
+                        availableApps: navigationApplications,
+                        profiles: Binding(
+                            get: { model.config.appNavigationProfiles },
+                            set: { model.config.appNavigationProfiles = $0; model.saveConfig() }),
+                        status: model.applicationNavigationStatus)
+                        .padding(14)
                 }
 
                 SettingsGroup(title: "Dock 应用选择") {
@@ -199,5 +210,16 @@ struct GeneralPage: View {
                 return "\(KeyDisplay.name(key)) · \(title)：\(ActionSummary.describe(action))"
             }
         }
+    }
+
+    private var navigationApplications: [DockApplications.Entry] {
+        var entries = DockApplications.pinned()
+        var seen = Set(entries.map(\.id))
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isTerminated {
+            guard let id = app.bundleIdentifier, seen.insert(id).inserted,
+                  let entry = DockApplications.resolve(id) else { continue }
+            entries.append(entry)
+        }
+        return entries
     }
 }

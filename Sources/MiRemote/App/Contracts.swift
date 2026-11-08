@@ -235,6 +235,8 @@ struct MappingConfig: Codable {
     /// System menu application shortcuts. nil follows pinned Dock applications;
     /// an empty array hides the section. Device-specific choices stay local.
     var menuFavoriteApps: [String]? = nil
+    /// Opt-in navigation behavior by application. Missing apps retain native keys.
+    var appNavigationProfiles: [String: AppNavigationProfile]? = nil
 }
 
 /// 动作执行器（ActionRunner 实现；MappingEngine 调用）

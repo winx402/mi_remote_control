@@ -204,6 +204,10 @@
       }
     }
   },
+  "appNavigationProfiles": {
+    "com.openai.codex": {"mode": "regions", "layout": "chat"},
+    "com.bytedance.douyin.desktop": {"mode": "regions", "layout": "video"}
+  },
   "voiceProfiles": {
     "global": {
       "keyName": "fn",

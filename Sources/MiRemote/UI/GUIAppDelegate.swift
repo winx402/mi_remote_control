@@ -19,6 +19,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var voiceProbeRunning = false
     private var voiceProbeGeneration: UInt64 = 0
     private let dockNavigation = DockNavigationController()
+    private let applicationNavigation = ApplicationNavigationController()
     private var dockReturnApplication: NSRunningApplication?
 
     init(uiPreview: Bool) {
@@ -33,6 +34,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
             source.setEventHandler { [weak self] in
+                self?.applicationNavigation.stop()
                 self?.dockNavigation.close()
                 self?.services?.stop()
                 NSApp.terminate(nil)
@@ -58,10 +60,12 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // M5 v2 浮层体系：窗口选择器 / 系统功能菜单 / 教程浮层（捕获式）+ 控制模式 HUD。
         let center = OverlayCenter(model: model, services: services)
         overlayCenter = center
+        center.onActiveChanged = { [weak self] in self?.updateNavigationSuspension() }
         center.onOpenSettings = { [weak self] in self?.showWindow() }
         dockNavigation.onActiveChanged = { [weak self, weak center] active in
             center?.noteDockNavigation(active)
             self?.model.dockNavigationStatus = active ? "正在打开 Dock…" : "已退出 Dock 选择"
+            self?.updateNavigationSuspension()
         }
         dockNavigation.onSelectionChanged = { [weak self] name in
             self?.model.dockNavigationStatus = "正在选择：\(name)"
@@ -70,7 +74,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.model.dockNavigationStatus = text
             CodexNavigation.showNotice(text)
         }
-        model.onMouseStatus = { [weak center] text in center?.updateMouseStatus(text: text) }
+        model.onMouseStatus = { [weak self, weak center] text in
+            center?.updateMouseStatus(text: text)
+            self?.updateNavigationSuspension()
+        }
         CodexNavigation.onUnavailable = { [weak self, weak center] name, message in
             if name == "codex_previous_chat" || name == "codex_next_chat" {
                 self?.dockNavigation.close()
@@ -166,6 +173,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        applicationNavigation.stop()
         dockNavigation.close()
         services?.bridge.cancelVoiceContinuityProbe()
         // 退出前清理：恢复 hidutil 中转、断开语音链路（AppServices.stop 幂等）。
@@ -188,6 +196,12 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             dockNavigation.close()
             overlayCenter?.open(name)
         }
+    }
+
+    private func updateNavigationSuspension() {
+        applicationNavigation.setSuspended(
+            overlayCenter?.hasActiveOverlay == true || dockNavigation.isActive
+                || MouseMode.shared.isActive || services?.keyMapper?.engine.isSuspended == true)
     }
 
     @objc private func startVoiceProbe() {
@@ -354,16 +368,42 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, let km = services.keyMapper, let filter = services.hidFilter else { return }
             self.dockNavigation.engine = km.engine
+            km.engine.onApplicationNavigation = { [weak self] key, down in
+                MainActor.assumeIsolated { self?.applicationNavigation.handle(key, isDown: down) }
+            }
+            self.applicationNavigation.onCaptureChanged = { [weak self, weak km] enabled in
+                km?.engine.setApplicationNavigationEnabled(enabled)
+                guard let self else { return }
+                self.overlayCenter?.noteApplicationNavigation(
+                    mode: enabled ? self.applicationNavigation.navigationMode : nil,
+                    editing: self.applicationNavigation.isEditing)
+            }
+            self.applicationNavigation.onStatusChanged = { [weak self] text in
+                self?.model.applicationNavigationStatus = text
+                guard let self else { return }
+                self.overlayCenter?.noteApplicationNavigation(
+                    mode: self.applicationNavigation.isEnabled ? self.applicationNavigation.navigationMode : nil,
+                    editing: self.applicationNavigation.isEditing)
+            }
+            self.applicationNavigation.configure(self.model.config.appNavigationProfiles ?? [:])
+            self.model.onApplicationNavigationConfigChanged = { [weak self] profiles in
+                self?.applicationNavigation.configure(profiles)
+            }
+            FocusInput.onDidFocusInput = { [weak self] in
+                MainActor.assumeIsolated { self?.applicationNavigation.enterEditing() }
+            }
             let previousSuspend = km.engine.onSuspendChanged
             km.engine.onSuspendChanged = { [weak self] suspended in
                 previousSuspend?(suspended)
                 if suspended { DispatchQueue.main.async { self?.dockNavigation.close() } }
+                DispatchQueue.main.async { self?.updateNavigationSuspension() }
             }
             if let hid = services.hidEngine {
                 let previousRemoved = hid.onDeviceRemoved
                 hid.onDeviceRemoved = { [weak self] in
                     previousRemoved?()
                     DispatchQueue.main.async { self?.dockNavigation.close() }
+                    DispatchQueue.main.async { self?.applicationNavigation.invalidateSelection() }
                 }
             }
             km.onLayerChanged = { [weak self] layer in
@@ -377,6 +417,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             km.engine.onEscapeHatch = { [weak self] in
                 MainActor.assumeIsolated {
                     self?.dockNavigation.close()
+                    self?.applicationNavigation.invalidateSelection()
                     if self?.voiceProbeRunning == true { self?.cancelVoiceProbe() }
                     self?.overlayCenter?.escapeHatch()
                 }
@@ -385,11 +426,18 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     switch action {
+                    case .overlay, .openApp, .mouseMode, .system("quit_app"), .system("app_mru_back"),
+                         .system("space_left"), .system("space_right"), .system("show_desktop"):
+                        self.applicationNavigation.invalidateSelection()
+                    default: break
+                    }
+                    switch action {
                     case .overlay(let name): self.openOverlay(name)
                     case .mouseMode:
                         self.dockNavigation.close()
                         self.overlayCenter?.close()
                         MouseMode.shared.toggle()
+                        self.updateNavigationSuspension()
                     case .system("quit_app"):
                         // Capture the foreground application before closing panels.
                         if self.dockNavigation.isActive {

@@ -308,7 +308,8 @@ final class DockNavigationController {
         })
         escMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 53,
-                  event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Self.syntheticEventTag else { return }
+                  event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Self.syntheticEventTag,
+                  event.cgEvent?.getIntegerValueField(.eventSourceUserData) != AppNavigationAccessibility.syntheticEventTag else { return }
             // 真键盘 Escape 已由系统收到；只清理捕获，避免再投递一份。
             MainActor.assumeIsolated {
                 guard let self, self.lease.accepts(ticket) else { return }
@@ -317,7 +318,8 @@ final class DockNavigationController {
         }
         localEscMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 53,
-               event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Self.syntheticEventTag {
+               event.cgEvent?.getIntegerValueField(.eventSourceUserData) != Self.syntheticEventTag,
+               event.cgEvent?.getIntegerValueField(.eventSourceUserData) != AppNavigationAccessibility.syntheticEventTag {
                 MainActor.assumeIsolated {
                     guard let self, self.lease.accepts(ticket) else { return }
                     self.close(restoreFocus: false)

@@ -245,6 +245,8 @@ final class AppModel: ObservableObject {
     /// 最近一次按下的遥控键（「按下即亮」回显），nil=无
     @Published var lastPressedKey: RemoteKey?
     @Published var dockNavigationStatus = "尚未开启 Dock 选择"
+    @Published var applicationNavigationStatus = "当前应用使用原有按键"
+    var onApplicationNavigationConfigChanged: (([String: AppNavigationProfile]) -> Void)?
     /// inline「已保存」微提示（自增触发）
     @Published var savedTick = 0
 
@@ -383,6 +385,7 @@ final class AppModel: ObservableObject {
     func saveConfig() {
         if ConfigStore.save(config, to: configURL) {
             services?.applyConfig(config)
+            onApplicationNavigationConfigChanged?(config.appNavigationProfiles ?? [:])
             savedTick += 1
         }
     }

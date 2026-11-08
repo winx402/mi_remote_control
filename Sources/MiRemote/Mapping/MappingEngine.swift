@@ -110,6 +110,17 @@ final class MappingEngine: @unchecked Sendable {
     /// 经 mainDispatch 投递到主线程交给浮层处理；浮层关闭（置 nil）即恢复。
     private var overlayHandler: ((ButtonEvent) -> Void)?
     private var immediateOverlayDirections = false
+    private var applicationNavigationEnabled = false
+    var onApplicationNavigation: ((RemoteKey, Bool) -> Void)?
+    private lazy var applicationNavigationGestures: ApplicationNavigationGestures = {
+        let gestures = ApplicationNavigationGestures(schedule: scheduleAfter)
+        gestures.onNavigate = { [weak self] key, down in self?.forwardApplicationNavigation(key, down) }
+        gestures.onDouble = { [weak self] key in
+            guard let self, let action = self.config.globalShortcuts?[key.rawValue]?.double else { return }
+            self.runIndependentGlobal(action)
+        }
+        return gestures
+    }()
 
     // MARK: - 全局逃生键（P2：模式迷路兜底）
 
@@ -193,7 +204,7 @@ final class MappingEngine: @unchecked Sendable {
         // 其余方向继续直接改写，保留系统原生 autorepeat 与零延迟。
         let directions: Set<RemoteKey> = [.up, .down, .left, .right]
         let native = Set(directions.filter { key in
-            reservedDirectionAction(key) == nil
+            !applicationNavigationEnabled && reservedDirectionAction(key) == nil
                 && (!independent || overlayDeclared(key)?.overrideBase != true)
         })
         let route = TapRoute(effectiveLayer: effectiveLayer,
@@ -297,9 +308,24 @@ final class MappingEngine: @unchecked Sendable {
         }
     }
 
+    func setApplicationNavigationEnabled(_ enabled: Bool) {
+        dispatch { [weak self] in
+            guard let self, self.applicationNavigationEnabled != enabled else { return }
+            self.applicationNavigationGestures.reset()
+            self.applicationNavigationEnabled = enabled
+            self.publishTapRoute()
+        }
+    }
+
+    private func forwardApplicationNavigation(_ key: RemoteKey, _ down: Bool) {
+        guard let handler = onApplicationNavigation else { return }
+        mainDispatch { handler(key, down) }
+    }
+
     // MARK: - 对外 API 实现（均在执行上下文内）
 
     private func _setConfig(_ config: MappingConfig) {
+        applicationNavigationGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
@@ -327,6 +353,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _setActiveProfile(_ bundleID: String?) {
+        applicationNavigationGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         contextGeneration &+= 1
@@ -342,6 +369,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _resetInputState(_ reason: String, preserveReservedPresses: Bool = true) {
+        applicationNavigationGestures.reset()
         reservedDirectionGestures.reset(preservePressed: preserveReservedPresses)
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
@@ -409,6 +437,11 @@ final class MappingEngine: @unchecked Sendable {
             }
             return
         }
+        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0,
+           isDirection(event.key) || event.key == .ok {
+            applicationNavigationGestures.handle(event, doubleMs: nil)
+            return
+        }
         if event.key == .ok, okPhysicallyDown != event.isDown {
             okPhysicallyDown = event.isDown
             publishTapRoute()
@@ -426,6 +459,13 @@ final class MappingEngine: @unchecked Sendable {
         let key = event.key
         if immediateOverlayDirections, isDirection(key), let overlayHandler {
             mainDispatch { overlayHandler(event) }
+            return
+        }
+        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(),
+           overlayHandler == nil, !MouseMode.shared.isActive,
+           isDirection(key) || key == .ok {
+            let double = (key == .left || key == .right) && config.globalShortcuts?[key.rawValue]?.double != nil
+            applicationNavigationGestures.handle(event, doubleMs: double ? config.settings.doubleMs : nil)
             return
         }
         // 左右双击在 App、浮层和鼠标之前决断；上下继续走原分流与即时方向路由。
@@ -594,6 +634,9 @@ final class MappingEngine: @unchecked Sendable {
                 let consumed = MouseMode.shared.handle(key: key, isDown: true)
                 _ = MouseMode.shared.handle(key: key, isDown: false)
                 if !consumed { runIndependentLocal(independentTapAction(key)) }
+            } else if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), key == .back {
+                forwardApplicationNavigation(key, true)
+                forwardApplicationNavigation(key, false)
             } else {
                 runIndependentLocal(independentTapAction(key))
             }
@@ -609,6 +652,10 @@ final class MappingEngine: @unchecked Sendable {
     private func independentTapAction(_ key: RemoteKey) -> Action? {
         if TransientSystemUI.isMissionControlActive() {
             if let arrow = Self.nativeArrowName[key] { return .keyStroke(key: arrow, mods: []) }
+            if key == .ok {
+                _ = TransientSystemUI.consumeMissionControlExit()
+                return .keyStroke(key: "return", mods: [])
+            }
             if key == .back || key == .home || key == .menu {
                 _ = TransientSystemUI.consumeMissionControlExit()
                 return .keyStroke(key: "escape", mods: [])
@@ -632,6 +679,7 @@ final class MappingEngine: @unchecked Sendable {
 
     private func runIndependentGlobal(_ action: Action) {
         guard action != .none else { return }
+        applicationNavigationGestures.reset()
         switch action {
         case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
              .system("space_left"), .system("space_right"), .system("show_desktop"), .system("quit_app"):
@@ -832,12 +880,21 @@ final class MappingEngine: @unchecked Sendable {
 
     /// 短按分发：层激活时优先 `layers["\(层)"]`，缺失退回 `tap`。
     private func fireTap(_ key: RemoteKey) {
+        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0, key == .back {
+            forwardApplicationNavigation(key, true)
+            forwardApplicationNavigation(key, false)
+            return
+        }
         // 从 MiRemote 打开 Mission Control 后，Home/菜单的首要语义是退出该系统态。
         // 发 Esc 比再次 open Mission Control.app 可靠，并且只消费一次。
-        if effectiveLayer == 0, (key == .menu || key == .home),
+        if effectiveLayer == 0, (key == .menu || key == .home || (applicationNavigationEnabled && key == .back)),
            TransientSystemUI.consumeMissionControlExit() {
             runner.run(.keyStroke(key: "escape", mods: []))
             log("\(key) 退出 Mission Control")
+            return
+        }
+        if effectiveLayer == 0, key == .ok, TransientSystemUI.consumeMissionControlExit() {
+            runner.run(.keyStroke(key: "return", mods: []))
             return
         }
         let b = binding(for: key)
@@ -1013,6 +1070,68 @@ final class MappingEngine: @unchecked Sendable {
 // MARK: - 纯逻辑自测
 
 extension MappingEngine {
+
+    static func applicationNavigationSelfCheck() -> Bool {
+        let clock = ManualClock()
+        let runner = RecordingRunner()
+        var config = MappingConfig()
+        config.globalShortcuts = [
+            "left": KeyBinding(double: .system("space_left")),
+            "right": KeyBinding(double: .system("space_right")),
+            "back": KeyBinding(hold: .system("quit_app"), holdMs: 1200)
+        ]
+        let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+            dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) })
+        var events: [String] = []
+        engine.onApplicationNavigation = { events.append("\($0.rawValue)\($1 ? "+" : "-")") }
+        func key(_ key: RemoteKey, _ down: Bool) {
+            engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
+        }
+        engine.setApplicationNavigationEnabled(true)
+        guard engine.tapRoute.nativeDirections.isEmpty else { return false }
+        key(.right, true)
+        guard events == ["right+"], runner.actions.isEmpty else { return false }
+        key(.right, false); clock.advance(100); key(.right, true); key(.right, false)
+        guard events == ["right+", "right-"], runner.actions == [.system("space_right")] else { return false }
+        runner.actions.removeAll(); events.removeAll()
+        key(.ok, true); key(.ok, false); key(.back, true); key(.back, false)
+        guard events == ["ok+", "ok-", "back+", "back-"], runner.actions.isEmpty else { return false }
+        events.removeAll()
+        var overlay: [ButtonEvent] = []
+        engine.setOverlayCapture({ overlay.append($0) }, immediateDirections: true)
+        key(.left, true); key(.left, false)
+        guard overlay.map(\.isDown) == [true, false], events.isEmpty else { return false }
+        engine.setOverlayCapture(nil)
+        key(.up, true); engine.resetInputState(reason: "navigation test")
+        guard events == ["up+", "up-"] else { return false }
+        events.removeAll()
+        key(.back, true); clock.advance(1200); key(.back, false)
+        guard runner.actions == [.system("quit_app")], events.isEmpty else { return false }
+        runner.actions.removeAll()
+        engine.setApplicationNavigationEnabled(false)
+        guard engine.tapRoute.nativeDirections == [.up, .down] else { return false }
+        key(.right, true); key(.right, false); clock.advance(250)
+        guard events.isEmpty && runner.actions == [.keyStroke(key: "right_arrow", mods: [])] else { return false }
+        config.globalShortcuts = nil
+        engine.setConfig(config)
+        engine.setApplicationNavigationEnabled(true)
+        runner.actions.removeAll()
+        key(.left, true); key(.left, false); key(.ok, true); key(.ok, false)
+        key(.back, true); key(.back, false)
+        guard events == ["left+", "left-", "ok+", "ok-", "back+", "back-"], runner.actions.isEmpty else { return false }
+        defer { TransientSystemUI.clearMissionControlExit() }
+        for independentMode in [false, true] {
+            config.globalShortcuts = independentMode ? [:] : nil
+            engine.setConfig(config)
+            events.removeAll(); runner.actions.removeAll()
+            TransientSystemUI.markMissionControlEntered()
+            key(.up, true); key(.up, false); key(.ok, true); key(.ok, false)
+            guard events.isEmpty,
+                  runner.actions == [.keyStroke(key: "up_arrow", mods: []), .keyStroke(key: "return", mods: [])],
+                  !TransientSystemUI.isMissionControlActive() else { return false }
+        }
+        return true
+    }
 
     /// 保留左右双击的确定性路由检查；所有动作、浮层与鼠标出口均为记录器。
     static func reservedDirectionSelfCheck() -> Bool {

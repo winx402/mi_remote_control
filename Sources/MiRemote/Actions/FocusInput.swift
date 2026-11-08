@@ -12,6 +12,11 @@ import os
 ///   ③ AX 拿到输入框 frame，合成鼠标左键点其中心。
 /// 每级失败静默降级下一级，全程不抛异常。需要「辅助功能」权限。
 enum FocusInput {
+    nonisolated(unsafe) static var onDidFocusInput: (() -> Void)?
+
+    private static func notifyInputFocus() {
+        DispatchQueue.main.async { onDidFocusInput?() }
+    }
 
     // MARK: - 终端类 app 白名单（纯数据，可单测）
 
@@ -71,10 +76,11 @@ enum FocusInput {
         // ② AXFocused
         if AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
            boolAttribute(field, kAXFocusedAttribute as CFString) == true {
+            notifyInputFocus()
             return
         }
         // ③ 中心点合成左键单击
-        if let c = center(of: field) { click(at: c) }
+        if let c = center(of: field), click(at: c) { notifyInputFocus() }
     }
 
     // MARK: - AX 树 BFS（深度/节点数上限防卡死）
@@ -197,13 +203,14 @@ enum FocusInput {
             .joined(separator: " ")
     }
 
-    private static func click(at point: CGPoint) {
+    private static func click(at point: CGPoint) -> Bool {
         let src = CGEventSource(stateID: .combinedSessionState)
         guard let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown,
                                  mouseCursorPosition: point, mouseButton: .left),
               let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp,
-                               mouseCursorPosition: point, mouseButton: .left) else { return }
+                               mouseCursorPosition: point, mouseButton: .left) else { return false }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+        return true
     }
 }

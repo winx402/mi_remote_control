@@ -200,6 +200,8 @@ final class OverlayCenter {
     private let quickLook: MappingQuickLookController
 
     private var active: Kind?
+    var hasActiveOverlay: Bool { active != nil }
+    var onActiveChanged: (() -> Void)?
     private var panel: NSPanel?
     private let uiState = OverlayUIState()
     private var escMonitor: Any?
@@ -232,6 +234,8 @@ final class OverlayCenter {
     private var profileHintToken = 0
     private var mouseStatusText: String?
     private var dockNavigationActive = false
+    private var applicationNavigationMode: AppNavigationMode?
+    private var applicationNavigationEditing = false
     // 列表导航按住加速（gamepad-ux D3）：400ms 起连发，1.5s 后提速
     private var repeatKey: RemoteKey?
     private var repeatTimer: Timer?
@@ -279,6 +283,7 @@ final class OverlayCenter {
         }
         profileHintToken &+= 1
         active = kind
+        onActiveChanged?()
         switch kind {
         case .windowPicker:
             pickerCurrentAppOnly = false
@@ -338,6 +343,7 @@ final class OverlayCenter {
     func close() {
         guard active != nil else { return }
         active = nil
+        onActiveChanged?()
         powerGeneration &+= 1
         powerMenu.close()
         codexSessions.cancel()
@@ -376,7 +382,8 @@ final class OverlayCenter {
         guard escMonitor == nil else { return }
         escMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] ev in
             guard ev.keyCode == 53,
-                  ev.cgEvent?.getIntegerValueField(.eventSourceUserData) != DockNavigationController.syntheticEventTag else { return }
+                  ev.cgEvent?.getIntegerValueField(.eventSourceUserData) != DockNavigationController.syntheticEventTag,
+                  ev.cgEvent?.getIntegerValueField(.eventSourceUserData) != AppNavigationAccessibility.syntheticEventTag else { return }
             MainActor.assumeIsolated { self?.close() }
         }
     }
@@ -729,7 +736,8 @@ final class OverlayCenter {
     /// 闪一条提示条。基础态平时不常驻提示条，故到点自动收起。
     /// 浮层打开或已在功能层时不打扰——那两种状态的提示条另有主人。
     func noteProfileSwitch(_ bundleID: String?) {
-        guard active == nil, !dockNavigationActive, mouseStatusText == nil, model?.activeLayer == 0 else { return }
+        guard active == nil, !dockNavigationActive, applicationNavigationMode == nil,
+              mouseStatusText == nil, model?.activeLayer == 0 else { return }
         profileHintToken &+= 1
         let token = profileHintToken
         guard let model, let bundleID else { hideHintBar(); return }
@@ -830,6 +838,14 @@ final class OverlayCenter {
                 .init(keys: [.up, .down, .left, .right], text: "选择 Dock 应用"),
                 .init(keys: [.ok], text: "打开"),
                 .init(keys: [.back], text: "取消")])
+        } else if let mode = applicationNavigationMode {
+            let direction = applicationNavigationEditing ? "移动光标"
+                : mode == .regions ? "左右切区 · 上下导航" : "选择按钮"
+            showHintBar([
+                .init(keys: [.up, .down, .left, .right], text: direction),
+                .init(keys: [.ok], text: applicationNavigationEditing ? "回车" : "点击选中控件"),
+                .init(keys: [.back], text: applicationNavigationEditing ? "退出输入" : "返回"),
+                .init(keys: [.menu], text: "双击系统菜单 · 长按 Dock")])
         } else if let mouseStatusText {
             showHintBar(HintBarCatalog.hintsForMouse(status: mouseStatusText))
         } else if let model, model.activeLayer != 0 {
@@ -844,6 +860,14 @@ final class OverlayCenter {
         dockNavigationActive = active
         profileHintToken &+= 1
         if self.active == nil { restoreContextHints() }
+    }
+
+    func noteApplicationNavigation(mode: AppNavigationMode?, editing: Bool) {
+        guard applicationNavigationMode != mode || applicationNavigationEditing != editing else { return }
+        applicationNavigationMode = mode
+        applicationNavigationEditing = editing
+        profileHintToken &+= 1
+        if active == nil { restoreContextHints() }
     }
 
     private func showHintBar(_ items: [HintBarCatalog.Hint]) {

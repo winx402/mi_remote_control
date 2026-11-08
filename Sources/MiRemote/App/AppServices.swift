@@ -703,6 +703,8 @@ final class AppServices {
     /// 睡眠/唤醒/设备事件的 observer tokens：stop 时逐个移除（否则旧服务无法释放、
     /// 重新 start 会叠加回调；闭包内一律弱捕获 tap/km 作为第二道防线）。
     private var workspaceObservers: [NSObjectProtocol] = []
+    /// AppKit 显示参数通知来自 default center，必须在同一 center 解除。
+    private var displayParametersObserver: NSObjectProtocol?
 
     /// 启动期语音触发三级合并（纯函数，供自测）：内置默认 ← 配置 global 规则 ← CLI 标志。
     /// cliIME 双层 Optional：nil=CLI 未给；.some(nil)=--ime none（不切输入法）；.some(v)=指定前缀。
@@ -803,9 +805,9 @@ final class AppServices {
                 health?.setSuspended(suspended)
                 tap?.setSuspended(suspended)
             }
-            // 映射生命周期：蓝牙重连后设备服务重建，hidutil 映射可能失效 → 幂等重装；
+            // 映射生命周期：设备/显示服务重建后，短窗口复核实际映射，确认缺失才重装；
             // 设备移除 / 系统睡眠可能丢 keyUp → 复位引擎与 tap 的按压状态。
-            hid.onDeviceMatched = { [weak tap] in tap?.reinstallMapping(reason: "设备重连") }
+            hid.onDeviceMatched = { [weak tap] in tap?.scheduleMappingRecovery(reason: "设备接入") }
             hid.onDeviceRemoved = { [weak km, weak tap] in
                 km?.engine.resetInputState(reason: "设备移除")
                 tap?.resetPressState()
@@ -813,8 +815,13 @@ final class AppServices {
             let wsnc = NSWorkspace.shared.notificationCenter
             workspaceObservers.append(wsnc.addObserver(
                 forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak tap] _ in
-                tap?.reinstallMapping(reason: "系统唤醒")
+                tap?.scheduleMappingRecovery(reason: "系统唤醒")
             })
+            displayParametersObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil, queue: nil) { [weak tap] _ in
+                tap?.scheduleMappingRecovery(reason: "显示参数变化")
+            }
             workspaceObservers.append(wsnc.addObserver(
                 forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [weak km, weak tap] _ in
                 km?.engine.resetInputState(reason: "系统睡眠")
@@ -853,6 +860,10 @@ final class AppServices {
         let wsnc = NSWorkspace.shared.notificationCenter
         workspaceObservers.forEach { wsnc.removeObserver($0) }
         workspaceObservers.removeAll()
+        if let displayParametersObserver {
+            NotificationCenter.default.removeObserver(displayParametersObserver)
+        }
+        displayParametersObserver = nil
         keyMapper?.invalidate()
         ActionRunner.onAppMRUBack = nil
         // shell 动作派生的活动进程组：TERM→KILL 清扫，超时承诺随服务生命周期兑现。

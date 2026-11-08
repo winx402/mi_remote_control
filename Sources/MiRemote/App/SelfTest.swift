@@ -673,6 +673,8 @@ enum SelfTest {
                    && !TapEngine.shouldAutoReinstall(suspended: false, tapEnabled: true, mappingInstalled: true)
                    && !TapEngine.shouldAutoReinstall(suspended: false, tapEnabled: false, mappingInstalled: false),
                    "TapEngine 自动重装判据：暂停/在位/无 tap 一律豁免")
+            expect(MappingRecoveryPlan.selfCheck(), "按键映射短恢复代次、暂停停止隔离与实际查询三态")
+            expect(KeyRemapper.liveMappingPreservationSelfCheck(), "映射修复与卸载保留实时第三方条目且不复活已删除项")
         }
 
         // M6-1. EnvironmentCheck API 健全性：只断言可调用不崩、返回结构完整，

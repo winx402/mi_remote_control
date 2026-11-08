@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import os
+import OSLog
 
 /// M2 按键接管的最终架构（实机验证 2026-07-19）：
 /// macOS 不允许用户态 seize 蓝牙 HID 键盘（0xE00002C1），IOHID 独占不可行。
@@ -90,10 +91,10 @@ enum KeyRemapper {
 
     private static var matching: String { RemoteIdentity.hidutilMatching }
     private static let hidutilLock = NSLock()
-    /// install 前保存的设备原有映射快照（已剔除本进程自己的中转条目）。
-    /// nil = 未持有快照（尚未读取或读取失败，或已在 uninstall 恢复时消费）。
-    /// 状态机：nil →(saveExistingMappingIfNeeded 成功)→ 持有 →(uninstall 恢复成功)→ nil。
-    /// 快照缺失时禁止 install（避免覆盖丢失第三方映射）；uninstall 按现状只剔除本程序条目。
+    private static let recoveryLog = Logger(subsystem: "com.miremote.controller", category: "KeyMappingRecovery")
+    /// 最近一次成功读取的第三方映射（已剔除本程序来源条目）。每次 install/uninstall
+    /// 都优先读取 live；快照仅供 uninstall 在查询失败时沿用既有安全清理策略。
+    /// 该回退无法保全最近一次读取之后尚未观测的外部修改，调用时必须明确日志。
     nonisolated(unsafe) private static var savedForeign: [(src: UInt64, dst: UInt64)]?
 
     /// 运行 hidutil，返回 (退出码==0, stdout)。启动失败/非零退出记日志。
@@ -151,20 +152,15 @@ enum KeyRemapper {
         return UInt64(digits)
     }
 
-    /// 首次 install 前读取并保存设备现有映射。剔除本进程自己的中转条目
-    /// （重复 install / 上次异常退出的残留不能被当成"原值"保存）。
-    /// 返回 false = 读取/解析失败，快照未建立——调用方（install）必须放弃安装。
-    private static func saveExistingMappingIfNeeded() -> Bool {
-        guard savedForeign == nil else { return true }
+    /// 每次 install 都重新读取 live，避免重连修复覆盖运行中新加/删除的第三方映射。
+    /// 即使持有快照，查询/解析失败也不允许安装。
+    private static func refreshForeignMappingSnapshot() -> Bool {
         let r = runHidutil(["property", "--matching", matching, "--get", "UserKeyMapping"], capture: true)
         guard r.ok, let pairs = parseUserKeyMapping(r.output) else {
             log?("读取设备现有 UserKeyMapping 失败或无法解析，禁止安装（避免覆盖第三方映射）")
             return false
         }
-        let ours = Set(mappingTable.map { 0x700000000 + UInt64($0.src) })
-        let foreign = pairs.filter { !ours.contains($0.src) }
-        savedForeign = foreign
-        if !foreign.isEmpty { log?("已保存设备原有 UserKeyMapping \(foreign.count) 条，退出时恢复") }
+        savedForeign = mappingPreservingLiveForeign(pairs, installing: false)
         return true
     }
 
@@ -172,19 +168,17 @@ enum KeyRemapper {
         #"{"HIDKeyboardModifierMappingSrc":\#(src),"HIDKeyboardModifierMappingDst":\#(dst)}"#
     }
 
-    /// 安装重映射（幂等）。保留设备原有的第三方映射条目共存。
-    /// 快照未能建立（现有映射读不到）时拒绝安装——绝不在未知现状上整表覆盖。
+    /// 安装重映射（幂等），与当前 live 第三方条目共存。
+    /// 现有映射读不到时拒绝安装——绝不使用旧快照覆盖未知现状。
     @discardableResult
     static func install() -> Bool {
         hidutilLock.lock(); defer { hidutilLock.unlock() }
-        guard saveExistingMappingIfNeeded(), let foreign = savedForeign else {
+        guard refreshForeignMappingSnapshot(), let foreign = savedForeign else {
             log?("hidutil 映射安装跳过：无法确认设备现有映射（健康检查会重试）")
             return false
         }
-        var entries = mappingTable.map {
-            entryJSON(src: 0x700000000 + UInt64($0.src), dst: 0x700000000 + UInt64($0.dst))
-        }
-        entries += foreign.map { entryJSON(src: $0.src, dst: $0.dst) }
+        let entries = mappingPreservingLiveForeign(foreign, installing: true)
+            .map { entryJSON(src: $0.src, dst: $0.dst) }
         let ok = runHidutil(["property", "--matching", matching,
                              "--set", #"{"UserKeyMapping":[\#(entries.joined(separator: ","))]}"#]).ok
         if !ok { log?("hidutil 映射安装失败") }
@@ -221,6 +215,36 @@ enum KeyRemapper {
         mappingTable.map { (0x700000000 + UInt64($0.src), 0x700000000 + UInt64($0.dst)) }
     }
 
+    /// 只认本次读取到的 live：安装时替换本程序来源，卸载时仅剔除这些来源。
+    /// 不与旧快照做并集，避免已被外部删除的映射重新出现。
+    static func mappingPreservingLiveForeign(_ live: [(src: UInt64, dst: UInt64)],
+                                             installing: Bool) -> [(src: UInt64, dst: UInt64)] {
+        let ours = Set(expectedMappingPairs.map { $0.src })
+        let foreign = live.filter { !ours.contains($0.src) }
+        return installing ? expectedMappingPairs + foreign : foreign
+    }
+
+    static func liveMappingPreservationSelfCheck() -> Bool {
+        let a: (src: UInt64, dst: UInt64) = (0x700000004, 0x700000005)
+        let b: (src: UInt64, dst: UInt64) = (0x700000006, 0x700000007)
+        let same: ([(src: UInt64, dst: UInt64)], [(src: UInt64, dst: UInt64)]) -> Bool = { lhs, rhs in
+            lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { pair in
+                pair.0.src == pair.1.src && pair.0.dst == pair.1.dst
+            }
+        }
+        // 先只有 A；运行中 B 新增，同时本程序映射已被服务重建清掉。
+        let first = mappingPreservingLiveForeign([a], installing: true)
+        let repaired = mappingPreservingLiveForeign([a, b], installing: true)
+        guard mappingSatisfied(first), mappingSatisfied(repaired),
+              same(mappingPreservingLiveForeign(first, installing: false), [a]),
+              same(mappingPreservingLiveForeign(repaired, installing: false), [a, b]) else { return false }
+        // A 后来被外部删除；无论重装还是卸载，都不能用旧 A 快照把它复活。
+        let afterDeletion = mappingPreservingLiveForeign(expectedMappingPairs + [b], installing: true)
+        return mappingSatisfied(afterDeletion)
+            && same(mappingPreservingLiveForeign(afterDeletion, installing: false), [b])
+            && same(mappingPreservingLiveForeign([b], installing: false), [b])
+    }
+
     /// 在位判据（纯函数，供 self-test）：本程序每条 (src,dst) 必须唯一在位且目标正确。
     /// 同源重复条目或被第三方改到错误目标 → 不算在位（健康检查触发重装修复）。
     static func mappingSatisfied(_ pairs: [(src: UInt64, dst: UInt64)]) -> Bool {
@@ -242,31 +266,122 @@ enum KeyRemapper {
         return mappingSatisfied(pairs)
     }
 
-    /// 恢复设备原有映射。持有快照 → 写回快照，成功后清除（防服务重启恢复过期状态）；
-    /// 无快照（读取曾失败/从未安装）→ 按设备现状只剔除本程序条目，绝不写空表。
+    /// 优先读取 live，只剔除本程序条目，并刷新第三方快照。
+    /// 查询失败时保留既有安全策略：有最近快照则尝试卸载，无快照则不写未知现状。
     @discardableResult
     static func uninstall() -> Bool {
         hidutilLock.lock(); defer { hidutilLock.unlock() }
-        if let foreign = savedForeign {
-            let entries = foreign.map { entryJSON(src: $0.src, dst: $0.dst) }
-            let ok = runHidutil(["property", "--matching", matching,
-                                 "--set", #"{"UserKeyMapping":[\#(entries.joined(separator: ","))]}"#]).ok
-            if ok { savedForeign = nil } else { log?("hidutil 映射恢复失败") }
-            return ok
-        }
-        // 无快照：等价残留清理——读现状、剔除本程序条目、保留第三方条目。
         let r = runHidutil(["property", "--matching", matching, "--get", "UserKeyMapping"], capture: true)
-        guard r.ok, let pairs = parseUserKeyMapping(r.output) else {
-            log?("hidutil 映射恢复跳过：无快照且无法读取设备现状（不写空表）")
+        let foreign: [(src: UInt64, dst: UInt64)]
+        if r.ok, let live = parseUserKeyMapping(r.output) {
+            foreign = mappingPreservingLiveForeign(live, installing: false)
+            savedForeign = foreign
+            if foreign.count == live.count {
+                savedForeign = nil
+                return true // live 已无本程序条目，无需回写健康的第三方映射。
+            }
+        } else if let savedForeign {
+            foreign = savedForeign
+            log?("hidutil 映射卸载：live 查询失败，回退最近第三方快照安全清理；无法保证保全上次读取后的未观测修改")
+            recoveryLog.warning("Mapping uninstall live query unconfirmed; using last foreign snapshot; unobserved foreign changes may not be preserved")
+        } else {
+            log?("hidutil 映射卸载跳过：无快照且无法读取 live（不写未知现状）")
+            recoveryLog.warning("Mapping uninstall live query unconfirmed; no foreign snapshot, no mapping write")
             return false
         }
-        let ours = Set(mappingTable.map { 0x700000000 + UInt64($0.src) })
-        let entries = pairs.filter { !ours.contains($0.src) }
-            .map { entryJSON(src: $0.src, dst: $0.dst) }
+        let entries = foreign.map { entryJSON(src: $0.src, dst: $0.dst) }
         let ok = runHidutil(["property", "--matching", matching,
                              "--set", #"{"UserKeyMapping":[\#(entries.joined(separator: ","))]}"#]).ok
-        if !ok { log?("hidutil 映射恢复失败") }
+        if ok { savedForeign = nil } else { log?("hidutil 映射卸载失败，未确认中转条目已清理") }
         return ok
+    }
+}
+
+/// 有界恢复的纯计划：生命周期与单次恢复各有代次，旧回调即使已入队也不能越代生效。
+/// 仅在 TapEngine.healthQueue 上变更；selfCheck 不创建 tap、不调用 hidutil。
+struct MappingRecoveryPlan {
+    struct Token: Equatable {
+        let lifecycle: UInt64
+        let burst: UInt64
+    }
+
+    enum MappingAction: Equatable {
+        case keep, reinstall, queryUnconfirmed, safetyUninstall
+    }
+
+    static let delays: [TimeInterval] = [0.25, 1, 3, 6]
+    private(set) var running = false
+    private(set) var suspended = false
+    private(set) var lifecycle: UInt64 = 0
+    private var burst: UInt64 = 0
+
+    var active: Bool { running && !suspended }
+
+    @discardableResult
+    mutating func start() -> Bool {
+        guard !running else { return false }
+        lifecycle &+= 1
+        burst &+= 1
+        running = true
+        suspended = false
+        return true
+    }
+
+    mutating func stop() {
+        running = false
+        suspended = false
+        lifecycle &+= 1
+        burst &+= 1
+    }
+
+    @discardableResult
+    mutating func setSuspended(_ value: Bool) -> Bool {
+        guard running, suspended != value else { return false }
+        suspended = value
+        burst &+= 1
+        return true
+    }
+
+    mutating func beginBurst() -> Token? {
+        guard active else { return nil }
+        burst &+= 1
+        return Token(lifecycle: lifecycle, burst: burst)
+    }
+
+    func accepts(_ token: Token) -> Bool {
+        active && token.lifecycle == lifecycle && token.burst == burst
+    }
+
+    static func action(mappingPresent: Bool?, tapReady: Bool = true) -> MappingAction {
+        guard tapReady else { return .safetyUninstall }
+        return switch mappingPresent {
+        case true: .keep
+        case false: .reinstall
+        case nil: .queryUnconfirmed
+        }
+    }
+
+    static func selfCheck() -> Bool {
+        var plan = MappingRecoveryPlan()
+        guard plan.beginBurst() == nil, plan.start(), !plan.start(),
+              let first = plan.beginBurst(), plan.accepts(first),
+              let newer = plan.beginBurst(), !plan.accepts(first), plan.accepts(newer),
+              plan.setSuspended(true), !plan.accepts(newer), plan.beginBurst() == nil,
+              plan.setSuspended(false), !plan.accepts(newer),
+              let resumed = plan.beginBurst(), plan.accepts(resumed) else { return false }
+        plan.stop()
+        guard !plan.accepts(resumed), plan.beginBurst() == nil,
+              !plan.setSuspended(false), plan.start(),
+              let restarted = plan.beginBurst(), restarted.lifecycle != resumed.lifecycle,
+              !plan.accepts(resumed), plan.accepts(restarted),
+              action(mappingPresent: true) == .keep,
+              action(mappingPresent: false) == .reinstall,
+              action(mappingPresent: nil) == .queryUnconfirmed,
+              action(mappingPresent: true, tapReady: false) == .safetyUninstall,
+              action(mappingPresent: false, tapReady: false) == .safetyUninstall,
+              action(mappingPresent: nil, tapReady: false) == .safetyUninstall else { return false }
+        // 计划固定为四次，最后一次排在六秒处；无递归或无限重试。
+        return delays == [0.25, 1, 3, 6]
     }
 }
 
@@ -306,6 +421,8 @@ final class TapEngine: @unchecked Sendable {
     /// 低频健康检查：tap 可能被系统静默禁用（辅助功能撤权等），每 30s 校验一次。
     private var healthTimer: DispatchSourceTimer?
     private let healthQueue = DispatchQueue(label: "com.miremote.taphealth")
+    private var recoveryPlan = MappingRecoveryPlan()
+    private static let recoveryLog = Logger(subsystem: "com.miremote.controller", category: "KeyMappingRecovery")
 
     init(delegate: HIDEngineDelegate?) {
         self.delegate = delegate
@@ -334,35 +451,38 @@ final class TapEngine: @unchecked Sendable {
     }
 
     func start() {
-        guard let (tap, rls) = makeTap() else {
-            delegate?.hidLog("TAP 创建失败（需辅助功能权限），清理可能残留的 hidutil 映射")
-            // 上次异常退出可能残留映射；tap 起不来绝不留映射。
-            // uninstall 此时无快照——按现状只剔除本程序条目，不动第三方映射。
-            healthQueue.sync {
+        let outcome: (tapCreated: Bool, installed: Bool)? = healthQueue.sync {
+            guard recoveryPlan.start() else { return nil }
+            guard let (tap, rls) = makeTap() else {
+                // 上次异常退出可能残留映射；tap 起不来绝不留映射。
+                // uninstall 此时无快照——按现状只剔除本程序条目，不动第三方映射。
                 _ = KeyRemapper.uninstall()
                 // tap 创建失败不代表引擎不该运行——起健康定时器，30s 后自动重试
                 // 重建 tap（否则「所有按键失灵」只能靠用户手动重启 App 才能恢复）。
                 startHealthTimerOnce()
+                return (false, false)
             }
-            delegate?.hidSeizeState(false)
-            return
-        }
-        let installed: Bool = healthQueue.sync {
             self.tap = tap
             self.runLoopSource = rls
             let ok = KeyRemapper.install()
             stateLock.withLock { $0.mappingInstalled = ok }
             startHealthTimerOnce()
-            return ok
+            return (true, ok)
         }
-        onMappingState?(installed)
-        delegate?.hidSeizeState(true)
-        delegate?.hidLog(installed ? "TAP 就绪，hidutil 中转映射已安装"
-                                   : "TAP 就绪，但 hidutil 映射安装失败（中转键位不生效）")
+        guard let outcome else { return }
+        onMappingState?(outcome.installed)
+        delegate?.hidSeizeState(outcome.tapCreated)
+        if !outcome.tapCreated {
+            delegate?.hidLog("TAP 创建失败（需辅助功能权限），已尝试清理可能残留的 hidutil 映射")
+        } else {
+            delegate?.hidLog(outcome.installed ? "TAP 就绪，hidutil 中转映射已安装"
+                                              : "TAP 就绪，但 hidutil 映射安装失败（中转键位不生效）")
+        }
     }
 
     func stop() {
         healthQueue.sync {
+            recoveryPlan.stop()
             healthTimer?.cancel()
             healthTimer = nil
             if let tap {
@@ -392,7 +512,7 @@ final class TapEngine: @unchecked Sendable {
     /// 恢复=tap 在运行则幂等重装。串行在 healthQueue 上执行，与健康检查天然互斥。
     func setSuspended(_ suspended: Bool) {
         healthQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.recoveryPlan.setSuspended(suspended) else { return }
             let changed = self.stateLock.withLock { st -> Bool in
                 guard st.suspended != suspended else { return false }
                 st.suspended = suspended
@@ -422,29 +542,101 @@ final class TapEngine: @unchecked Sendable {
     /// 体检页的「重建通道」按钮会变成按了没反应。
     func reinstallMapping(reason: String) {
         healthQueue.async { [weak self] in
-            guard let self else { return }
-            if self.stateLock.withLock({ $0.suspended }) {
+            guard let self, self.recoveryPlan.running else { return }
+            if self.recoveryPlan.suspended {
                 self.delegate?.hidLog("遥控已暂停，跳过映射重装（\(reason)）")
                 return
             }
-            if self.tap == nil {
-                guard let (tap, rls) = self.makeTap() else {
-                    self.delegate?.hidLog("映射重装失败：TAP 重建失败（\(reason)），请检查辅助功能权限或重新打开 App")
-                    return
-                }
-                self.tap = tap
-                self.runLoopSource = rls
-                self.resetPressState()
-                self.router?.resetInputState(reason: "重装映射时重建 TAP")
-                self.delegate?.hidSeizeState(true)
-                self.delegate?.hidLog("TAP 已重建（\(reason)）")
+            guard self.ensureTapReady(reason: reason) else {
+                self.uninstallMappingAfterTapFailure(reason: reason)
+                return
             }
-            let ok = KeyRemapper.install()
-            self.stateLock.withLock { $0.mappingInstalled = ok }
-            self.onMappingState?(ok)
-            self.delegate?.hidLog(ok ? "hidutil 映射已重装（\(reason)）"
-                                     : "hidutil 映射重装失败（\(reason)）")
+            _ = self.installMapping(reason: reason)
         }
+    }
+
+    /// 设备/显示服务重建后的短恢复窗口。只查四次实际映射；确认缺失才写，未知则保留。
+    /// 新事件覆盖旧窗口，暂停/stop 作废代次；回调不另开轮询，也不合成测试按键。
+    func scheduleMappingRecovery(reason: String) {
+        healthQueue.async { [weak self] in
+            guard let self, let token = self.recoveryPlan.beginBurst() else { return }
+            Self.recoveryLog.info("Mapping recovery started: \(reason, privacy: .public)")
+            for delay in MappingRecoveryPlan.delays {
+                self.healthQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.recoveryPlan.accepts(token) else { return }
+                    let tapReady = self.ensureTapReady(reason: reason)
+                    let present = tapReady ? KeyRemapper.mappingPresent() : nil
+                    switch MappingRecoveryPlan.action(mappingPresent: present, tapReady: tapReady) {
+                    case .safetyUninstall:
+                        self.uninstallMappingAfterTapFailure(reason: reason)
+                    case .keep:
+                        self.stateLock.withLock { $0.mappingInstalled = true }
+                        self.onMappingState?(true)
+                        Self.recoveryLog.debug("Mapping recovery verified present: \(reason, privacy: .public)")
+                    case .queryUnconfirmed:
+                        Self.recoveryLog.warning("Mapping recovery query unconfirmed; no mapping write: \(reason, privacy: .public)")
+                    case .reinstall:
+                        self.stateLock.withLock { $0.mappingInstalled = false }
+                        self.onMappingState?(false)
+                        let ok = self.installMapping(reason: reason)
+                        Self.recoveryLog.info("Mapping recovery missing; reinstall success=\(ok, privacy: .public): \(reason, privacy: .public)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// 必须在 healthQueue 上执行。短恢复不依赖缓存的 mappingInstalled，不发模拟 keyDown；
+    /// TAP 恢复时沿用已记录 nativeHeld 的配对 keyUp 清理，避免留下系统按住态。
+    private func ensureTapReady(reason: String) -> Bool {
+        guard recoveryPlan.active else { return false }
+        let recovered: Bool
+        if let tap {
+            if CGEvent.tapIsEnabled(tap: tap) { return true }
+            CGEvent.tapEnable(tap: tap, enable: true)
+            recovered = CGEvent.tapIsEnabled(tap: tap)
+        } else if let (tap, rls) = makeTap() {
+            self.tap = tap
+            self.runLoopSource = rls
+            recovered = true
+        } else {
+            recovered = false
+        }
+        guard recovered else {
+            delegate?.hidSeizeState(false)
+            Self.recoveryLog.warning("TAP recovery unavailable: \(reason, privacy: .public)")
+            return false
+        }
+        resetPressState()
+        router?.resetInputState(reason: "恢复 TAP")
+        delegate?.hidSeizeState(true)
+        Self.recoveryLog.info("TAP recovered: \(reason, privacy: .public)")
+        return true
+    }
+
+    /// healthQueue 调用方已确认生命周期和 TAP 可用。
+    @discardableResult
+    private func installMapping(reason: String) -> Bool {
+        let ok = KeyRemapper.install()
+        stateLock.withLock { $0.mappingInstalled = ok }
+        onMappingState?(ok)
+        delegate?.hidLog(ok ? "hidutil 映射已重装（\(reason)）" : "hidutil 映射重装失败（\(reason)）")
+        return ok
+    }
+
+    /// TAP 仍不可用时，优先消除中转键泄漏。这是失效安全清理，不是对健康映射重装。
+    /// uninstall 内部优先读取 live；无法确认清理成功时，不把缓存/健康状态谎报为已清理。
+    private func uninstallMappingAfterTapFailure(reason: String) {
+        let cleaned = KeyRemapper.uninstall()
+        if cleaned {
+            stateLock.withLock { $0.mappingInstalled = false }
+            onMappingState?(false)
+            Self.recoveryLog.warning("TAP unavailable; intermediary mapping cleanup succeeded: \(reason, privacy: .public)")
+        } else {
+            Self.recoveryLog.error("TAP unavailable; mapping cleanup failed or unconfirmed: \(reason, privacy: .public)")
+        }
+        resetPressState()
+        router?.resetInputState(reason: "TAP 恢复失败")
     }
 
     /// 清空按压锁存（OK 物理态 / 原生按住方向）。设备移除、系统睡眠、tap 失效恢复时调用。
@@ -478,15 +670,21 @@ final class TapEngine: @unchecked Sendable {
     /// 幂等：已有定时器时不重复创建（tap 创建失败分支与成功分支都会调用它，
     /// 必须在 healthQueue 上执行才安全）。
     private func startHealthTimerOnce() {
-        guard healthTimer == nil else { return }
+        guard recoveryPlan.running, healthTimer == nil else { return }
+        let lifecycle = recoveryPlan.lifecycle
         let t = DispatchSource.makeTimerSource(queue: healthQueue)
         t.schedule(deadline: .now() + 30, repeating: 30)
-        t.setEventHandler { [weak self] in self?.healthCheck() }
+        t.setEventHandler { [weak self] in
+            guard let self, self.recoveryPlan.running,
+                  self.recoveryPlan.lifecycle == lifecycle else { return }
+            self.healthCheck()
+        }
         t.resume()
         healthTimer = t
     }
 
     private func healthCheck() {
+        guard recoveryPlan.active else { return }
         let suspended = stateLock.withLock { $0.suspended }
         if suspended { return }
         guard let tap else {
@@ -542,7 +740,7 @@ final class TapEngine: @unchecked Sendable {
     /// （禁用期间可能丢 keyUp）；失败立即卸载映射。在 healthQueue 上执行
     ///（与 stop/暂停/重装串行互斥；tap 回调线程只投递不直接操作生命周期）。
     private func recoverDisabledTap(_ reason: String) {
-        guard let tap else { return }
+        guard recoveryPlan.active, let tap else { return }
         CGEvent.tapEnable(tap: tap, enable: true)
         if CGEvent.tapIsEnabled(tap: tap) {
             delegate?.hidLog("TAP 被禁用（\(reason)），已重新启用")

@@ -71,6 +71,12 @@ python3 scripts/test-television-client.py --binary /Applications/MiRemote.app/Co
 
 ### 其他按键
 
+按键恢复保留原有周期健康检查，并在遥控器接入、系统唤醒和 GUI 显示参数变化后执行短时、有界复查。确认映射仍在位则不重写，查询未确认则不盲装，确认缺失才修复；暂停、停止及新的恢复批次会作废旧回调。恢复只释放已记录的原生按下状态，不生成新的按下动作。`com.miremote.controller / KeyMappingRecovery` 日志用于区分恢复时间；这项改进不等于已证实或消除电视自身控制服务的启动延迟。
+
+HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.apple.com/en-us/108928)未将 M2 Mac mini 的内置 HDMI 列入 CEC 支持名单；指定的 Apple USB-C Digital AV Multiport Adapter 和 Belkin 转接器可在 Apple silicon / macOS 14.4+ 提供系统自动 CEC，但这不等于应用获得任意 CEC 发包接口。恢复视频信号、请求 Mac 显示器醒来与发送 CEC 命令是不同能力，不能混作已验证的电视开机。
+
+遥控器自动换主机尚未实现，也未确认 2 Pro 的多主机保留配对与主机选择协议。Mac 端释放某条 CoreBluetooth 连接不能保证系统 HID 物理链路释放，更不能命令电视交还连接；详见 [Apple cancelPeripheralConnection](https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/cancelperipheralconnection(_:))。检测到 HDMI 变化只解决触发条件，不解决蓝牙交接本身。现阶段不自动解绑、重配或抢占遥控器。
+
 返回长按使用独立全局 `quit_app` 动作，请求当前前台应用正常退出，保留应用自己的保存／取消流程。一次按住只请求一次，松手不补发返回；单击仍执行当前应用原有返回操作。退出前会释放鼠标拖拽并收起临时面板。鼠标模式仍可用返回单击或闲置 20 秒退出。
 
 长按菜单进入真实 macOS Dock 的应用选择模式；四个方向都沿 App 图标顺序选择，OK 打开／激活，返回取消，闲置后自动退出。适配 Dock 的左侧、底部、右侧位置与自动隐藏。Dock 模式中左右按键只选 App；退出模式后恢复全局左右长按。选择只通过系统键盘和公开 Accessibility 接口，不改 Dock 的固定项与布局。

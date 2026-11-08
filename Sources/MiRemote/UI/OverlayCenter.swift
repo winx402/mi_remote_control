@@ -330,9 +330,9 @@ final class OverlayCenter {
         installEscMonitor()
         showHintBar(HintBarCatalog.hints(for: kind))
         // 捕获遥控键：浮层期间事件不走动作分发（引擎 mainDispatch 保证主线程回调）。
-        engine?.setOverlayCapture { [weak self] event in
+        engine?.setOverlayCapture({ [weak self] event in
             MainActor.assumeIsolated { self?.handleKey(event) }
-        }
+        }, immediateDirections: kind == .systemMenu)
     }
 
     func close() {

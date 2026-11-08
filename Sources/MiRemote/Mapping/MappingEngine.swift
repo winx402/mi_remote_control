@@ -1119,10 +1119,10 @@ extension MappingEngine {
         engine.setOverlayCapture({ captured.append($0) }, immediateDirections: true)
         twice(.left)
         expect(captured.map(\.isDown) == [true, false, true, false] && takeActions().isEmpty,
-               "Dock选择模式四向即时选择，快速连按不触发全局左右双击")
+               "菜单/Dock选择模式四向即时选择，快速连按不触发全局左右双击")
         engine.setOverlayCapture(nil)
         twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "退出Dock选择模式恢复全局左右双击")
+        expect(takeActions() == [doubleRight], "退出菜单/Dock选择模式恢复全局左右双击")
 
         // 假鼠标出口验证持续按住和释放，绝不激活 MouseMode.shared 或发送 CG 输入。
         mouseActive = true

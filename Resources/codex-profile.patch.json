@@ -59,16 +59,18 @@
       }
     },
     "left": {
-      "double": {
+      "hold": {
         "type": "system",
         "value": "space_left"
-      }
+      },
+      "holdMs": 650
     },
     "right": {
-      "double": {
+      "hold": {
         "type": "system",
         "value": "space_right"
-      }
+      },
+      "holdMs": 650
     }
   },
   "profiles": {
@@ -205,8 +207,8 @@
     }
   },
   "appNavigationProfiles": {
-    "com.openai.codex": {"mode": "regions", "layout": "chat"},
-    "com.bytedance.douyin.desktop": {"mode": "regions", "layout": "video"}
+    "com.openai.codex": {"mode": "buttons", "layout": "chat"},
+    "com.bytedance.douyin.desktop": {"mode": "buttons", "layout": "video"}
   },
   "voiceProfiles": {
     "global": {

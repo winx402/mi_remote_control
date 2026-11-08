@@ -116,10 +116,12 @@ struct ApplicationNavigationSettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("按钮导航：方向单按选中并高亮按钮，OK 激活。")
+                Text("按钮导航：上下左右按当前按钮位置移动选中框，OK 激活。")
                 Text("分区导航：左右切换区域，上下选择区域内菜单或滚动。")
                 Text("区域来自当前控件层级；聊天／视频只补充操作行为，不预设区域位置。")
+                Text("按钮位置随当前窗口重新识别，不保存固定坐标；未识别到按钮时会提示。")
                 Text("输入框：OK 进入输入，返回回到导航。全局长按和双击仍保留。")
+                Text("左右长按切换桌面空间；左右快速单击只选择按钮。")
             }
             .font(.caption)
             .foregroundStyle(.secondary)

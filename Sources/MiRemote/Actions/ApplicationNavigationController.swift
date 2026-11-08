@@ -1,6 +1,65 @@
 import AppKit
 import CoreGraphics
 
+/// Resolves an asynchronous, read-only preview against the physical press.
+/// A delayed native action can commit once, only after a short release.
+struct AppNavigationPressDecision {
+    struct Ticket: Equatable { let serial: UInt64; let key: RemoteKey }
+    private enum Resolution { case pending, virtual, native }
+    private var serial: UInt64 = 0
+    private var current: Ticket?
+    private var released = false
+    private var resolution = Resolution.pending
+
+    mutating func begin(_ key: RemoteKey) -> Ticket {
+        serial &+= 1
+        let ticket = Ticket(serial: serial, key: key)
+        current = ticket; released = false; resolution = .pending
+        return ticket
+    }
+
+    func matches(_ ticket: Ticket) -> Bool { current == ticket }
+
+    mutating func resolve(_ ticket: Ticket, needsNative: Bool) -> Bool {
+        guard matches(ticket) else { return false }
+        resolution = needsNative ? .native : .virtual
+        guard released else { return false }
+        current = nil
+        return needsNative
+    }
+
+    mutating func commit(_ key: RemoteKey) -> Bool {
+        guard current?.key == key else { return false }
+        released = true
+        switch resolution {
+        case .pending: return false
+        case .virtual: current = nil; return false
+        case .native: current = nil; return true
+        }
+    }
+
+    mutating func cancel() { serial &+= 1; current = nil }
+
+    static func selfCheck() -> Bool {
+        var state = Self()
+        let first = state.begin(.left)
+        guard !state.resolve(first, needsNative: true), state.commit(.left),
+              !state.commit(.left), !state.resolve(first, needsNative: true) else { return false }
+        let earlyRelease = state.begin(.right)
+        guard !state.commit(.right), state.resolve(earlyRelease, needsNative: true),
+              !state.resolve(earlyRelease, needsNative: true) else { return false }
+        let held = state.begin(.left)
+        state.cancel()
+        guard !state.resolve(held, needsNative: true), !state.commit(.left) else { return false }
+        let virtual = state.begin(.right)
+        guard !state.resolve(virtual, needsNative: false), !state.commit(.right) else { return false }
+        let obsolete = state.begin(.left)
+        let latest = state.begin(.right)
+        return !state.resolve(obsolete, needsNative: true) && state.matches(latest)
+            && !state.commit(.left)
+    }
+}
+
 /// Pure selection state, deliberately separate from workspace/AX/event APIs for self-test.
 struct AppNavigationSelectionState {
     var selectedID: Int?
@@ -64,6 +123,8 @@ final class ApplicationNavigationController {
     private var snapshot: AppNavigationAccessibility.Snapshot?
     private var snapshotAt: TimeInterval = 0
     private var navigationPending = false
+    private var reservedDecision = AppNavigationPressDecision()
+    private var reservedNative: (RemoteKey, AppNavigationAccessibility.NativeReason, UInt64?)?
     private var suspended = false
     private var stopped = false
     private var lastActivity: TimeInterval = 0
@@ -168,6 +229,66 @@ final class ApplicationNavigationController {
         }
     }
 
+    /// Left/right are shared with the global hold shortcut. Key-down may only
+    /// preview a virtual target; editing/menu/native effects wait for release.
+    func handleReservedDirection(_ key: RemoteKey, phase: ApplicationNavigationReservedPhase) {
+        guard key == .left || key == .right else { return }
+        switch phase {
+        case .cancelled:
+            invalidateSelection()
+        case .committed:
+            if reservedDecision.commit(key) { performReservedNative() }
+        case .began:
+            refresh()
+            guard isEnabled else { return }
+            stopRepeat()
+            lastActivity = ProcessInfo.processInfo.systemUptime
+            let ticket = reservedDecision.begin(key)
+            reservedNative = nil
+            if selection.editing {
+                reservedNative = (key, .editing, selection.windowID)
+                _ = reservedDecision.resolve(ticket, needsNative: true)
+                return
+            }
+            navigationPending = true
+            let accepted = submit(.scan, retryWhenBusy: true) { [weak self] reply in
+                guard let self, let context = self.context, reservedDecision.matches(ticket) else { return }
+                navigationPending = false
+                switch reply {
+                case .snapshot(let snapshot):
+                    self.snapshot = snapshot
+                    snapshotAt = ProcessInfo.processInfo.systemUptime
+                    selection.receive(snapshot)
+                    navigate(key, snapshot: snapshot, profile: context.profile, allowNativeFallback: false)
+                    _ = reservedDecision.resolve(ticket, needsNative: false)
+                case .menu:
+                    clearForNativeMenu()
+                    reservedNative = (key, .menu, nil)
+                    if reservedDecision.resolve(ticket, needsNative: true) { performReservedNative() }
+                case .unavailable(let message):
+                    invalidateSelection()
+                    setStatus(message)
+                case .cancelled, .staleSelection:
+                    clearStaleSelection()
+                case .performed, .editing, .menuPerformed:
+                    clearStaleSelection()
+                }
+            }
+            if !accepted {
+                clearStaleSelection()
+            }
+        }
+    }
+
+    private func performReservedNative() {
+        guard let (key, reason, windowID) = reservedNative else { return }
+        reservedNative = nil
+        if case .menu = reason { routeMenu(key); return }
+        submit(.native(key, reason, windowID: windowID), retryWhenBusy: true) { [weak self] reply in
+            self?.handleEffectReply(reply, editing: true, originalKey: key)
+        }
+    }
+
     /// Called only after the app's real FocusInput action succeeds, or successful AXFocused here.
     /// Native editing requests independently revalidate the actual focused, nonsecure text input.
     func enterEditing() {
@@ -267,7 +388,7 @@ final class ApplicationNavigationController {
                 self.snapshot = nil
                 overlay.hide()
                 setStatus(message)
-                if Self.isDirection(key) { nativeFallback(key, windowID: nil) }
+                if context.profile.mode != .buttons, Self.isDirection(key) { nativeFallback(key, windowID: nil) }
             case .cancelled:
                 // Transient menu, focus and window changes are intentionally quiet.
                 snapshotAt = 0
@@ -281,7 +402,7 @@ final class ApplicationNavigationController {
     }
 
     private func navigate(_ key: RemoteKey, snapshot: AppNavigationAccessibility.Snapshot,
-                          profile: AppNavigationProfile) {
+                          profile: AppNavigationProfile, allowNativeFallback: Bool = true) {
         selection.receive(snapshot)
         switch profile.mode {
         case .native: return
@@ -290,8 +411,7 @@ final class ApplicationNavigationController {
             guard !controls.isEmpty else {
                 selection.selectedID = nil
                 overlay.hide()
-                setStatus("当前界面没有暴露可操作控件，方向键使用原生行为。")
-                if Self.isDirection(key) { nativeFallback(key, windowID: snapshot.windowID) }
+                setStatus("当前界面未识别到可选按钮，请稍后再试。")
                 return
             }
             let direction = key == .ok ? RemoteKey.down : key
@@ -308,7 +428,7 @@ final class ApplicationNavigationController {
                 + (snapshot.limited ? " · 部分界面暂未识别" : ""))
             guard !regions.isEmpty else {
                 overlay.hide()
-                if Self.isDirection(key) { nativeFallback(key, windowID: snapshot.windowID) }
+                if allowNativeFallback, Self.isDirection(key) { nativeFallback(key, windowID: snapshot.windowID) }
                 return
             }
             if !regions.contains(where: { $0.id == selection.regionID }) {
@@ -468,6 +588,8 @@ final class ApplicationNavigationController {
     }
 
     private func resetSession() {
+        reservedDecision.cancel()
+        reservedNative = nil
         accessibility.cancel()
         session = nil
         retryTask?.cancel()
@@ -539,6 +661,6 @@ final class ApplicationNavigationController {
     /// Safe for --self-test: no controller instance, timer, workspace, AX query or event is created.
     nonisolated static func selfCheck() -> Bool {
         AppNavigationAccessibility.selfCheck() && AppNavigationSelectionState.selfCheck()
-            && NavigationFocusOverlay.selfCheck()
+            && NavigationFocusOverlay.selfCheck() && AppNavigationPressDecision.selfCheck()
     }
 }

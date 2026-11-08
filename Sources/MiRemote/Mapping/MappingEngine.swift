@@ -112,11 +112,16 @@ final class MappingEngine: @unchecked Sendable {
     private var immediateOverlayDirections = false
     private var applicationNavigationEnabled = false
     var onApplicationNavigation: ((RemoteKey, Bool) -> Void)?
+    var onApplicationNavigationReservedDirection: ((RemoteKey, ApplicationNavigationReservedPhase) -> Void)?
     private lazy var applicationNavigationGestures: ApplicationNavigationGestures = {
         let gestures = ApplicationNavigationGestures(schedule: scheduleAfter)
         gestures.onNavigate = { [weak self] key, down in self?.forwardApplicationNavigation(key, down) }
-        gestures.onDouble = { [weak self] key in
-            guard let self, let action = self.config.globalShortcuts?[key.rawValue]?.double else { return }
+        gestures.onReservedDirection = { [weak self] key, phase in
+            guard let self, let handler = self.onApplicationNavigationReservedDirection else { return }
+            self.mainDispatch { handler(key, phase) }
+        }
+        gestures.onHold = { [weak self] key in
+            guard let self, let action = self.reservedDirectionAction(key) else { return }
             self.runIndependentGlobal(action)
         }
         return gestures
@@ -200,11 +205,11 @@ final class MappingEngine: @unchecked Sendable {
     private func publishTapRoute() {
         // 基础状态是“文字输入态”：Profile 不能接管四方向的短按语义。
         // 只有第二功能/导航模式（layer != 0），或用户明确按住 OK 组成手势时，
-        // 方向键才进入映射引擎。保留全局双击的左右也必须进引擎决断；
+        // 方向键才进入映射引擎。保留全局长按的左右也必须进引擎决断；
         // 其余方向继续直接改写，保留系统原生 autorepeat 与零延迟。
         let directions: Set<RemoteKey> = [.up, .down, .left, .right]
         let native = Set(directions.filter { key in
-            !applicationNavigationEnabled && reservedDirectionAction(key) == nil
+            !applicationNavigationEnabled && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
                 && (!independent || overlayDeclared(key)?.overrideBase != true)
         })
         let route = TapRoute(effectiveLayer: effectiveLayer,
@@ -369,7 +374,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _resetInputState(_ reason: String, preserveReservedPresses: Bool = true) {
-        applicationNavigationGestures.reset()
+        applicationNavigationGestures.reset(preservePressed: preserveReservedPresses)
         reservedDirectionGestures.reset(preservePressed: preserveReservedPresses)
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
@@ -398,6 +403,10 @@ final class MappingEngine: @unchecked Sendable {
     private func _handle(_ event: ButtonEvent) {
         // 暂停态：遥控完全惰性——不进状态机、不追踪逃生、不喂浮层。
         if suspendedLock.withLock({ $0 }) { return }
+        // A hold/context change consumes that physical press through release,
+        // even if its global action focuses another app or opens a new panel.
+        if applicationNavigationGestures.consumeSuppressed(event)
+            || reservedDirectionGestures.consumeSuppressed(event) { return }
         if independent {
             handleIndependent(event)
             return
@@ -439,7 +448,7 @@ final class MappingEngine: @unchecked Sendable {
         }
         if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0,
            isDirection(event.key) || event.key == .ok {
-            applicationNavigationGestures.handle(event, doubleMs: nil)
+            applicationNavigationGestures.handle(event)
             return
         }
         if event.key == .ok, okPhysicallyDown != event.isDown {
@@ -464,13 +473,26 @@ final class MappingEngine: @unchecked Sendable {
         if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(),
            overlayHandler == nil, !MouseMode.shared.isActive,
            isDirection(key) || key == .ok {
-            let double = (key == .left || key == .right) && config.globalShortcuts?[key.rawValue]?.double != nil
-            applicationNavigationGestures.handle(event, doubleMs: double ? config.settings.doubleMs : nil)
+            applicationNavigationGestures.handle(event, holdMs: reservedDirectionAction(key) == nil
+                ? nil : reservedDirectionHoldMs(key))
             return
         }
-        // 左右双击在 App、浮层和鼠标之前决断；上下继续走原分流与即时方向路由。
+        // 保留左右长按先决断，不能先发原生按键/滚动再切 Space。
+        // 菜单/Dock 的 immediateDirections 捕获在此之前，继续即时选择和连发。
         if let action = reservedDirectionAction(key) {
-            reservedDirectionGestures.handle(event) { reservedDirectionRoute(key, double: action) }
+            reservedDirectionGestures.handle(event, holdMs: reservedDirectionHoldMs(key)) {
+                reservedDirectionRoute(key, hold: action)
+            }
+            return
+        }
+        // Keep an explicitly customized non-Space double outside app navigation.
+        // The obsolete Space double is never a navigation gesture.
+        if customDirectionDouble(key) != nil {
+            if event.isDown, !independentGestures.isTracking(key) {
+                gestureContexts[key] = (contextGeneration, reservedMouseIsActive())
+            }
+            independentGestures.handle(event, policy: .init(
+                doubleMs: max(0, config.settings.doubleMs), holdMs: 1, hasDouble: true, hasHold: false))
             return
         }
         if key == .volUp || key == .volDown {
@@ -529,10 +551,24 @@ final class MappingEngine: @unchecked Sendable {
 
     private func reservedDirectionAction(_ key: RemoteKey) -> Action? {
         guard key == .left || key == .right else { return nil }
-        return config.globalShortcuts?[key.rawValue]?.double
+        return config.globalShortcuts?[key.rawValue]?.hold
     }
 
-    private func reservedDirectionRoute(_ key: RemoteKey, double action: Action) -> ReservedDirectionGestures.Route {
+    private func reservedDirectionHoldMs(_ key: RemoteKey) -> Int {
+        max(1, config.globalShortcuts?[key.rawValue]?.holdMs ?? ReservedDirectionGestures.defaultHoldMs)
+    }
+
+    private func customDirectionDouble(_ key: RemoteKey) -> Action? {
+        guard key == .left || key == .right, reservedDirectionAction(key) == nil,
+              let action = config.globalShortcuts?[key.rawValue]?.double else { return nil }
+        if action == .system("space_left") || action == .system("space_right") { return nil }
+        if case .keyStroke(let arrow, let mods) = action,
+           ["left_arrow", "right_arrow"].contains(arrow), mods.count == 1,
+           ["left_ctrl", "right_ctrl"].contains(mods[0]) { return nil }
+        return action
+    }
+
+    private func reservedDirectionRoute(_ key: RemoteKey, hold action: Action) -> ReservedDirectionGestures.Route {
         let generation = contextGeneration
         let mouseActive = reservedMouseIsActive()
         let handler = overlayHandler
@@ -543,53 +579,19 @@ final class MappingEngine: @unchecked Sendable {
             guard let self else { return false }
             return self.contextGeneration == generation && self.reservedMouseIsActive() == mouseActive
         }
-        let forward: (ButtonEvent) -> Void
-        if let handler {
-            // 保留旧 handler 以保证切上下文时 up 释放旧浮层的按住连发。
-            forward = { [weak self] event in self?.mainDispatch { handler(event) } }
-        } else if mouseActive {
-            forward = { [weak self] event in self?.reservedMouseHandle(event.key, event.isDown) }
-        } else {
-            forward = { [weak self] event in
-                guard let self else { return }
-                if event.isDown {
-                    self.independentHeld.insert(key)
-                    self.repeatTokens[key, default: 0] &+= 1
-                    let token = self.repeatTokens[key]!
-                    self.runIndependentLocal(localAction)
-                    self.repeatReservedDirection(key, action: localAction, token: token, generation: generation)
-                } else {
-                    self.independentHeld.remove(key)
-                    self.repeatTokens[key, default: 0] &+= 1
-                    if self.scrollRepeatingKeys.remove(key) != nil { CodexNavigation.cancelScrolling() }
-                }
-            }
-        }
         return .init(
             tap: { [weak self] in
                 guard valid() else { return }
-                if handler != nil || mouseActive {
-                    forward(down)
-                    forward(up)
+                if let handler {
+                    self?.mainDispatch { handler(down); handler(up) }
+                } else if mouseActive {
+                    self?.reservedMouseHandle(key, true)
+                    self?.reservedMouseHandle(key, false)
                 } else {
                     self?.runIndependentLocal(localAction)
                 }
             },
-            down: { if valid() { forward(down) } },
-            up: { forward(up) },
-            double: { [weak self] in self?.runIndependentGlobal(action) })
-    }
-
-    /// 被双击保留的左右不再原生透传，因此按住时用完整 keyStroke 持续连发。
-    /// 浮层与鼠标不走此计时器，转发 down/up 后继续使用它们自己的按住机制。
-    private func repeatReservedDirection(_ key: RemoteKey, action: Action?, token: Int, generation: Int) {
-        scheduleAfter(110) { [weak self] in
-            guard let self, self.repeatTokens[key] == token, self.independentHeld.contains(key),
-                  !self.isSuspended, self.contextGeneration == generation,
-                  self.overlayHandler == nil, !self.reservedMouseIsActive() else { return }
-            self.runIndependentLocal(action)
-            self.repeatReservedDirection(key, action: action, token: token, generation: generation)
-        }
+            hold: { [weak self] in if valid() { self?.runIndependentGlobal(action) } })
     }
 
     private func repeatIndependent(_ key: RemoteKey, token: Int, after delay: Int, global: Bool) {
@@ -1076,31 +1078,65 @@ extension MappingEngine {
         let runner = RecordingRunner()
         var config = MappingConfig()
         config.globalShortcuts = [
-            "left": KeyBinding(double: .system("space_left")),
-            "right": KeyBinding(double: .system("space_right")),
+            "left": KeyBinding(hold: .system("space_left")),
+            "right": KeyBinding(hold: .system("space_right"), holdMs: 700),
             "back": KeyBinding(hold: .system("quit_app"), holdMs: 1200)
         ]
         let engine = MappingEngine(config: config, runner: runner, delegate: nil,
             dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) })
         var events: [String] = []
+        var phases: [(RemoteKey, ApplicationNavigationReservedPhase)] = []
+        var order: [String] = []
         engine.onApplicationNavigation = { events.append("\($0.rawValue)\($1 ? "+" : "-")") }
+        engine.onApplicationNavigationReservedDirection = { key, phase in
+            phases.append((key, phase)); order.append("\(key.rawValue):\(phase)")
+        }
+        engine.onGlobalAction = { action in runner.run(action); order.append("global") }
         func key(_ key: RemoteKey, _ down: Bool) {
             engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
         }
+        func tap(_ k: RemoteKey) { key(k, true); key(k, false) }
         engine.setApplicationNavigationEnabled(true)
         guard engine.tapRoute.nativeDirections.isEmpty else { return false }
-        key(.right, true)
-        guard events == ["right+"], runner.actions.isEmpty else { return false }
-        key(.right, false); clock.advance(100); key(.right, true); key(.right, false)
-        guard events == ["right+", "right-"], runner.actions == [.system("space_right")] else { return false }
-        runner.actions.removeAll(); events.removeAll()
-        key(.ok, true); key(.ok, false); key(.back, true); key(.back, false)
+        // Every rapid press gets its own immediate preview/commit, never a double.
+        for direction in [RemoteKey.left, .right, .up, .down] { tap(direction); tap(direction) }
+        guard phases.map(\.1) == [.began, .committed, .began, .committed,
+                                  .began, .committed, .began, .committed],
+              events == ["up+", "up-", "up+", "up-", "down+", "down-", "down+", "down-"],
+              runner.actions.isEmpty else { return false }
+        clock.advance(1000)
+        guard runner.actions.isEmpty else { return false }
+        events.removeAll(); phases.removeAll(); order.removeAll()
+        key(.left, true); clock.advance(649); key(.left, true)
+        guard phases.map(\.1) == [.began], runner.actions.isEmpty else { return false }
+        clock.advance(1)
+        guard phases.map(\.1) == [.began, .cancelled],
+              order == ["left:began", "left:cancelled", "global"],
+              runner.actions == [.system("space_left")] else { return false }
+        // A focus/capture change and raw autorepeat cannot replay the held key.
+        engine.setActiveProfile("com.example.next")
+        engine.setApplicationNavigationEnabled(false)
+        key(.left, true); clock.advance(1500); key(.left, false)
+        guard phases.count == 2, runner.actions == [.system("space_left")], events.isEmpty else { return false }
+        engine.setApplicationNavigationEnabled(true)
+        runner.actions.removeAll(); phases.removeAll()
+        key(.right, true); clock.advance(699)
+        guard runner.actions.isEmpty else { return false }
+        clock.advance(1); key(.right, false)
+        guard runner.actions == [.system("space_right")], phases.map(\.1) == [.began, .cancelled] else { return false }
+        runner.actions.removeAll(); phases.removeAll()
+        key(.left, true); engine.setActiveProfile("com.example.changed"); clock.advance(800)
+        key(.left, true); key(.left, false)
+        guard phases.map(\.1) == [.began, .cancelled], runner.actions.isEmpty else { return false }
+        phases.removeAll()
+        tap(.ok); tap(.back)
         guard events == ["ok+", "ok-", "back+", "back-"], runner.actions.isEmpty else { return false }
         events.removeAll()
         var overlay: [ButtonEvent] = []
         engine.setOverlayCapture({ overlay.append($0) }, immediateDirections: true)
-        key(.left, true); key(.left, false)
-        guard overlay.map(\.isDown) == [true, false], events.isEmpty else { return false }
+        key(.left, true); clock.advance(900); key(.left, false); tap(.right); tap(.right)
+        guard overlay.map(\.isDown) == [true, false, true, false, true, false],
+              phases.isEmpty, events.isEmpty, runner.actions.isEmpty else { return false }
         engine.setOverlayCapture(nil)
         key(.up, true); engine.resetInputState(reason: "navigation test")
         guard events == ["up+", "up-"] else { return false }
@@ -1110,22 +1146,30 @@ extension MappingEngine {
         runner.actions.removeAll()
         engine.setApplicationNavigationEnabled(false)
         guard engine.tapRoute.nativeDirections == [.up, .down] else { return false }
-        key(.right, true); key(.right, false); clock.advance(250)
-        guard events.isEmpty && runner.actions == [.keyStroke(key: "right_arrow", mods: [])] else { return false }
+        tap(.right)
+        guard runner.actions == [.keyStroke(key: "right_arrow", mods: [])] else { return false }
+        // Legacy mode does not acquire global Space holds or double decisions.
         config.globalShortcuts = nil
-        engine.setConfig(config)
-        engine.setApplicationNavigationEnabled(true)
-        runner.actions.removeAll()
-        key(.left, true); key(.left, false); key(.ok, true); key(.ok, false)
-        key(.back, true); key(.back, false)
-        guard events == ["left+", "left-", "ok+", "ok-", "back+", "back-"], runner.actions.isEmpty else { return false }
+        engine.setConfig(config); engine.setApplicationNavigationEnabled(true)
+        runner.actions.removeAll(); phases.removeAll()
+        tap(.left); tap(.left); tap(.ok); tap(.back)
+        guard events == ["left+", "left-", "left+", "left-", "ok+", "ok-", "back+", "back-"],
+              phases.isEmpty, runner.actions.isEmpty else { return false }
+        // An unrelated user-customized double still works outside app navigation.
+        config.globalShortcuts = ["left": KeyBinding(double: .system("mute"))]
+        engine.setConfig(config); events.removeAll()
+        tap(.left); tap(.left)
+        guard events == ["left+", "left-", "left+", "left-"], runner.actions.isEmpty else { return false }
+        engine.setApplicationNavigationEnabled(false); events.removeAll()
+        tap(.left); clock.advance(40); tap(.left)
+        guard runner.actions == [.system("mute")] else { return false }
         defer { TransientSystemUI.clearMissionControlExit() }
         for independentMode in [false, true] {
             config.globalShortcuts = independentMode ? [:] : nil
-            engine.setConfig(config)
+            engine.setConfig(config); engine.setApplicationNavigationEnabled(true)
             events.removeAll(); runner.actions.removeAll()
             TransientSystemUI.markMissionControlEntered()
-            key(.up, true); key(.up, false); key(.ok, true); key(.ok, false)
+            tap(.up); tap(.ok)
             guard events.isEmpty,
                   runner.actions == [.keyStroke(key: "up_arrow", mods: []), .keyStroke(key: "return", mods: [])],
                   !TransientSystemUI.isMissionControlActive() else { return false }
@@ -1133,7 +1177,7 @@ extension MappingEngine {
         return true
     }
 
-    /// 保留左右双击的确定性路由检查；所有动作、浮层与鼠标出口均为记录器。
+    /// Reserved Space holds use fake actions, panels and mouse outputs only.
     static func reservedDirectionSelfCheck() -> Bool {
         var passed = true
         func expect(_ condition: Bool, _ message: String) {
@@ -1145,132 +1189,83 @@ extension MappingEngine {
         let clock = ManualClock()
         let runner = RecordingRunner()
         var mouseActive = false
-        var mouseHeld: Set<RemoteKey> = []
         var mouseEvents: [(RemoteKey, Bool)] = []
         var dragging = false
-        let doubleLeft = Action.keyStroke(key: "left_arrow", mods: ["left_ctrl"])
-        let doubleRight = Action.keyStroke(key: "right_arrow", mods: ["left_ctrl"])
         var cfg = MappingConfig()
+        cfg.settings.holdMs = 100 // reserved LR use their own 650ms default
         cfg.globalShortcuts = [
-            "left": KeyBinding(double: doubleLeft),
-            "right": KeyBinding(double: doubleRight),
+            "left": KeyBinding(hold: .system("space_left")),
+            "right": KeyBinding(hold: .system("space_right")),
         ]
         cfg.profiles["com.example.editor"] = [
-            "left": KeyBinding(tap: .keyStroke(key: "left_arrow", mods: []),
-                               double: .system("wrong_app_double"), overrideBase: true),
+            "left": KeyBinding(tap: .system("codex_scroll_down"),
+                               hold: .system("wrong_app_hold"), overrideBase: true),
         ]
         let engine = MappingEngine(
             config: cfg, runner: runner, delegate: nil, dispatch: { $0() },
             scheduleAfter: { ms, work in clock.schedule(ms, work) },
             reservedMouseIsActive: { mouseActive },
-            reservedMouseHandle: { key, down in
-                mouseEvents.append((key, down))
-                if down { mouseHeld.insert(key) } else { mouseHeld.remove(key) }
-            },
-            reservedMouseDeactivate: { mouseActive = false; mouseHeld.removeAll(); dragging = false })
+            reservedMouseHandle: { mouseEvents.append(($0, $1)) },
+            reservedMouseDeactivate: { mouseActive = false; dragging = false })
         func event(_ key: RemoteKey, _ down: Bool) {
             engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
         }
         func tap(_ key: RemoteKey) { event(key, true); clock.advance(10); event(key, false) }
-        func twice(_ key: RemoteKey) { tap(key); clock.advance(40); tap(key) }
         func takeActions() -> [Action] {
-            let actions = runner.actions
-            runner.actions.removeAll()
-            return actions
+            let actions = runner.actions; runner.actions.removeAll(); return actions
         }
-
-        expect(engine.tapRoute.nativeDirections == [.up, .down], "只左右退出原生直通")
-        var withoutReserved = cfg
-        withoutReserved.globalShortcuts = [:]
-        engine.setConfig(withoutReserved)
-        expect(engine.tapRoute.nativeDirections == [.up, .down, .left, .right], "无保留双击时四方向保持原分流")
-        engine.setConfig(cfg)
-        engine.setActiveProfile("com.example.editor")
-        tap(.left); clock.advance(249)
-        expect(runner.actions.isEmpty, "单击在双击窗口内不提前发方向键")
+        expect(engine.tapRoute.nativeDirections == [.up, .down], "只有保留长按的左右退出原生直通")
+        tap(.right)
+        expect(takeActions() == [.keyStroke(key: "right_arrow", mods: [])], "单击release立即发方向键，不等250ms")
+        tap(.right); tap(.right); clock.advance(300)
+        expect(takeActions() == Array(repeating: .keyStroke(key: "right_arrow", mods: []), count: 2),
+               "快速连续左右单击各自产生一次动作")
+        event(.right, true); clock.advance(649); event(.right, true)
+        expect(takeActions().isEmpty, "长按判定前不发原生键，autorepeat不重启计时")
         clock.advance(1)
-        expect(takeActions() == [.keyStroke(key: "left_arrow", mods: [])], "App 单击只发一个原方向键")
-        twice(.left); clock.advance(500)
-        expect(takeActions() == [doubleLeft], "全局双击发送⌃←，覆盖 App 错误 double 且无单击前缀")
-        twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "右双击独立发送⌃→")
-
-        // 重复原始 down 不能延后按住决断；按住原生左右持续发键，松开后立即停。
-        event(.right, true); clock.advance(100); event(.right, true); clock.advance(150)
-        expect(takeActions() == [.keyStroke(key: "right_arrow", mods: [])], "250ms 按住决断不被 autorepeat 重置")
-        clock.advance(330)
-        expect(takeActions() == Array(repeating: .keyStroke(key: "right_arrow", mods: []), count: 3),
-               "普通左右长按持续连发")
-        event(.right, false); clock.advance(500)
-        expect(takeActions().isEmpty, "原生左右松开清掉连发")
-
+        expect(takeActions() == [.system("space_right")], "650ms只触发一次全局长按")
+        event(.right, true); clock.advance(1500); event(.right, false)
+        expect(takeActions().isEmpty, "长按触发后吞到release，无连发和单击尾巴")
+        engine.setActiveProfile("com.example.editor")
+        event(.left, true); clock.advance(649)
+        expect(takeActions().isEmpty, "App滚动/自定义hold在Space判定前无副作用")
+        clock.advance(1); event(.left, false)
+        expect(takeActions() == [.system("space_left")], "Space hold优先于App滚动与hold")
+        tap(.left)
+        expect(takeActions() == [.system("codex_scroll_down")], "短按release仍执行App动作一次")
         var captured: [ButtonEvent] = []
         engine.setOverlayCapture { captured.append($0) }
-        twice(.left); clock.advance(500)
-        expect(captured.isEmpty && takeActions() == [doubleLeft], "浮层双击穿透为全局⌃←")
-        tap(.right); clock.advance(250)
-        expect(captured.map(\.key) == [.right, .right] && captured.map(\.isDown) == [true, false],
-               "浮层单击回到原上下文的一对 down/up")
+        tap(.right)
+        expect(captured.map(\.isDown) == [true, false], "普通浮层短按在release提交一对事件")
         captured.removeAll()
-        event(.left, true); clock.advance(250); clock.advance(500)
-        expect(captured.map(\.isDown) == [true], "浮层按住及时转发 down，交由浮层持续翻页")
-        engine._resetInputState("reserved direction test")
-        expect(captured.map(\.isDown) == [true, false], "reset 给旧浮层补 up")
-        event(.left, true); clock.advance(500)
-        expect(captured.count == 2, "reset 后旧按住 autorepeat 不进入新上下文")
-        event(.left, false); clock.advance(500)
-        expect(captured.count == 2 && takeActions().isEmpty, "reset 后松开无残留动作")
-
-        captured.removeAll()
-        event(.right, true); clock.advance(250)
-        var newCaptured: [ButtonEvent] = []
-        engine.setOverlayCapture { newCaptured.append($0) }
-        expect(captured.map(\.isDown) == [true, false] && newCaptured.isEmpty,
-               "更换浮层时 up 回到旧 handler")
-        event(.right, false)
-        tap(.left)
-        engine.setActiveProfile("com.example.other")
-        clock.advance(500)
-        expect(newCaptured.isEmpty, "上下文变化作废尚未决断的单击")
-        engine.setOverlayCapture(nil)
-
-        captured.removeAll()
+        event(.left, true); clock.advance(650); event(.left, false)
+        expect(captured.isEmpty && takeActions() == [.system("space_left")], "普通浮层长按没有导航前缀")
         engine.setOverlayCapture({ captured.append($0) }, immediateDirections: true)
-        twice(.left)
-        expect(captured.map(\.isDown) == [true, false, true, false] && takeActions().isEmpty,
-               "菜单/Dock选择模式四向即时选择，快速连按不触发全局左右双击")
+        event(.left, true); clock.advance(1000); event(.left, false); tap(.right); tap(.right)
+        expect(captured.map(\.isDown) == [true, false, true, false, true, false] && takeActions().isEmpty,
+               "菜单/Dock捕获优先，长按及快速连按均不触发Space")
         engine.setOverlayCapture(nil)
-        twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "退出菜单/Dock选择模式恢复全局左右双击")
-
-        // 假鼠标出口验证持续按住和释放，绝不激活 MouseMode.shared 或发送 CG 输入。
-        mouseActive = true
-        event(.left, true); clock.advance(250); clock.advance(500)
-        expect(mouseEvents.count == 1 && mouseHeld == [.left], "鼠标按住得到持续保持的 down")
-        event(.left, false)
-        expect(mouseEvents.count == 2 && !mouseEvents[1].1 && mouseHeld.isEmpty, "鼠标松开准确收到 up")
+        mouseActive = true; dragging = true
+        tap(.right)
+        expect(mouseEvents.map(\.1) == [true, false], "鼠标短按完整提交且无遗留按住")
         mouseEvents.removeAll()
-        dragging = true
-        event(.left, true); clock.advance(250)
-        twice(.right); clock.advance(500)
-        expect(takeActions() == [doubleRight], "鼠标中右双击仍优先发送⌃→")
-        expect(!mouseActive && !dragging && mouseHeld.isEmpty,
-               "全局组合键释放旧方向并退出拖拽")
-        expect(mouseEvents.count == 2 && mouseEvents[0].1 && !mouseEvents[1].1,
-               "全局组合键只给已转发方向补一次 up")
-        event(.left, false); event(.right, false); clock.advance(500)
-        expect(takeActions().isEmpty && mouseHeld.isEmpty, "两侧方向松开后无遗留动作")
-
-        // 设备复位与配置热载都必须作废尚未转发的定时器。
-        tap(.right); engine._resetInputState("device removal test", preserveReservedPresses: false); clock.advance(500)
-        expect(takeActions().isEmpty, "设备复位清除 pending tap")
-        event(.right, true); clock.advance(250)
-        engine._resetInputState("device removal held test", preserveReservedPresses: false)
-        _ = takeActions()
-        tap(.right); clock.advance(250)
-        expect(takeActions() == [.keyStroke(key: "right_arrow", mods: [])], "设备丢 keyUp 后下一次按压正常")
-        event(.left, true); engine.setConfig(cfg); clock.advance(500); event(.left, false)
-        expect(takeActions().isEmpty, "配置重载清除 pending hold")
+        event(.left, true); clock.advance(649)
+        expect(mouseEvents.isEmpty && takeActions().isEmpty, "鼠标Space长按判定前不移动")
+        clock.advance(1); event(.left, true); clock.advance(1000); event(.left, false)
+        expect(mouseEvents.isEmpty && takeActions() == [.system("space_left")] && !mouseActive && !dragging,
+               "鼠标长按只切一次Space并退出拖拽")
+        event(.right, true); engine.setActiveProfile("com.example.other"); clock.advance(900)
+        event(.right, true); event(.right, false)
+        expect(takeActions().isEmpty, "上下文切换取消pending hold，旧按压吞到release")
+        event(.left, true); engine.setConfig(cfg); clock.advance(900); event(.left, false)
+        expect(takeActions().isEmpty, "配置热载取消旧hold")
+        event(.right, true); engine._resetInputState("device removal", preserveReservedPresses: false)
+        tap(.right); clock.advance(900)
+        expect(takeActions() == [.keyStroke(key: "right_arrow", mods: [])], "设备丢keyUp后新按压正常")
+        var noReserved = cfg
+        noReserved.globalShortcuts = [:]
+        engine.setConfig(noReserved)
+        expect(engine.tapRoute.nativeDirections == [.up, .down, .left, .right], "未启用保留hold时保持原生分流")
         if passed { print("[MappingEngine.reservedDirectionSelfCheck] passed") }
         return passed
     }

@@ -393,6 +393,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             km.engine.onApplicationNavigation = { [weak self] key, down in
                 MainActor.assumeIsolated { self?.applicationNavigation.handle(key, isDown: down) }
             }
+            km.engine.onApplicationNavigationReservedDirection = { [weak self] key, phase in
+                MainActor.assumeIsolated { self?.applicationNavigation.handleReservedDirection(key, phase: phase) }
+            }
             self.applicationNavigation.onCaptureChanged = { [weak self, weak km] enabled in
                 km?.engine.setApplicationNavigationEnabled(enabled)
                 guard let self else { return }

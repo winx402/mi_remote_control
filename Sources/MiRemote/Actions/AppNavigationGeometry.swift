@@ -30,16 +30,10 @@ enum AppNavigationGeometry {
                 ? max(0, axis.primaryMin(node.frame) - axis.primaryMax(source))
                 : max(0, axis.primaryMin(source) - axis.primaryMax(node.frame))
 
-            if !inBeam {
-                // A narrow direction cone admits nearby staggered controls. Additional bounds,
-                // relative to actual control sizes, prevent an exhausted list from jumping to
-                // an unrelated distant diagonal column. Directly aligned controls remain reachable.
-                guard cross <= forward * 0.75,
-                      crossGap <= max(axis.crossSize(source), axis.crossSize(node.frame)) * 1.5,
-                      primaryGap <= max(axis.primarySize(source), axis.primarySize(node.frame)) * 6 else {
-                    return nil
-                }
-            }
+            // Prefer the same row/column, then nearby staggered controls. Cross-axis distance
+            // is a soft penalty: a sparse or rearranged layout must still offer a target in
+            // the requested half-plane, even at 45 degrees or beyond a control-size threshold.
+            // The strict forward check above keeps exhausted edges from wrapping backwards.
             let score = hypot(primaryGap, crossGap * 2) + forward * 0.2 + cross * 0.15
             guard score.isFinite else { return nil }
             return Candidate(node: node, inBeam: inBeam, score: score, forward: forward, cross: cross)
@@ -86,11 +80,9 @@ enum AppNavigationGeometry {
         func primaryCenter(_ r: CGRect) -> CGFloat { horizontal ? r.midX : r.midY }
         func primaryMin(_ r: CGRect) -> CGFloat { horizontal ? r.minX : r.minY }
         func primaryMax(_ r: CGRect) -> CGFloat { horizontal ? r.maxX : r.maxY }
-        func primarySize(_ r: CGRect) -> CGFloat { horizontal ? r.width : r.height }
         func crossCenter(_ r: CGRect) -> CGFloat { horizontal ? r.midY : r.midX }
         func crossMin(_ r: CGRect) -> CGFloat { horizontal ? r.minY : r.minX }
         func crossMax(_ r: CGRect) -> CGFloat { horizontal ? r.maxY : r.maxX }
-        func crossSize(_ r: CGRect) -> CGFloat { horizontal ? r.height : r.width }
     }
 
     private struct Candidate {
@@ -478,6 +470,9 @@ enum AppNavigationGeometry {
               target(currentID: 1, direction: .down, nodes: grid) == 3,
               target(currentID: 1, direction: .left, nodes: grid) == 4,
               target(currentID: 1, direction: .right, nodes: grid) == 5,
+              target(currentID: 2, direction: .up, nodes: grid) == 2,
+              target(currentID: 3, direction: .down, nodes: grid) == 3,
+              target(currentID: 4, direction: .left, nodes: grid) == 4,
               target(currentID: 5, direction: .right, nodes: grid) == 5,
               target(currentID: 1, direction: .ok, nodes: grid) == 1 else { return failure("four directions and grid edge") }
 
@@ -487,10 +482,47 @@ enum AppNavigationGeometry {
               target(currentID: 1, direction: .down, nodes: list) == 2,
               target(currentID: 2, direction: .down, nodes: list) == 3,
               target(currentID: 3, direction: .down, nodes: list) == 3,
-              target(currentID: 1, direction: .right, nodes: [node(1, 0, 0), node(2, 300, 500)]) == 1,
-              target(currentID: 1, direction: .down, nodes: [node(1, 0, 0), node(2, 300, 500)]) == 1,
               target(currentID: 1, direction: .right, nodes: [node(1, 0, 0), node(2, 60, 45)]) == 2 else {
-            return failure("beam priority, list, and diagonal bounds")
+            return failure("beam priority, list, and staggered neighbor")
+        }
+
+        // Sparse layouts deliberately permit diagonal fallback; angle and control-size limits
+        // previously left both of these two-button snapshots without any movement at all.
+        let diagonal = [node(1, 0, 0), node(2, 120, 120)]
+        let sparse = [node(1, 0, 0), node(2, 300, 500)]
+        for pair in [diagonal, sparse] {
+            guard target(currentID: 1, direction: .right, nodes: pair) == 2,
+                  target(currentID: 1, direction: .down, nodes: pair) == 2,
+                  target(currentID: 2, direction: .left, nodes: pair) == 1,
+                  target(currentID: 2, direction: .up, nodes: pair) == 1,
+                  target(currentID: 1, direction: .left, nodes: pair) == 1,
+                  target(currentID: 2, direction: .right, nodes: pair) == 2 else {
+                return failure("45-degree and distant diagonal fallback without wrapping")
+            }
+        }
+
+        let toolbar = [node(1, 0, 0, 50, 30), node(2, 180, 60, 80, 35),
+                       node(3, 490, 135, 40, 25), node(4, 1_000, 240, 100, 50),
+                       node(99, 0, 0, 1_100, 300, .scrollArea)]
+        for snapshot in [toolbar, Array(toolbar.reversed())] {
+            guard target(currentID: 1, direction: .right, nodes: snapshot) == 2,
+                  target(currentID: 2, direction: .right, nodes: snapshot) == 3,
+                  target(currentID: 3, direction: .right, nodes: snapshot) == 4,
+                  target(currentID: 4, direction: .left, nodes: snapshot) == 3,
+                  target(currentID: 3, direction: .left, nodes: snapshot) == 2,
+                  target(currentID: 2, direction: .left, nodes: snapshot) == 1,
+                  target(currentID: 4, direction: .right, nodes: snapshot) == 4 else {
+                return failure("irregular toolbar nearest neighbors and snapshot-order stability")
+            }
+        }
+        let rearranged = [node(1, 0, 0), node(2, 500, 140), node(3, 120, 60)]
+        let nearDiagonal = [node(1, 0, 0), node(2, 80, 80), node(3, 500, 100)]
+        let wideInput = [node(1, 0, 0, 400, 40, .input), node(2, 380, 5, 40, 30)]
+        guard target(currentID: 1, direction: .right, nodes: rearranged) == 3,
+              target(currentID: 1, direction: .right, nodes: nearDiagonal) == 2,
+              target(currentID: 1, direction: .right, nodes: wideInput) == 2,
+              target(currentID: 2, direction: .left, nodes: wideInput) == 1 else {
+            return failure("live rearranged frames, nearby diagonals, and overlapping wide input")
         }
 
         let invalid = [node(9, .nan, 0), node(8, 0, 0, -10, 10), node(10, 0, 0, 10, -10), node(7, 0, 0, 0, 10),

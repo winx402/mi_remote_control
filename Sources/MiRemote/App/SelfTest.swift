@@ -242,6 +242,8 @@ enum SelfTest {
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
         expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
+        expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
+        expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")
         expect(VoicePressGate.selfCheck(), "语音短按不启动音频、长按预录音与结束清理")
         expect(MouseMode.selfCheck(), "鼠标快慢档、滚动、锁定拖拽及闲置释放")

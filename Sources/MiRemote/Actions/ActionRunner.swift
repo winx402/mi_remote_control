@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreGraphics
+import os
 
 /// shell 动作派生的活动进程组全局登记表：正常退出/服务 stop 时对全部活动组
 /// TERM→KILL 清扫，保证「shell 命令绝不跑过主程序生命周期」的承诺。
@@ -94,6 +95,52 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
     /// 服务接线期设置、主线程执行；未接线（如 --run-action 单发）仅记日志。
     nonisolated(unsafe) static var onAppMRUBack: (() -> Void)?
 
+    private struct TelevisionSettings { var configuration: XiaomiTVConfiguration?; var revision: UInt64 = 0 }
+    private static let televisionSettings = OSAllocatedUnfairLock(initialState: TelevisionSettings())
+    private struct TelevisionOperations { var pending = 0; var failures = 0 }
+    private static let televisionOperations = OSAllocatedUnfairLock(initialState: TelevisionOperations())
+    static var pendingTelevisionCommands: Int { televisionOperations.withLock { $0.pending } }
+    static var televisionCommandFailures: Int { televisionOperations.withLock { $0.failures } }
+
+    static func configureTelevision(_ configuration: XiaomiTVConfiguration?) {
+        televisionSettings.withLock {
+            if $0.configuration != configuration { $0.configuration = configuration; $0.revision &+= 1 }
+        }
+        if Thread.isMainThread { MainActor.assumeIsolated { applyLatestTelevisionSettings() } }
+        else { Task { @MainActor in applyLatestTelevisionSettings() } }
+    }
+
+    @MainActor private static func applyLatestTelevisionSettings() {
+        let settings = televisionSettings.withLock { $0 }
+        XiaomiTVController.shared.configure(settings.configuration,
+            isCurrent: { televisionSettings.withLock { $0.revision == settings.revision } })
+    }
+
+    private func runTelevision(_ command: XiaomiTVCommand) {
+        let settings = Self.televisionSettings.withLock { $0 }
+        Self.televisionOperations.withLock { $0.pending += 1 }
+        Task { @MainActor in
+            guard Self.televisionSettings.withLock({ $0.revision == settings.revision }) else {
+                recordTelevisionResult(.failure(.cancelled))
+                return
+            }
+            let client = XiaomiTVController.shared
+            client.configure(settings.configuration,
+                isCurrent: { Self.televisionSettings.withLock { $0.revision == settings.revision } })
+            client.perform(command) { result in
+                self.recordTelevisionResult(result)
+            }
+        }
+    }
+
+    private func recordTelevisionResult(_ result: Result<Void, XiaomiTVFailure>) {
+        Self.televisionOperations.withLock {
+            $0.pending -= 1
+            if case .failure = result { $0.failures += 1 }
+        }
+        if case .failure(let failure) = result { log("小米电视：\(failure.message)") }
+    }
+
     // MARK: - ActionRunning
     func run(_ action: Action) {
         switch action {
@@ -147,6 +194,9 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
     private func system(_ name: String) {
         if CodexNavigation.perform(name) { return }
         switch name {
+        case "tv_volume_up": runTelevision(.volumeUp)
+        case "tv_volume_down": runTelevision(.volumeDown)
+        case "tv_off": runTelevision(.sleep)
         case "volume_up":   aux(NX_KEYTYPE_SOUND_UP)
         case "volume_down": aux(NX_KEYTYPE_SOUND_DOWN)
         case "mute":        aux(NX_KEYTYPE_MUTE)

@@ -720,6 +720,7 @@ final class AppServices {
         // 启动早期只读预载配置：settings 覆盖项（VID/PID、声卡名、终端白名单）
         // 与 voiceProfiles.global 需要在各引擎构建前生效。文件缺失/坏损 → 全部内置默认。
         let preloaded = ConfigStore.loadIfExists(at: options.configPath)
+        ActionRunner.configureTelevision(preloaded?.television)
         let settings = preloaded?.settings ?? MappingConfig.Settings()
         RemoteIdentity.configure(vendorID: settings.remoteVendorID,
                                  productID: settings.remoteProductID)
@@ -837,6 +838,7 @@ final class AppServices {
     func stop() {
         guard started else { return }
         started = false
+        ActionRunner.configureTelevision(nil)
         keyMapper?.engine.setSuspended(true)
         MouseMode.shared.deactivate()
         eventListener.stop()
@@ -861,6 +863,7 @@ final class AppServices {
     /// 热加载映射配置（UI 写回 config.json 后调用）。
     /// settings 里的 VID/PID、声卡名改动需重启进程生效（引擎构建期绑定）；终端白名单即刻生效。
     func applyConfig(_ config: MappingConfig) {
+        ActionRunner.configureTelevision(config.television)
         voiceApp.minimumHoldMs = options.keys && config.globalShortcuts != nil
             ? config.settings.holdMs : 0
         FocusInput.extraTerminalBundles = Set(config.settings.terminalApps ?? [])

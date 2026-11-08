@@ -27,6 +27,20 @@ struct GeneralPage: View {
                     }
                 }
 
+                SettingsGroup(title: "小米电视") {
+                    TelevisionSettingsView(configuration: Binding(
+                        get: { model.config.television },
+                        set: { value in
+                            model.config.television = value
+                            if value?.enabled != true, model.televisionVolumeKeys {
+                                model.setTelevisionVolumeKeys(false)
+                            } else { model.saveConfig() }
+                        }), volumeKeysControlTV: Binding(
+                            get: { model.televisionVolumeKeys },
+                            set: { model.setTelevisionVolumeKeys($0) }))
+                        .padding(14)
+                }
+
                 SettingsGroup(title: "应用内遥控") {
                     ApplicationNavigationSettingsView(
                         availableApps: navigationApplications,

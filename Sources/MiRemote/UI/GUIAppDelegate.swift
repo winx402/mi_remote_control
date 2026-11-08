@@ -132,6 +132,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         systemMenu.target = self
         appMenu.addItem(systemMenu)
         let dockMenu = NSMenuItem(title: "Dock 应用选择…", action: #selector(showDockPicker), keyEquivalent: "")
+        let powerMenu = NSMenuItem(title: "电源与应用…", action: #selector(showPowerMenu), keyEquivalent: "")
+        powerMenu.target = self
+        appMenu.addItem(powerMenu)
         dockMenu.target = self
         appMenu.addItem(dockMenu)
         let diagnostics = NSMenuItem(title: "检查抖音导航…", action: #selector(diagnoseDouyinNavigation), keyEquivalent: "")
@@ -188,6 +191,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func showSystemMenu() { openOverlay("system_menu") }
+    @objc private func showPowerMenu() { openOverlay("computer_power") }
     @objc private func showDockPicker() { openOverlay("dock_picker") }
 
     @objc private func diagnoseDouyinNavigation() {

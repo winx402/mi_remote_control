@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>连接你配置的小米电视，调节音量并按你的指令让电视待机。</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>用于在你选择并确认后让电脑休眠或正常关机。</string>
     <key>CFBundleIdentifier</key>

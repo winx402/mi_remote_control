@@ -237,6 +237,8 @@ struct MappingConfig: Codable {
     var menuFavoriteApps: [String]? = nil
     /// Opt-in navigation behavior by application. Missing apps retain native keys.
     var appNavigationProfiles: [String: AppNavigationProfile]? = nil
+    /// Optional LAN TV integration; device addresses stay in the local config only.
+    var television: XiaomiTVConfiguration? = nil
 }
 
 /// 动作执行器（ActionRunner 实现；MappingEngine 调用）

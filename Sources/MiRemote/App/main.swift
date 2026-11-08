@@ -9,6 +9,9 @@ import AppKit
 // 纯逻辑自检不触碰 BLE/hidutil，允许在 GUI 正在运行时并行执行（打包校验需要）。
 let startupArgs = Array(CommandLine.arguments.dropFirst())
 if startupArgs == ["--self-test"] { exit(SelfTest.run()) }
+if startupArgs.first == "--tv" {
+    exit(MainActor.assumeIsolated { TelevisionCLI.run(Array(startupArgs.dropFirst())) })
+}
 
 // 单实例锁在参数解析【之后】获取：--help / --doctor / --list-audio-devices /
 // --login-item status 等只读子命令在解析中就 exit，不与运行中的实例争用
@@ -48,11 +51,14 @@ while let argument = args.first {
         }
         print("配置 JSON 验证通过")
         exit(0)
-    case "--render-system-menu":
+    case "--render-system-menu", "--render-power-menu":
         guard !args.isEmpty else { exit(2) }
         let url = URL(fileURLWithPath: args.removeFirst())
         do {
-            try MainActor.assumeIsolated { try SystemMenuPreview.render(to: url) }
+            try MainActor.assumeIsolated {
+                if argument == "--render-power-menu" { try PowerMenuPreview.render(to: url) }
+                else { try SystemMenuPreview.render(to: url) }
+            }
             print("菜单预览已保存")
             exit(0)
         } catch {
@@ -153,6 +159,7 @@ while let argument = args.first {
         }
         do {
             let action = try JSONDecoder().decode(Action.self, from: Data(args.removeFirst().utf8))
+            ActionRunner.configureTelevision(ConfigStore.loadIfExists(at: opts.configPath)?.television)
             FileHandle.standardError.write("执行动作: \(action)\n".data(using: .utf8)!)
             ActionRunner().run(action)
         } catch {
@@ -166,9 +173,10 @@ while let argument = args.first {
         let runActionDeadline = Date().addingTimeInterval(120)
         func pollRunActionExit() {
             let done = !MacroEngine.shared.isRunning && ShellProcessRegistry.shared.activeCount == 0
+                && ActionRunner.pendingTelevisionCommands == 0
             if done || Date() > runActionDeadline {
                 ShellProcessRegistry.shared.terminateAll()
-                exit(done ? 0 : 1)
+                exit(done && ActionRunner.televisionCommandFailures == 0 ? 0 : 1)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { pollRunActionExit() }
         }
@@ -179,6 +187,7 @@ while let argument = args.first {
         print("miremote --ui-preview        GUI 但不启动引擎（开发验证）")
         print("miremote [--list-audio-devices] [--output <name>] [--wav <path>] [--gain <dB>] [--verbose]")
         print("         [--keys] [--config <path>] [--doubao] [--run-action '<action json>']")
+        print("         --tv status|volume-up|volume-down|off [--config <path>]")
         print("         [--doctor] [--login-item on|off|status] [--claude-hooks install|uninstall|status]")
         print("         [--print-default-config] [--validate-config <path>]")
         print("         [--render-system-menu <png-path>]（离屏渲染，不启动遥控服务）")

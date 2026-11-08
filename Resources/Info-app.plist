@@ -26,6 +26,8 @@
     <string>连接小米蓝牙遥控器并接收语音数据。</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>用于在你选择并确认后让电脑休眠或正常关机。</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>连接你配置的小米电视，调节电视音量并在你选择后让电视待机。</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

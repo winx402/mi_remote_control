@@ -221,6 +221,7 @@ final class OverlayCenter {
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexIndex = 0
     private var powerMenu = PowerMenuState()
+    private var powerApplication: NSRunningApplication?
     private var powerGeneration: UInt64 = 0
     /// 窗口选择/系统菜单/教程不应无限占用遥控路由；10s 无操作自动收起。
     private static let overlayIdleSeconds: TimeInterval = 10
@@ -302,7 +303,17 @@ final class OverlayCenter {
             showPanel()
         case .computerPower:
             powerGeneration &+= 1
-            powerMenu.open()
+            ActionRunner.configureTelevision(model?.config.television)
+            let foreground = NSWorkspace.shared.frontmostApplication
+            powerApplication = (foreground?.processIdentifier == NSRunningApplication.current.processIdentifier
+                ? frontApp : foreground).flatMap {
+                    $0.activationPolicy == .regular && !$0.isTerminated
+                        && $0.processIdentifier != NSRunningApplication.current.processIdentifier ? $0 : nil
+                }
+            let douyinRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.bytedance.douyin.desktop")
+                .contains { !$0.isTerminated && $0.activationPolicy == .regular }
+            powerMenu.open(choices: PowerMenuCatalog.choices(televisionConfigured: XiaomiTVController.shared.isConfigured,
+                currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning))
             showPanel()
         case .tutorial:
             quickLook.setVisible(true,
@@ -346,6 +357,7 @@ final class OverlayCenter {
         onActiveChanged?()
         powerGeneration &+= 1
         powerMenu.close()
+        powerApplication = nil
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexIndex = 0
@@ -608,17 +620,26 @@ final class OverlayCenter {
     // MARK: 电脑电源列表
 
     private func handlePowerKey(_ key: RemoteKey) {
-        switch powerMenu.handle(key) {
+        handlePowerEffect(powerMenu.handle(key))
+    }
+
+    private func selectPowerChoice(_ choice: PowerMenuState.Choice) {
+        guard active == .computerPower else { return }
+        handlePowerEffect(powerMenu.select(choice))
+    }
+
+    private func handlePowerEffect(_ effect: PowerMenuState.Effect) {
+        switch effect {
         case .none:
             sync()
         case .dismiss:
             close()
-        case .execute(let request):
+        case .execute(let command):
             stopRepeat()
             restartOverlayIdleTimer()
             sync(animated: false)
             let token = powerGeneration
-            ComputerPower.execute(request) { [weak self] result in
+            PowerMenuActions.perform(command, currentApplication: powerApplication) { [weak self] result in
                 guard let self, self.active == .computerPower,
                       self.powerGeneration == token else { return }
                 if self.powerMenu.complete(result) == .dismiss {
@@ -711,7 +732,8 @@ final class OverlayCenter {
         p.contentView = NSHostingView(rootView: OverlayRootView(state: uiState,
             onDismiss: { [weak self] in self?.close() },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
-            onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) }))
+            onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) },
+            onPowerSelect: { [weak self] in self?.selectPowerChoice($0) }))
         panel = p
         return p
     }
@@ -1096,6 +1118,7 @@ private struct OverlayRootView: View {
     let onDismiss: () -> Void
     let onMenuSelect: (Int) -> Void
     let onMenuActivate: (Int) -> Void
+    let onPowerSelect: (PowerMenuState.Choice) -> Void
 
     private var visible: Bool { state.kind != nil }
 
@@ -1121,7 +1144,7 @@ private struct OverlayRootView: View {
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
                 case .computerPower:
-                    PowerMenuView(state: state.powerMenu)
+                    PowerMenuView(state: state.powerMenu, onSelect: onPowerSelect)
                 default:
                     EmptyView()
                 }

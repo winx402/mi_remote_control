@@ -220,7 +220,7 @@ enum WorkspaceActions {
 
     static func perform(_ action: WorkspaceAction) {
         if action == .quitApplication {
-            quitFrontmostApplication()
+            requestQuit(NSWorkspace.shared.frontmostApplication)
             return
         }
         if action == .focusInput {
@@ -272,8 +272,8 @@ enum WorkspaceActions {
 
     /// Snapshot the target before UI cleanup can change focus. Request normal
     /// termination, allowing the application's own save/cancel flow to run.
-    private static func quitFrontmostApplication() {
-        guard let target = NSWorkspace.shared.frontmostApplication,
+    static func requestQuit(_ application: NSRunningApplication?) {
+        guard let target = application,
               target.activationPolicy == .regular, !target.isTerminated else { return }
         DispatchQueue.main.async {
             guard !target.isTerminated else { return }

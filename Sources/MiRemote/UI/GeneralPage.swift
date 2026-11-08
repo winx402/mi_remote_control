@@ -25,6 +25,22 @@ struct GeneralPage: View {
                     }
                 }
 
+                SettingsGroup(title: "Dock 应用选择") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("长按菜单唤起 · 四向选择应用 · OK 打开 · 返回取消")
+                        Text(model.dockNavigationStatus).foregroundStyle(.secondary)
+                    }.font(.callout).padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                SettingsGroup(title: "系统功能菜单 · 常用应用") {
+                    MenuFavoriteAppsSettingsView(
+                        available: DockApplications.pinned(),
+                        selectedIDs: Binding(
+                            get: { model.config.menuFavoriteApps },
+                            set: { model.config.menuFavoriteApps = $0; model.saveConfig() }))
+                        .padding(14)
+                }
+
                 SettingsGroup(title: "启动与显示") {
                     SettingsRow(icon: "power.circle", title: "登录时启动", subtitle: nil) {
                         Toggle("", isOn: $loginItemOn)

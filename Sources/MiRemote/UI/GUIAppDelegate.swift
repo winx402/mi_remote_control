@@ -18,6 +18,8 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var voiceProbeLabel: NSTextField?
     private var voiceProbeRunning = false
     private var voiceProbeGeneration: UInt64 = 0
+    private let dockNavigation = DockNavigationController()
+    private var dockReturnApplication: NSRunningApplication?
 
     init(uiPreview: Bool) {
         self.uiPreview = uiPreview
@@ -31,6 +33,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
             source.setEventHandler { [weak self] in
+                self?.dockNavigation.close()
                 self?.services?.stop()
                 NSApp.terminate(nil)
             }
@@ -56,17 +59,29 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let center = OverlayCenter(model: model, services: services)
         overlayCenter = center
         center.onOpenSettings = { [weak self] in self?.showWindow() }
+        dockNavigation.onActiveChanged = { [weak self, weak center] active in
+            center?.noteDockNavigation(active)
+            self?.model.dockNavigationStatus = active ? "正在打开 Dock…" : "已退出 Dock 选择"
+        }
+        dockNavigation.onSelectionChanged = { [weak self] name in
+            self?.model.dockNavigationStatus = "正在选择：\(name)"
+        }
+        dockNavigation.onUnavailable = { [weak self] text in
+            self?.model.dockNavigationStatus = text
+            CodexNavigation.showNotice(text)
+        }
         model.onMouseStatus = { [weak center] text in center?.updateMouseStatus(text: text) }
-        CodexNavigation.onUnavailable = { [weak center] name, message in
+        CodexNavigation.onUnavailable = { [weak self, weak center] name, message in
             if name == "codex_previous_chat" || name == "codex_next_chat" {
+                self?.dockNavigation.close()
                 center?.ensureOpen("codex_sessions")
             } else {
                 CodexNavigation.showNotice(message)
             }
         }
-        ActionRunner.onOverlay = { name in
+        ActionRunner.onOverlay = { [weak self] name in
             // ActionRunner 已切主线程投递
-            MainActor.assumeIsolated { center.open(name) }
+            MainActor.assumeIsolated { self?.openOverlay(name) }
         }
 
         // 服务事件 → 主线程 → AppModel
@@ -106,6 +121,12 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   action: #selector(showCodexSessions), keyEquivalent: "")
         sessions.target = self
         appMenu.addItem(sessions)
+        let systemMenu = NSMenuItem(title: "系统功能菜单…", action: #selector(showSystemMenu), keyEquivalent: "")
+        systemMenu.target = self
+        appMenu.addItem(systemMenu)
+        let dockMenu = NSMenuItem(title: "Dock 应用选择…", action: #selector(showDockPicker), keyEquivalent: "")
+        dockMenu.target = self
+        appMenu.addItem(dockMenu)
         let probe = NSMenuItem(title: "验证遥控器连续收音…",
                                action: #selector(startVoiceProbe), keyEquivalent: "")
         probe.target = self
@@ -145,13 +166,28 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        dockNavigation.close()
         services?.bridge.cancelVoiceContinuityProbe()
         // 退出前清理：恢复 hidutil 中转、断开语音链路（AppServices.stop 幂等）。
         services?.stop()
     }
 
     @objc private func showCodexSessions() {
-        overlayCenter?.open("codex_sessions")
+        openOverlay("codex_sessions")
+    }
+
+    @objc private func showSystemMenu() { openOverlay("system_menu") }
+    @objc private func showDockPicker() { openOverlay("dock_picker") }
+
+    private func openOverlay(_ name: String) {
+        if name == "dock_picker" {
+            overlayCenter?.close()
+            if !dockNavigation.isActive { dockReturnApplication = NSWorkspace.shared.frontmostApplication }
+            dockNavigation.toggle()
+        } else {
+            dockNavigation.close()
+            overlayCenter?.open(name)
+        }
     }
 
     @objc private func startVoiceProbe() {
@@ -283,7 +319,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let healthConnection = services.voiceApp.onConnection
         services.voiceApp.onConnection = { [weak self] ok, name in
             healthConnection?(ok, name)
-            DispatchQueue.main.async { self?.model.noteConnection(ok, name: name) }
+            DispatchQueue.main.async {
+                self?.model.noteConnection(ok, name: name)
+                if !ok { self?.dockNavigation.close() }
+            }
         }
         services.voiceApp.onVoiceActive = { [weak self] active in
             DispatchQueue.main.async { self?.model.noteVoice(active) }
@@ -314,6 +353,19 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // keys 链路的钩子要等 start() 建好 keyMapper 才能挂——start 是同步的，这里延后一拍挂。
         DispatchQueue.main.async { [weak self] in
             guard let self, let km = services.keyMapper, let filter = services.hidFilter else { return }
+            self.dockNavigation.engine = km.engine
+            let previousSuspend = km.engine.onSuspendChanged
+            km.engine.onSuspendChanged = { [weak self] suspended in
+                previousSuspend?(suspended)
+                if suspended { DispatchQueue.main.async { self?.dockNavigation.close() } }
+            }
+            if let hid = services.hidEngine {
+                let previousRemoved = hid.onDeviceRemoved
+                hid.onDeviceRemoved = { [weak self] in
+                    previousRemoved?()
+                    DispatchQueue.main.async { self?.dockNavigation.close() }
+                }
+            }
             km.onLayerChanged = { [weak self] layer in
                 DispatchQueue.main.async {
                     self?.model.noteLayer(layer)
@@ -324,6 +376,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // UI 侧同步收掉全部浮层/HUD（角标随 onLayerChanged 归零自动消失）。
             km.engine.onEscapeHatch = { [weak self] in
                 MainActor.assumeIsolated {
+                    self?.dockNavigation.close()
                     if self?.voiceProbeRunning == true { self?.cancelVoiceProbe() }
                     self?.overlayCenter?.escapeHatch()
                 }
@@ -332,20 +385,28 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     switch action {
-                    case .overlay(let name): self.overlayCenter?.open(name)
+                    case .overlay(let name): self.openOverlay(name)
                     case .mouseMode:
+                        self.dockNavigation.close()
                         self.overlayCenter?.close()
                         MouseMode.shared.toggle()
                     case .system("quit_app"):
                         // Capture the foreground application before closing panels.
-                        ActionRunner().run(action)
+                        if self.dockNavigation.isActive {
+                            let target = self.dockReturnApplication
+                            self.dockNavigation.close()
+                            WorkspaceActions.requestQuit(target)
+                        } else { ActionRunner().run(action) }
                         self.overlayCenter?.close()
                         MouseMode.shared.deactivate()
-                    case .openApp, .system("app_mru_back"):
+                    case .openApp, .system("app_mru_back"), .system("show_desktop"):
+                        self.dockNavigation.close()
                         self.overlayCenter?.close()
                         MouseMode.shared.deactivate()
                         ActionRunner().run(action)
-                    default: ActionRunner().run(action)
+                    default:
+                        self.dockNavigation.close()
+                        ActionRunner().run(action)
                     }
                 }
             }

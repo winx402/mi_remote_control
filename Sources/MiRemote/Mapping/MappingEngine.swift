@@ -109,6 +109,7 @@ final class MappingEngine: @unchecked Sendable {
     /// 浮层键捕获（M5 v2「UI 模态路由」）：非 nil 时按键事件不走动作分发，
     /// 经 mainDispatch 投递到主线程交给浮层处理；浮层关闭（置 nil）即恢复。
     private var overlayHandler: ((ButtonEvent) -> Void)?
+    private var immediateOverlayDirections = false
 
     // MARK: - 全局逃生键（P2：模式迷路兜底）
 
@@ -287,10 +288,11 @@ final class MappingEngine: @unchecked Sendable {
 
     /// M5 v2 浮层键捕获：handler 非 nil 时所有遥控键改喂浮层（主线程回调），
     /// 置 nil 恢复正常动作分发。切换时复位输入运行态（清在途定时器/相位，防卡键）。
-    func setOverlayCapture(_ handler: ((ButtonEvent) -> Void)?) {
+    func setOverlayCapture(_ handler: ((ButtonEvent) -> Void)?, immediateDirections: Bool = false) {
         dispatch { [weak self] in
             guard let self else { return }
             self.overlayHandler = handler
+            self.immediateOverlayDirections = handler != nil && immediateDirections
             self._resetInputState(handler != nil ? "浮层打开" : "浮层关闭")
         }
     }
@@ -422,6 +424,10 @@ final class MappingEngine: @unchecked Sendable {
 
     private func handleIndependent(_ event: ButtonEvent) {
         let key = event.key
+        if immediateOverlayDirections, isDirection(key), let overlayHandler {
+            mainDispatch { overlayHandler(event) }
+            return
+        }
         // 左右双击在 App、浮层和鼠标之前决断；上下继续走原分流与即时方向路由。
         if let action = reservedDirectionAction(key) {
             reservedDirectionGestures.handle(event) { reservedDirectionRoute(key, double: action) }
@@ -628,7 +634,7 @@ final class MappingEngine: @unchecked Sendable {
         guard action != .none else { return }
         switch action {
         case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
-             .system("space_left"), .system("space_right"), .system("quit_app"):
+             .system("space_left"), .system("space_right"), .system("show_desktop"), .system("quit_app"):
             reservedDirectionGestures.reset()
             CodexNavigation.cancelScrolling()
         default: break
@@ -636,7 +642,7 @@ final class MappingEngine: @unchecked Sendable {
         switch action {
         case .overlay, .openApp, .system("app_mru_back"):
             MouseMode.shared.deactivate()
-        case .keyStroke, .system("space_left"), .system("space_right"), .system("quit_app"):
+        case .keyStroke, .system("space_left"), .system("space_right"), .system("show_desktop"), .system("quit_app"):
             reservedMouseDeactivate()
         default: break
         }
@@ -1108,6 +1114,15 @@ extension MappingEngine {
         clock.advance(500)
         expect(newCaptured.isEmpty, "上下文变化作废尚未决断的单击")
         engine.setOverlayCapture(nil)
+
+        captured.removeAll()
+        engine.setOverlayCapture({ captured.append($0) }, immediateDirections: true)
+        twice(.left)
+        expect(captured.map(\.isDown) == [true, false, true, false] && takeActions().isEmpty,
+               "Dock选择模式四向即时选择，快速连按不触发全局左右双击")
+        engine.setOverlayCapture(nil)
+        twice(.right); clock.advance(500)
+        expect(takeActions() == [doubleRight], "退出Dock选择模式恢复全局左右双击")
 
         // 假鼠标出口验证持续按住和释放，绝不激活 MouseMode.shared 或发送 CG 输入。
         mouseActive = true

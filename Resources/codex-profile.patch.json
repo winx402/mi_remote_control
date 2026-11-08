@@ -15,8 +15,8 @@
     },
     "home": {
       "double": {
-        "type": "overlay",
-        "value": "window_picker"
+        "type": "system",
+        "value": "show_desktop"
       }
     },
     "menu": {
@@ -25,7 +25,8 @@
         "value": "system_menu"
       },
       "hold": {
-        "type": "mouse_mode"
+        "type": "overlay",
+        "value": "dock_picker"
       }
     },
     "tv": {

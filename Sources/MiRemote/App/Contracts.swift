@@ -232,6 +232,9 @@ struct MappingConfig: Codable {
     var voiceProfiles: [String: VoiceTriggerRule]? = nil
     /// 独立于 App profile 的保留手势；存在时启用新版路由，旧配置保持原语义。
     var globalShortcuts: [String: KeyBinding]? = nil
+    /// System menu application shortcuts. nil follows pinned Dock applications;
+    /// an empty array hides the section. Device-specific choices stay local.
+    var menuFavoriteApps: [String]? = nil
 }
 
 /// 动作执行器（ActionRunner 实现；MappingEngine 调用）

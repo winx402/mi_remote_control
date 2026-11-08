@@ -48,6 +48,17 @@ while let argument = args.first {
         }
         print("配置 JSON 验证通过")
         exit(0)
+    case "--render-system-menu":
+        guard !args.isEmpty else { exit(2) }
+        let url = URL(fileURLWithPath: args.removeFirst())
+        do {
+            try MainActor.assumeIsolated { try SystemMenuPreview.render(to: url) }
+            print("菜单预览已保存")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("菜单预览失败: \(error.localizedDescription)\n".data(using: .utf8)!)
+            exit(1)
+        }
     case "--doctor":
         // 体检是 standalone 只读 + 残留清理；但有活实例时 hidutil 中转映射正在使用，
         // 不是残留——探测到活实例就跳过清理，绝不把在用的映射当残留清掉。
@@ -170,6 +181,7 @@ while let argument = args.first {
         print("         [--keys] [--config <path>] [--doubao] [--run-action '<action json>']")
         print("         [--doctor] [--login-item on|off|status] [--claude-hooks install|uninstall|status]")
         print("         [--print-default-config] [--validate-config <path>]")
+        print("         [--render-system-menu <png-path>]（离屏渲染，不启动遥控服务）")
         exit(0)
     default:
         FileHandle.standardError.write("未知参数: \(argument)\n".data(using: .utf8)!)

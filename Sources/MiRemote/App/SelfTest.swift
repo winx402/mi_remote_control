@@ -247,6 +247,7 @@ enum SelfTest {
         expect(MouseMode.selfCheck(), "鼠标快慢档、滚动、锁定拖拽及闲置释放")
         expect(ActionRunner.selfCheck(), "ActionRunner 键表/修饰位自测")
         expect(WorkspaceActions.selfCheck(), "WorkspaceActions 工作区动作目录自测")
+        expect(DockNavigationController.selfCheck(), "真实Dock四向选择、沿轴发键与取消代次")
         expect(Set(KeyRemapper.table.map(\.key)).isSuperset(of: [.volUp, .volDown]),
                "音量键进入映射引擎（基础音量 / AI 数字 2、3）")
 

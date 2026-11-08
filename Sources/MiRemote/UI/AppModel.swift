@@ -163,6 +163,7 @@ enum ActionSummary {
     static let overlayNames: [(value: String, display: String)] = [
         ("window_picker", "窗口选择器浮层"),
         ("system_menu", "系统功能菜单浮层"),
+        ("dock_picker", "Dock 应用选择"),
         ("tutorial", "按键教程浮层"),
         ("app_wheel", "App 轮盘（最近使用）"),
         ("open_settings", "打开 MiRemote 设置"),
@@ -243,6 +244,7 @@ final class AppModel: ObservableObject {
     @Published var remoteSuspended = false
     /// 最近一次按下的遥控键（「按下即亮」回显），nil=无
     @Published var lastPressedKey: RemoteKey?
+    @Published var dockNavigationStatus = "尚未开启 Dock 选择"
     /// inline「已保存」微提示（自增触发）
     @Published var savedTick = 0
 

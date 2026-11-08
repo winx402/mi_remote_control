@@ -196,7 +196,11 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
         switch name {
         case "tv_volume_up": runTelevision(.volumeUp)
         case "tv_volume_down": runTelevision(.volumeDown)
-        case "tv_off": runTelevision(.sleep)
+        case "tv_standby": runTelevision(.sleep)
+        case "tv_wake": runTelevision(.wake)
+        case "tv_off":
+            Self.televisionOperations.withLock { $0.failures += 1 }
+            log("真正关机尚未接入；电视待机请使用 tv_standby。")
         case "volume_up":   aux(NX_KEYTYPE_SOUND_UP)
         case "volume_down": aux(NX_KEYTYPE_SOUND_DOWN)
         case "mute":        aux(NX_KEYTYPE_MUTE)

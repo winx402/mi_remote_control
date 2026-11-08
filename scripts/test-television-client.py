@@ -110,9 +110,13 @@ def main():
         root = Path(directory)
         scenario(args.binary, root, base_config, "status")
         scenario(args.binary, root, base_config, "volume-down", 25)
-        scenario(args.binary, root, base_config, "off", 223)
+        scenario(args.binary, root, base_config, "standby", 223)
+        scenario(args.binary, root, base_config, "wake", 224)
         scenario(args.binary, root, base_config, "volume-down", 25, partial=True)
         scenario(args.binary, root, base_config, "volume-down", 25, generic=True)
+        rejected = subprocess.run([str(args.binary), "--tv", "off"], capture_output=True, text=True, timeout=3)
+        assert rejected.returncode != 0 and "尚未接入" in rejected.stdout
+        print("PASS true shutdown is not aliased to standby")
 
 
 if __name__ == "__main__":

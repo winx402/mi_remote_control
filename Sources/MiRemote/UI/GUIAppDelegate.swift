@@ -213,14 +213,14 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func openOverlay(_ name: String) {
+    private func openOverlay(_ name: String, wakeTelevision: Bool = false) {
         if name == "dock_picker" {
             overlayCenter?.close()
             if !dockNavigation.isActive { dockReturnApplication = NSWorkspace.shared.frontmostApplication }
             dockNavigation.toggle()
         } else {
             dockNavigation.close()
-            overlayCenter?.open(name)
+            overlayCenter?.open(name, wakeTelevision: wakeTelevision)
         }
     }
 
@@ -461,7 +461,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     default: break
                     }
                     switch action {
-                    case .overlay(let name): self.openOverlay(name)
+                    case .overlay(let name): self.openOverlay(name, wakeTelevision: name == "computer_power")
                     case .mouseMode:
                         self.dockNavigation.close()
                         self.overlayCenter?.close()

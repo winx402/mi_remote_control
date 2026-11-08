@@ -75,6 +75,8 @@ enum ComputerPower {
 struct PowerMenuState {
     enum Command: Sendable, Equatable {
         case computer(ComputerPower.Request)
+        case tvWake
+        case tvStandby
         case tvOff
         case tvVolumeUp
         case tvVolumeDown
@@ -118,6 +120,25 @@ struct PowerMenuState {
         static let cancel = Choice(id: "cancel", title: "取消", symbol: "xmark", section: "")
     }
 
+    /// 同名分类合并，按首次出现顺序排列；取消独立于分类。
+    struct Section: Identifiable, Sendable, Equatable {
+        var id: String { title }
+        let title: String
+        var choices: [Choice]
+    }
+
+    var sections: [Section] {
+        var result: [Section] = []
+        for choice in choices where choice.id != Choice.cancel.id {
+            if let index = result.firstIndex(where: { $0.title == choice.section }) {
+                result[index].choices.append(choice)
+            } else {
+                result.append(Section(title: choice.section, choices: [choice]))
+            }
+        }
+        return result
+    }
+
     enum Effect: Equatable {
         case none
         case dismiss
@@ -130,12 +151,16 @@ struct PowerMenuState {
     private(set) var isExecuting = false
     private(set) var error: String?
     private var executingCommand: Command?
+    private var rememberedColumns: [String: Int] = [:]
+    private var preferredColumn = 0
 
     /// 保留调用方顺序，去重稳定 ID；取消始终可用且位于最后。
     mutating func open(choices: [Choice] = [.sleep, .shutDown, .cancel]) {
         var ids: Set<String> = [Choice.cancel.id]
         self.choices = choices.filter { ids.insert($0.id).inserted } + [.cancel]
         selection = .cancel
+        rememberedColumns = [:]
+        preferredColumn = 0
         isOpen = true
         isExecuting = false
         executingCommand = nil
@@ -157,8 +182,11 @@ struct PowerMenuState {
         }
         guard !isExecuting else { return .none }
         switch key {
-        case .up, .down, .left, .right:
-            moveSelection(by: key == .up || key == .left ? -1 : 1)
+        case .up, .down:
+            moveSection(by: key == .up ? -1 : 1)
+            return .none
+        case .left, .right:
+            moveColumn(by: key == .left ? -1 : 1)
             return .none
         case .ok:
             return activateSelection()
@@ -172,17 +200,56 @@ struct PowerMenuState {
         guard isOpen, !isExecuting,
               let current = choices.first(where: { $0.id == choice.id }),
               !current.disabled else { return .none }
-        selection = current
+        updateSelection(current)
         return activateSelection()
     }
 
-    private mutating func moveSelection(by delta: Int) {
-        guard let index = choices.firstIndex(where: { $0.id == selection.id }) else { return }
-        var next = index + delta
-        while choices.indices.contains(next) {
-            if !choices[next].disabled {
-                selection = choices[next]
-                error = nil
+    private mutating func updateSelection(_ choice: Choice) {
+        selection = choice
+        error = nil
+        if let section = sections.first(where: { $0.id == choice.section }),
+           let column = section.choices.firstIndex(where: { $0.id == choice.id }) {
+            rememberedColumns[section.id] = column
+            preferredColumn = column
+        }
+    }
+
+    private mutating func moveColumn(by delta: Int) {
+        guard selection.id != Choice.cancel.id,
+              let section = sections.first(where: { $0.id == selection.section }),
+              let column = section.choices.firstIndex(where: { $0.id == selection.id }) else { return }
+        var next = column + delta
+        while section.choices.indices.contains(next) {
+            if !section.choices[next].disabled {
+                updateSelection(section.choices[next])
+                return
+            }
+            next += delta
+        }
+    }
+
+    private mutating func moveSection(by delta: Int) {
+        let groups = sections
+        let current = selection.id == Choice.cancel.id
+            ? groups.count : groups.firstIndex(where: { $0.id == selection.section })
+        guard let current else { return }
+        var next = current + delta
+        while (0...groups.count).contains(next) {
+            if next == groups.count {
+                updateSelection(.cancel)
+                return
+            }
+            let section = groups[next]
+            let column = min(rememberedColumns[section.id] ?? preferredColumn,
+                             section.choices.count - 1)
+            // 分类中的禁用项不可选；优先靠近原列，等距时选择左侧。
+            if let enabled = section.choices.indices.filter({ !section.choices[$0].disabled })
+                .min(by: { left, right in
+                    let leftDistance = abs(left - column)
+                    let rightDistance = abs(right - column)
+                    return leftDistance == rightDistance ? left < right : leftDistance < rightDistance
+                }) {
+                updateSelection(section.choices[enabled])
                 return
             }
             next += delta
@@ -217,61 +284,86 @@ struct PowerMenuState {
         }
     }
 
-    /// 仅验证值与状态转移，不调用执行器、NSAppleScript 或任何真实设备 API。
+    /// 仅验证二维导航与执行闸门，不调用执行器或真实设备 API。
     static func selfCheck() -> Bool {
-        let volume = Choice(id: "tv.volumeUp", title: "电视音量 +", symbol: "speaker.plus",
-                            section: "小米电视", command: .tvVolumeUp)
-        let unavailable = Choice(id: "tv.off", title: "关闭小米电视（待机）", symbol: "power",
-                                 section: "小米电视", command: .tvOff, disabled: true)
-        let app = Choice(id: "app.example", title: "关闭示例 App", symbol: "app",
-                         section: "应用", command: .quitApp(bundleID: "com.example.app"))
+        let wake = Choice(id: "tv.wake", title: "开机", symbol: "power", section: "电视", command: .tvWake)
+        let standby = Choice(id: "tv.standby", title: "待机", symbol: "moon", section: "电视", command: .tvStandby)
+        let off = Choice(id: "tv.off", title: "关机", symbol: "power", section: "电视", command: .tvOff, disabled: true)
+        let volume = Choice(id: "tv.volume", title: "音量 +", symbol: "speaker.plus", section: "电视", command: .tvVolumeUp)
+        let app = Choice(id: "app.example", title: "退出应用", symbol: "app", section: "应用", command: .quitCurrentApp)
+        let unavailable = Choice(id: "disabled", title: "不可用", symbol: "xmark", section: "不可用", disabled: true)
         var state = PowerMenuState()
         state.open()
-        guard state.selection == .cancel, state.handle(.ok) == .dismiss,
-              !state.isOpen else { return false }
+        guard state.selection == .cancel, state.handle(.left) == .none,
+              state.selection == .cancel, state.handle(.ok) == .dismiss, !state.isOpen else { return false }
         for key in [RemoteKey.back, .power, .home, .tv] {
             state.open()
-            guard state.handle(.up) == .none, state.selection == .shutDown,
+            guard state.handle(.up) == .none, state.selection == .sleep,
                   state.handle(key) == .dismiss, !state.isOpen else { return false }
         }
-        state.open(choices: [volume, unavailable, .sleep, app, volume])
-        guard state.choices == [volume, unavailable, .sleep, app, .cancel],
-              state.selection == .cancel, state.select(unavailable) == .none,
-              state.selection == .cancel else { return false }
-        for expected in [app, .sleep, volume, volume] {
-            guard state.handle(.up) == .none, state.selection == expected,
-                  !state.isExecuting else { return false }
-        }
-        guard state.handle(.right) == .none, state.selection == .sleep,
-              state.handle(.left) == .none, state.selection == volume,
-              state.handle(.ok) == .execute(.tvVolumeUp), state.isExecuting,
-              state.handle(.ok) == .none, state.select(app) == .none,
+        // 分类按首次出现排序，非相邻同名项合并；重复 ID 去重。
+        state.open(choices: [wake, .sleep, standby, off, volume, .shutDown, unavailable, app, volume])
+        guard state.choices.count == 9,
+              state.sections.map(\.title) == ["电视", "这台 Mac", "不可用", "应用"],
+              state.sections[0].choices == [wake, standby, off, volume],
+              state.select(off) == .none, state.selection == .cancel else { return false }
+        // 上下切分类，跳过整行禁用；左右仅在当前分类，边界不串行。
+        guard state.handle(.up) == .none, state.selection == app,
+              state.handle(.right) == .none, state.selection == app,
+              state.handle(.up) == .none, state.selection == .sleep,
+              state.handle(.right) == .none, state.selection == .shutDown,
+              state.handle(.up) == .none, state.selection == standby,
+              state.handle(.right) == .none, state.selection == volume,
+              state.handle(.right) == .none, state.selection == volume,
+              state.handle(.up) == .none, state.selection == volume,
+              state.handle(.down) == .none, state.selection == .shutDown,
+              state.handle(.left) == .none, state.selection == .sleep,
+              state.handle(.up) == .none, state.selection == volume else { return false }
+        // 已访问分类记忆自己的列；首次进入较短分类按当前列收敛。
+        state.open(choices: [wake, standby, off, volume, .sleep, .shutDown])
+        guard state.handle(.up) == .none, state.selection == .sleep,
+              state.handle(.up) == .none, state.selection == wake,
+              state.handle(.right) == .none, state.selection == standby,
+              state.handle(.right) == .none, state.selection == volume,
+              state.handle(.down) == .none, state.selection == .sleep,
+              state.handle(.down) == .none, state.selection == .cancel,
+              state.handle(.right) == .none, state.selection == .cancel,
+              state.handle(.up) == .none, state.selection == .sleep,
+              state.handle(.up) == .none, state.selection == volume else { return false }
+        // 新分类尚无列记忆：从电视最右列向下，Mac 收敛至最后一列。
+        state.open(choices: [wake, standby, off, volume, .sleep, .shutDown])
+        guard state.select(volume) == .execute(.tvVolumeUp),
+              state.handle(.ok) == .none, state.select(.sleep) == .none,
               state.handle(.down) == .none, state.selection == volume,
               state.complete(.success(())) == .none, state.isOpen,
-              !state.isExecuting, state.selection == volume,
+              state.handle(.down) == .none, state.selection == .shutDown,
+              state.handle(.up) == .none, state.selection == volume,
               state.handle(.ok) == .execute(.tvVolumeUp),
               state.complete(.failure(.message("电视未响应"))) == .none,
-              state.isOpen, state.selection == .cancel,
-              state.error == "电视未响应",
-              state.complete(.success(())) == .none,
-              state.error == "电视未响应" else { return false }
-        for choice in [Choice.sleep, .shutDown, app,
-                       Choice(id: "tv.off", title: "待机", symbol: "power",
-                              section: "小米电视", command: .tvOff)] {
+              state.isOpen, state.selection == .cancel, state.error == "电视未响应",
+              state.complete(.success(())) == .none, state.error == "电视未响应" else { return false }
+        // 上下落到禁用列时选择最近可用项，等距偏左；执行中返回仍可关闭。
+        state.open(choices: [wake, off, volume, .sleep, .shutDown])
+        guard state.handle(.up) == .none, state.selection == .sleep,
+              state.handle(.right) == .none, state.selection == .shutDown,
+              state.handle(.up) == .none, state.selection == wake,
+              state.handle(.ok) == .execute(.tvWake),
+              state.handle(.back) == .dismiss, !state.isOpen,
+              state.complete(.success(())) == .none else { return false }
+        for choice in [Choice.sleep, .shutDown, app, wake, standby,
+                       Choice(id: "tv.off.enabled", title: "关机", symbol: "power", section: "电视", command: .tvOff)] {
             state.open(choices: [choice])
             guard state.handle(.up) == .none, state.selection == choice,
                   let command = choice.command,
-                  state.handle(.ok) == .execute(command),
+                  state.handle(.ok) == .execute(command), state.isExecuting,
                   state.handle(.ok) == .none,
-                  state.complete(.success(())) == .dismiss,
-                  !state.isOpen, state.handle(.ok) == .none else { return false }
+                  state.complete(.success(())) == .dismiss, !state.isOpen else { return false }
         }
         state.open(choices: [unavailable])
         guard state.handle(.up) == .none, state.selection == .cancel,
-              state.select(Choice.sleep) == .none,
-              state.handle(.ok) == .dismiss else { return false }
+              state.select(.sleep) == .none, state.handle(.ok) == .dismiss else { return false }
         state.open(choices: [])
-        return state.choices == [.cancel] && state.selection == .cancel
-            && state.handle(.ok) == .dismiss
+        return state.sections.isEmpty && state.choices == [.cancel]
+            && state.selection == .cancel && state.handle(.ok) == .dismiss
     }
 }

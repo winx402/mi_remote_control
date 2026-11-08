@@ -36,7 +36,7 @@ struct TelevisionSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
-                Text("“关闭小米电视”使电视待机，不会关闭 Mac。")
+                Text("电源键会先尝试唤醒电视，再打开面板；电视关机与待机是独立功能。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

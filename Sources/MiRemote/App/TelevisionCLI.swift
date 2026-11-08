@@ -7,10 +7,14 @@ enum TelevisionCLI {
 
     static func run(_ arguments: [String]) -> Int32 {
         guard let verb = arguments.first,
-              ["status", "volume-up", "volume-down", "off"].contains(verb),
+              ["status", "volume-up", "volume-down", "standby", "wake", "off"].contains(verb),
               arguments.count == 1 || (arguments.count == 3 && arguments[1] == "--config") else {
-            print("用法：miremote --tv status|volume-up|volume-down|off [--config 路径]")
+            print("用法：miremote --tv status|volume-up|volume-down|standby|wake [--config 路径]")
             return 2
+        }
+        guard verb != "off" else {
+            print("真正关机尚未接入；待机请使用 --tv standby，唤醒请使用 --tv wake。")
+            return 1
         }
         let path = arguments.count == 3 ? arguments[2] : nil
         let client = XiaomiTVController.shared
@@ -23,7 +27,8 @@ enum TelevisionCLI {
         if verb == "status" {
             client.checkConnection { completion.result = $0 }
         } else {
-            let command: XiaomiTVCommand = verb == "volume-up" ? .volumeUp : verb == "volume-down" ? .volumeDown : .sleep
+            let command: XiaomiTVCommand = verb == "volume-up" ? .volumeUp : verb == "volume-down" ? .volumeDown
+                : verb == "wake" ? .wake : .sleep
             client.perform(command) { completion.result = $0 }
         }
         let keepAlive = Timer(timeInterval: 0.05, repeats: true) { _ in }

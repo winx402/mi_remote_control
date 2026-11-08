@@ -58,6 +58,7 @@ enum XiaomiTVCommand: String, Sendable {
     case volumeUp
     case volumeDown
     case sleep
+    case wake
 
     fileprivate var keyCode: Int32 {
         switch self {
@@ -65,6 +66,8 @@ enum XiaomiTVCommand: String, Sendable {
         case .volumeDown: return 25
         // Android KEYCODE_SLEEP is a no-op when already asleep. Never substitute POWER (26).
         case .sleep: return 223
+        // KEYCODE_WAKEUP never toggles an already-awake TV back to sleep.
+        case .wake: return 224
         }
     }
 
@@ -73,6 +76,7 @@ enum XiaomiTVCommand: String, Sendable {
         case .volumeUp: return "电视音量增加"
         case .volumeDown: return "电视音量降低"
         case .sleep: return "电视休眠"
+        case .wake: return "电视唤醒"
         }
     }
 }
@@ -533,6 +537,10 @@ private enum XiaomiTVProtocol {
             try require(keyPair(command: .sleep, downID: 0x01020304, upID: 0x01020305).bytes == down + up)
             try require(XiaomiTVCommand.volumeUp.keyCode == 24 && XiaomiTVCommand.volumeDown.keyCode == 25)
             try require(XiaomiTVCommand.sleep.keyCode == 223 && XiaomiTVCommand.sleep.keyCode != 26)
+            var goldenWake = golden
+            goldenWake[24] = 0xe0
+            try require(keyFrame(command: .wake, action: 0, id: 0x01020304) == Data(goldenWake)
+                && XiaomiTVCommand.wake.keyCode == 224)
 
             var parser = Acknowledgements(expectedIDs: [1, 2])
             let unrelated = response(99) + response(1, code: 1) + frame(type: 2, payload: Data())

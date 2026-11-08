@@ -187,7 +187,7 @@ while let argument = args.first {
         print("miremote --ui-preview        GUI 但不启动引擎（开发验证）")
         print("miremote [--list-audio-devices] [--output <name>] [--wav <path>] [--gain <dB>] [--verbose]")
         print("         [--keys] [--config <path>] [--doubao] [--run-action '<action json>']")
-        print("         --tv status|volume-up|volume-down|off [--config <path>]")
+        print("         --tv status|volume-up|volume-down|standby|wake [--config <path>]")
         print("         [--doctor] [--login-item on|off|status] [--claude-hooks install|uninstall|status]")
         print("         [--print-default-config] [--validate-config <path>]")
         print("         [--render-system-menu <png-path>]（离屏渲染，不启动遥控服务）")

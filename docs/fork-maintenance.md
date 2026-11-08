@@ -44,13 +44,15 @@ open /Applications/MiRemote.app
 | 音量（按住连续调节） | 音量＋／－ |
 | 电视、Mac 与应用操作面板 | 电源单击 |
 
-电源面板按“小米电视／这台 Mac／应用”分组，提供电视音量、电视待机、Mac 休眠／关机、退出当前 App、退出抖音及取消。选项采用数据目录，后续可追加能力；默认选中取消，打开、移动或返回不执行操作。OK 或鼠标点击明确选项才执行，电视操作不会回落到 Mac 电源动作。Mac 仍走正常 System Events 电源流程，不使用强制关机；首次实际执行可能要求自动化授权。应用退出使用打开面板前捕获的目标并保留保存／取消流程，不强杀进程。音量成功后保留面板，其余成功后关闭；错误回到取消并保留反馈。
+电源面板按“小米电视／这台 Mac／应用”分组，同类按钮横排，上下切分类、左右在类内选按钮，保留各类上次列并跳过不可用项。提供电视唤醒、待机、音量、Mac 休眠／关机、退出当前 App、退出抖音及取消。选项采用数据目录，后续可追加能力；默认选中取消。OK 或鼠标点击明确选项才执行，电视操作不会回落到 Mac 电源动作。面板方向优先于全局左右长按，避免选项时切桌面。Mac 仍走正常 System Events 电源流程，不使用强制关机；首次实际执行可能要求自动化授权。应用退出使用打开面板前捕获的目标并保留保存／取消流程，不强杀进程。音量成功后保留面板，其余成功后关闭；错误回到取消并保留反馈。
 
 ### 小米电视联动
 
 “通用 → 小米电视”保存本机专属的 `television` 配置（enabled、局域网 IPv4 host、port，默认 6091），未配置时不连接电视。可选择遥控器音量键控制小米电视或 Mac；电视未连接时不把电视指令误发为 Mac 音量或关机。本机地址不进入源预设与仓库。连接检查仅验证服务 TCP 可达，不代表电视屏幕正在开启。
 
-采用 MiLink 本地协议，音量使用 Android KeyCode 24／25，关闭电视使用明确的 `KEYCODE_SLEEP` 223，使电视待机，已待机时不唤醒；不使用开关切换键 26。该能力不等于断电或开机。每次命令成对发送 DOWN／UP，等待两条匹配确认后才报告送达；入队起 4 秒限时、最多 8 个请求、配置变化会取消旧目标，模糊失败不自动重发。实际待机效果仍需电视实机验收，不能以 TCP 可达或 ACK 代替。
+采用 MiLink 本地协议，音量使用 Android KeyCode 24／25；明确命名的“待机”使用 `KEYCODE_SLEEP` 223，唤醒使用 `KEYCODE_WAKEUP` 224（已醒时无作用），不使用开关切换键 26。遥控器电源键尝试一次224，已开机时不关机；面板已打开时再次电源仍尝试唤醒并收起面板，覆盖电视在面板打开期间被其他遥控器待机的情况。菜单栏打开面板不会主动唤醒电视。每次命令成对发送 DOWN／UP，等待两条匹配确认后才报告送达；入队起 4 秒限时、最多 8 个请求、配置变化会取消旧目标，模糊失败不自动重发。不能以 TCP 可达或 ACK 判断屏幕是否亮着。
+
+真正关机与待机已经分开：本轮用户选择先验证待机唤醒，真关机入口暂不可用，`tv_off`/`--tv off`明确失败，不再发送待机。后续可验证电视原生电源菜单；真关机后如果网络服务停止，224无法送达，能否网络开机要单独实测 WOL/CEC/IR 等恢复通路，不能以记录的上次操作假装当前电源状态。
 
 脚本入口不启动 GUI、蓝牙或按键映射，可以和 GUI 并行。示例中的配置来自本机，不在命令行重复暴露地址：
 
@@ -58,11 +60,12 @@ open /Applications/MiRemote.app
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv status
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv volume-up
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv volume-down
-/Applications/MiRemote.app/Contents/MacOS/miremote --tv off
+/Applications/MiRemote.app/Contents/MacOS/miremote --tv standby
+/Applications/MiRemote.app/Contents/MacOS/miremote --tv wake
 python3 scripts/test-television-client.py --binary /Applications/MiRemote.app/Contents/MacOS/miremote
 ```
 
-`--tv` 可另带 `--config 路径`；`off` 只用于电视待机，绝不关闭 Mac。loopback 测试验证真实 CLI 的成对报文、分片／乱序确认、少确认不重发、关机键码及通用 `--run-action` 的异步等待，所有测试只连接本机假电视。协议事实参考 [Mi TV Remote](https://github.com/EndLess728/MiTV-Remote) 和 [Android KeyEvent](https://developer.android.com/reference/android/view/KeyEvent#KEYCODE_SLEEP)，本项目未复制第三方客户端代码。
+`--tv` 可另带 `--config 路径`；`standby`与`wake`只作用于电视，绝不关闭 Mac。loopback 测试验证真实 CLI 的成对报文、分片／乱序确认、少确认不重发、待机/唤醒键码、拒绝把off混作待机，以及通用 `--run-action` 的异步等待，所有测试只连接本机假电视。协议事实参考 [Mi TV Remote](https://github.com/EndLess728/MiTV-Remote) 和 [Android KeyEvent](https://developer.android.com/reference/android/view/KeyEvent#KEYCODE_SLEEP)，本项目未复制第三方客户端代码。
 
 ### 其他按键
 

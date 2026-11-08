@@ -5,8 +5,12 @@ enum PowerMenuCatalog {
         typealias Item = PowerMenuState.Choice
         let unavailable = televisionConfigured ? nil : "请先在通用设置中配置电视。"
         return [
-            Item(id: "tv.off", title: "关闭小米电视", symbol: "tv", section: "小米电视",
-                 detail: unavailable ?? "让电视进入待机，Mac 继续运行。", command: .tvOff, disabled: !televisionConfigured),
+            Item(id: "tv.wake", title: "唤醒电视", symbol: "sun.max", section: "小米电视",
+                 detail: unavailable ?? "从待机恢复；电视已开启时不会把它关闭。", command: .tvWake, disabled: !televisionConfigured),
+            Item(id: "tv.standby", title: "电视待机", symbol: "moon.zzz", section: "小米电视",
+                 detail: unavailable ?? "让电视进入待机，Mac 继续运行。", command: .tvStandby, disabled: !televisionConfigured),
+            Item(id: "tv.off", title: "电视关机", symbol: "power", section: "小米电视",
+                 detail: "真正关机尚未接入；先验证待机唤醒和关机后的恢复方式。", command: .tvOff, disabled: true),
             Item(id: "tv.volumeDown", title: "电视音量 −", symbol: "speaker.wave.1", section: "小米电视",
                  detail: unavailable, command: .tvVolumeDown, disabled: !televisionConfigured),
             Item(id: "tv.volumeUp", title: "电视音量 ＋", symbol: "speaker.wave.3", section: "小米电视",
@@ -24,10 +28,12 @@ enum PowerMenuCatalog {
         let configured = choices(televisionConfigured: true, currentAppName: "测试 App", douyinRunning: true)
         let unavailable = choices(televisionConfigured: false, currentAppName: nil, douyinRunning: false)
         return Set(configured.map(\.id)).count == configured.count
-            && configured.filter { $0.section == "小米电视" }.allSatisfy { !$0.disabled }
+            && configured.filter { $0.section == "小米电视" && $0.id != "tv.off" }.allSatisfy { !$0.disabled }
             && unavailable.filter { $0.section == "小米电视" || $0.section == "应用" }.allSatisfy(\.disabled)
             && configured.contains { $0.command == .computer(.shutDown) && $0.title.contains("Mac") }
-            && configured.contains { $0.command == .tvOff && $0.title.contains("小米电视") }
+            && configured.contains { $0.command == .tvStandby && !$0.disabled }
+            && configured.contains { $0.command == .tvWake && !$0.disabled }
+            && configured.contains { $0.command == .tvOff && $0.disabled }
     }
 }
 
@@ -37,7 +43,10 @@ enum PowerMenuActions {
                         completion: @escaping @MainActor @Sendable (Result<Void, ComputerPower.Failure>) -> Void) {
         switch command {
         case .computer(let request): ComputerPower.execute(request, completion: completion)
-        case .tvOff: television(.sleep, completion: completion)
+        case .tvWake: television(.wake, completion: completion)
+        case .tvStandby: television(.sleep, completion: completion)
+        case .tvOff:
+            completion(.failure(.message("真正关机尚未接入；待机请使用“电视待机”。")))
         case .tvVolumeUp: television(.volumeUp, completion: completion)
         case .tvVolumeDown: television(.volumeDown, completion: completion)
         case .quitCurrentApp: quit(currentApplication, completion: completion)

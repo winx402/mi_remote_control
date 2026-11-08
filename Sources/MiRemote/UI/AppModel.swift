@@ -98,7 +98,7 @@ enum ActionSummary {
         ("codex_previous_chat", "Codex 上一个会话"), ("codex_next_chat", "Codex 下一个会话"),
         ("volume_up", "音量 ＋"), ("volume_down", "音量 －"), ("mute", "静音"),
         ("tv_volume_up", "小米电视音量 ＋"), ("tv_volume_down", "小米电视音量 －"),
-        ("tv_off", "关闭小米电视（待机）"),
+        ("tv_standby", "小米电视待机"), ("tv_wake", "唤醒小米电视"),
         ("play_pause", "播放/暂停"), ("next", "下一曲"), ("prev", "上一曲"),
         ("mission_control", "调度中心"), ("launchpad", "启动台"), ("spotlight", "Spotlight"),
         ("display_sleep", "显示器睡眠"), ("lock_screen", "锁屏"), ("screenshot", "截图"),

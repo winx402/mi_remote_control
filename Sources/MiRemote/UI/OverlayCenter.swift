@@ -144,6 +144,7 @@ final class OverlayUIState: ObservableObject {
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexIndex = 0
     @Published var powerMenu = PowerMenuState()
+    @Published var televisionPowerStatus: String?
 }
 
 /// 窗口选择器的菜单键三段流程：全局跨桌面 → 当前 App → 关闭。
@@ -222,6 +223,7 @@ final class OverlayCenter {
     private var codexIndex = 0
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
+    private var televisionPowerStatus: String?
     private var powerGeneration: UInt64 = 0
     /// 窗口选择/系统菜单/教程不应无限占用遥控路由；10s 无操作自动收起。
     private static let overlayIdleSeconds: TimeInterval = 10
@@ -266,7 +268,7 @@ final class OverlayCenter {
         open(name)
     }
 
-    func open(_ name: String) {
+    func open(_ name: String, wakeTelevision: Bool = false) {
         if name == "open_settings" {
             close()
             onOpenSettings?()
@@ -276,7 +278,20 @@ final class OverlayCenter {
             log("未知浮层名: \(name)")
             return
         }
-        if active == kind { close(); return }
+        if active == kind {
+            // The TV may have been put to sleep by another remote while this
+            // panel remained open. A physical power press still attempts WAKEUP.
+            if kind == .computerPower, wakeTelevision {
+                ActionRunner.configureTelevision(model?.config.television)
+                if XiaomiTVController.shared.isConfigured {
+                    XiaomiTVController.shared.perform(.wake) { [weak self] result in
+                        if case .failure(let failure) = result { self?.log("电视唤醒：\(failure.message)") }
+                    }
+                }
+            }
+            close()
+            return
+        }
         if active != nil { close() }
         if kind == .windowPicker || kind == .systemMenu || kind == .computerPower {
             MouseMode.shared.deactivate()
@@ -314,6 +329,19 @@ final class OverlayCenter {
                 .contains { !$0.isTerminated && $0.activationPolicy == .regular }
             powerMenu.open(choices: PowerMenuCatalog.choices(televisionConfigured: XiaomiTVController.shared.isConfigured,
                 currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning))
+            televisionPowerStatus = nil
+            if wakeTelevision, XiaomiTVController.shared.isConfigured {
+                televisionPowerStatus = "正在尝试唤醒电视…"
+                let token = powerGeneration
+                XiaomiTVController.shared.perform(.wake) { [weak self] result in
+                    guard let self, self.active == .computerPower, self.powerGeneration == token else { return }
+                    switch result {
+                    case .success: self.televisionPowerStatus = "唤醒指令已送达；电视已开启时保持当前状态。"
+                    case .failure(let failure): self.televisionPowerStatus = "唤醒未获确认：" + failure.message
+                    }
+                    self.sync(animated: false)
+                }
+            }
             showPanel()
         case .tutorial:
             quickLook.setVisible(true,
@@ -348,7 +376,7 @@ final class OverlayCenter {
         // 捕获遥控键：浮层期间事件不走动作分发（引擎 mainDispatch 保证主线程回调）。
         engine?.setOverlayCapture({ [weak self] event in
             MainActor.assumeIsolated { self?.handleKey(event) }
-        }, immediateDirections: kind == .systemMenu)
+        }, immediateDirections: kind == .systemMenu || kind == .computerPower)
     }
 
     func close() {
@@ -358,6 +386,7 @@ final class OverlayCenter {
         powerGeneration &+= 1
         powerMenu.close()
         powerApplication = nil
+        televisionPowerStatus = nil
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexIndex = 0
@@ -707,6 +736,7 @@ final class OverlayCenter {
             uiState.codexSnapshot = codexSnapshot
             uiState.codexIndex = codexIndex
             uiState.powerMenu = powerMenu
+            uiState.televisionPowerStatus = televisionPowerStatus
         }
         if animated {
             withAnimation(Motion.select) { apply() }
@@ -992,14 +1022,15 @@ enum HintBarCatalog {
                     Hint(keys: [.ok], text: "打开"),
                     Hint(keys: [.back, .home, .tv], text: "取消")]
         case .computerPower:
-            return [Hint(keys: [.up, .down], text: "选择"),
+            return [Hint(keys: [.up, .down], text: "切分类"),
+                    Hint(keys: [.left, .right], text: "选按钮"),
                     Hint(keys: [.ok], text: "确认"),
                     Hint(keys: [.back, .power], text: "取消")]
         }
     }
 
     static func hintsForGlobal() -> [Hint] {
-        [Hint(keys: [.left, .right], text: "双击 ⌃← / ⌃→"),
+        [Hint(keys: [.left, .right], text: "长按 ⌃← / ⌃→"),
          Hint(keys: [.home], text: "双击显示桌面"),
          Hint(keys: [.menu], text: "双击系统面板 · 长按 Dock"),
          Hint(keys: [.tv], text: "单击 Codex · 双击上个 App"),
@@ -1144,7 +1175,8 @@ private struct OverlayRootView: View {
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
                 case .computerPower:
-                    PowerMenuView(state: state.powerMenu, onSelect: onPowerSelect)
+                    PowerMenuView(state: state.powerMenu, onSelect: onPowerSelect,
+                                  televisionStatus: state.televisionPowerStatus)
                 default:
                     EmptyView()
                 }

@@ -54,11 +54,21 @@ struct XiaomiTVConfiguration: Codable, Equatable, Sendable {
     }
 }
 
-enum XiaomiTVCommand: String, Sendable {
+enum XiaomiTVCommand: String, CaseIterable, Sendable {
     case volumeUp
     case volumeDown
     case sleep
     case wake
+    /// Open the TV's own menu with a sustained POWER press; never send POWER as a short pair.
+    case powerMenu
+    case up
+    case down
+    case left
+    case right
+    case ok
+    case back
+
+    fileprivate var isVolume: Bool { self == .volumeUp || self == .volumeDown }
 
     fileprivate var keyCode: Int32 {
         switch self {
@@ -68,6 +78,13 @@ enum XiaomiTVCommand: String, Sendable {
         case .sleep: return 223
         // KEYCODE_WAKEUP never toggles an already-awake TV back to sleep.
         case .wake: return 224
+        case .powerMenu: return 26
+        case .up: return 19
+        case .down: return 20
+        case .left: return 21
+        case .right: return 22
+        case .ok: return 23
+        case .back: return 4
         }
     }
 
@@ -77,6 +94,13 @@ enum XiaomiTVCommand: String, Sendable {
         case .volumeDown: return "电视音量降低"
         case .sleep: return "电视休眠"
         case .wake: return "电视唤醒"
+        case .powerMenu: return "电视电源菜单"
+        case .up: return "电视向上"
+        case .down: return "电视向下"
+        case .left: return "电视向左"
+        case .right: return "电视向右"
+        case .ok: return "电视确认"
+        case .back: return "电视返回"
         }
     }
 }
@@ -109,7 +133,8 @@ enum XiaomiTVFailure: Error, Sendable, Equatable, LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// 单次连接发送一对 DOWN/UP，不重试；“已送达”仅表示收到对应的两条 MiLink ACK。
+/// 普通按键在单次连接合并发送 DOWN/UP；电源菜单则持续发送长按帧，不重试。
+/// “已送达”仅表示全部帧已发送并收到对应 MiLink ACK，不能据此推断电视已关机。
 @MainActor
 final class XiaomiTVController: ObservableObject {
     static let shared = XiaomiTVController()
@@ -121,26 +146,40 @@ final class XiaomiTVController: ObservableObject {
         return configuration.enabled && !configuration.host.isEmpty && configuration.validationFailure == nil
     }
 
+    var isIdle: Bool { active == nil && pending.isEmpty && cancellationDepth == 0 }
+
     private typealias Completion = @MainActor @Sendable (Result<Void, XiaomiTVFailure>) -> Void
 
     private enum Operation {
         case command(XiaomiTVCommand)
         case checkConnection
+
+        var command: XiaomiTVCommand? {
+            if case .command(let command) = self { return command }
+            return nil
+        }
     }
 
     private struct Request {
         let id = UUID()
         // Bound the whole request, including queue time, so stale button presses expire.
-        let deadline = ContinuousClock().now.advanced(by: .seconds(4))
+        let deadline: ContinuousClock.Instant
         let operation: Operation
         let completion: Completion
+
+        init(operation: Operation, completion: @escaping Completion) {
+            self.operation = operation
+            self.completion = completion
+            deadline = ContinuousClock().now.advanced(by: XiaomiTVQueuePolicy.lifetime(for: operation.command))
+        }
     }
 
     private final class Session {
         let request: Request
         let connection: NWConnection
         var timeout: Task<Void, Never>?
-        var packet: XiaomiTVProtocol.KeyPair?
+        var plan: XiaomiTVProtocol.KeyPlan?
+        var sender: XiaomiTVKeySender?
         var acknowledgements: XiaomiTVProtocol.Acknowledgements?
         var sendStarted = false
         var sendCompleted = false
@@ -153,6 +192,7 @@ final class XiaomiTVController: ObservableObject {
         func cancel() {
             timeout?.cancel()
             timeout = nil
+            sender?.cancel()
             connection.stateUpdateHandler = nil
             connection.cancel()
         }
@@ -163,7 +203,6 @@ final class XiaomiTVController: ObservableObject {
     private var active: Session?
     private var nextMessageID: UInt32 = 1
     private var cancellationDepth = 0
-    private let maximumRequests = 8
 
     private var configurationIsCurrent: (@Sendable () -> Bool)?
 
@@ -186,6 +225,31 @@ final class XiaomiTVController: ObservableObject {
     func perform(_ command: XiaomiTVCommand,
                  completion: @escaping @MainActor @Sendable (Result<Void, XiaomiTVFailure>) -> Void) {
         enqueue(.command(command), completion: completion)
+    }
+
+    func matches(_ expected: XiaomiTVConfiguration?) -> Bool {
+        configuration == expected && configurationIsCurrent?() != false
+    }
+
+    func perform(_ command: XiaomiTVCommand, matching expected: XiaomiTVConfiguration?,
+                 completion: @escaping @MainActor @Sendable (Result<Void, XiaomiTVFailure>) -> Void) {
+        guard matches(expected) else { completion(.failure(.cancelled)); return }
+        perform(command, completion: completion)
+    }
+
+    /// Cancel queued navigation before leaving the TV dialog. Never replays POWER.
+    func dismissPowerMenu(matching expected: XiaomiTVConfiguration?) {
+        guard matches(expected) else { return }
+        let cancelled = pending.filter { request in
+            guard let command = request.operation.command else { return false }
+            return [.up, .down, .left, .right, .ok, .back, .volumeUp, .volumeDown].contains(command)
+        }
+        let ids = Set(cancelled.map(\.id))
+        pending.removeAll { ids.contains($0.id) }
+        cancellationDepth += 1
+        cancelled.forEach { $0.completion(.failure(.cancelled)) }
+        cancellationDepth -= 1
+        perform(.back) { _ in }
     }
 
     /// 仅测试 TCP 是否可达，不发送按键，也不能据此推断电视电源状态。
@@ -214,11 +278,31 @@ final class XiaomiTVController: ObservableObject {
             completion(.failure(failure))
             return
         }
-        guard pending.count + (active == nil ? 0 : 1) < maximumRequests else {
+        let now = ContinuousClock().now
+        var discarded: [(Request, XiaomiTVFailure)] = []
+        pending.removeAll { request in
+            if request.deadline <= now {
+                discarded.append((request, .timedOut))
+                return true
+            }
+            if XiaomiTVQueuePolicy.shouldCancelPending(request.operation.command, incoming: operation.command) {
+                discarded.append((request, .cancelled))
+                return true
+            }
+            return false
+        }
+        let accepted = XiaomiTVQueuePolicy.accepts(operation.command,
+            pending: pending.map { $0.operation.command }, hasActive: active != nil)
+        if accepted { pending.append(Request(operation: operation, completion: completion)) }
+        // Detach/append before callbacks. A discarded request cannot re-enter and reorder
+        // the queue, and a callback that changes configuration can cancel the new request.
+        cancellationDepth += 1
+        for (request, failure) in discarded { request.completion(.failure(failure)) }
+        cancellationDepth -= 1
+        guard accepted else {
             completion(.failure(.busy))
             return
         }
-        pending.append(Request(operation: operation, completion: completion))
         startNextIfNeeded()
     }
 
@@ -238,11 +322,13 @@ final class XiaomiTVController: ObservableObject {
         active = session
         switch request.operation {
         case .command(let command):
-            let downID = takeMessageID()
-            let upID = takeMessageID()
-            let packet = XiaomiTVProtocol.keyPair(command: command, downID: downID, upID: upID)
-            session.packet = packet
-            session.acknowledgements = .init(expectedIDs: [downID, upID])
+            let ids = (0..<XiaomiTVProtocol.messageCount(for: command)).map { _ in takeMessageID() }
+            guard let plan = XiaomiTVProtocol.keyPlan(command: command, messageIDs: ids) else {
+                finish(request.id, result: .failure(.invalidResponse))
+                return
+            }
+            session.plan = plan
+            session.acknowledgements = .init(expectedIDs: plan.expectedIDs)
             status = "正在发送\(command.title)指令…"
         case .checkConnection:
             status = "正在检查电视 TCP 连接…"
@@ -285,19 +371,23 @@ final class XiaomiTVController: ObservableObject {
                     finish(requestID, result: .failure(.cancelled))
                     return
                 }
-                guard !session.sendStarted, let packet = session.packet else { return }
+                guard !session.sendStarted, let plan = session.plan else { return }
+                guard plan.canStart(remaining: ContinuousClock().now.duration(to: session.request.deadline)) else {
+                    // In particular, never begin POWER if there is only time for a short press.
+                    finish(requestID, result: .failure(.timedOut))
+                    return
+                }
                 session.sendStarted = true
-                // A single send contains the whole pair, preserving order and avoiding a
-                // later attempt to synthesize UP after an ambiguous transport failure.
-                session.connection.send(content: packet.bytes, completion: .contentProcessed { [weak self] error in
-                    MainActor.assumeIsolated {
-                        self?.sent(requestID: requestID, failed: error != nil)
-                    }
-                })
+                let sender = XiaomiTVKeySender(connection: session.connection, plan: plan,
+                    deadline: session.request.deadline, configurationIsCurrent: configurationIsCurrent) { [weak self] result in
+                    Task { @MainActor in self?.sent(requestID: requestID, result: result) }
+                }
+                session.sender = sender
+                sender.start()
                 receive(requestID: requestID)
             }
         case .failed:
-            finish(requestID, result: .failure(session.sendStarted ? .deliveryUnconfirmed : .connectionFailed))
+            finish(requestID, result: .failure(session.sender?.hasSentFrames == true ? .deliveryUnconfirmed : .connectionFailed))
         case .cancelled:
             finish(requestID, result: .failure(.cancelled))
         default:
@@ -306,14 +396,14 @@ final class XiaomiTVController: ObservableObject {
         }
     }
 
-    private func sent(requestID: UUID, failed: Bool) {
+    private func sent(requestID: UUID, result: Result<Void, XiaomiTVFailure>) {
         guard let session = active, session.request.id == requestID else { return }
         guard session.request.deadline > ContinuousClock().now else {
             expire(requestID)
             return
         }
-        if failed {
-            finish(requestID, result: .failure(.deliveryUnconfirmed))
+        if case .failure(let failure) = result {
+            finish(requestID, result: .failure(failure))
             return
         }
         session.sendCompleted = true
@@ -358,7 +448,7 @@ final class XiaomiTVController: ObservableObject {
 
     private func expire(_ requestID: UUID) {
         guard let session = active, session.request.id == requestID else { return }
-        finish(requestID, result: .failure(session.sendStarted ? .deliveryUnconfirmed : .timedOut))
+        finish(requestID, result: .failure(session.sender?.hasSentFrames == true ? .deliveryUnconfirmed : .timedOut))
     }
 
     private func finish(_ requestID: UUID, result: Result<Void, XiaomiTVFailure>) {
@@ -368,6 +458,7 @@ final class XiaomiTVController: ObservableObject {
         switch result {
         case .success:
             switch session.request.operation {
+            case .command(.powerMenu): status = "电视电源菜单按键序列已送达，请在电视上确认"
             case .command(let command): status = "\(command.title)指令已送达"
             case .checkConnection: status = "电视 TCP 连接可达"
             }
@@ -397,20 +488,195 @@ final class XiaomiTVController: ObservableObject {
     }
 }
 
+/// Pure queue decisions are shared by the controller and its offline checks.
+private enum XiaomiTVQueuePolicy {
+    static func lifetime(for command: XiaomiTVCommand?) -> Duration {
+        command?.isVolume == true ? .milliseconds(1400) : .seconds(4)
+    }
+
+    static func shouldCancelPending(_ command: XiaomiTVCommand?, incoming: XiaomiTVCommand?) -> Bool {
+        incoming == .powerMenu && command?.isVolume == true
+    }
+
+    static func accepts(_ command: XiaomiTVCommand?, pending: [XiaomiTVCommand?], hasActive: Bool) -> Bool {
+        guard pending.count + (hasActive ? 1 : 0) < 8 else { return false }
+        return command?.isVolume != true || !pending.contains { $0?.isVolume == true }
+    }
+}
+
+/// Sending runs independently of SwiftUI/main-actor work. Network callbacks still
+/// arrive on NWConnection's main delegate queue, but never gate the next repeat.
+private final class XiaomiTVKeySender: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "MiRemote.XiaomiTV.keySender", qos: .userInitiated)
+    private let connection: NWConnection
+    private let plan: XiaomiTVProtocol.KeyPlan
+    private let deadline: ContinuousClock.Instant
+    private let configurationIsCurrent: (@Sendable () -> Bool)?
+    private let completion: @Sendable (Result<Void, XiaomiTVFailure>) -> Void
+    private let stateLock = NSLock()
+    // Only these two values cross queues, always under stateLock.
+    private var cancelled = false
+    private var sentAny = false
+    // Everything below belongs to queue.
+    private var workItems: [DispatchWorkItem] = []
+    private var processedFrames = 0
+    private var completed = false
+    private var lastSentAt: ContinuousClock.Instant?
+
+    init(connection: NWConnection, plan: XiaomiTVProtocol.KeyPlan, deadline: ContinuousClock.Instant,
+         configurationIsCurrent: (@Sendable () -> Bool)?,
+         completion: @escaping @Sendable (Result<Void, XiaomiTVFailure>) -> Void) {
+        self.connection = connection
+        self.plan = plan
+        self.deadline = deadline
+        self.configurationIsCurrent = configurationIsCurrent
+        self.completion = completion
+    }
+
+    var hasSentFrames: Bool { stateLock.withLock { sentAny } }
+
+    func start() {
+        queue.async { [self] in
+            guard !stateLock.withLock({ cancelled }) else { return }
+            // Check again on this queue: waiting for a dispatch slot also spends the
+            // request's four-second budget and must not turn POWER into a short press.
+            guard plan.canStart(remaining: ContinuousClock().now.duration(to: deadline)) else {
+                finish(.failure(.timedOut))
+                return
+            }
+            let start = DispatchTime.now()
+            for frame in plan.frames {
+                let item = DispatchWorkItem { [weak self] in self?.send(frame) }
+                workItems.append(item)
+                queue.asyncAfter(deadline: start + .milliseconds(frame.offsetMilliseconds), execute: item)
+            }
+        }
+    }
+
+    func cancel() {
+        // Synchronous gate: a scheduled callback cannot start another DOWN after
+        // cancellation returns. Already committed sends are never replayed.
+        stateLock.withLock { cancelled = true }
+        queue.async { [self] in
+            workItems.forEach { $0.cancel() }
+            workItems.removeAll()
+        }
+    }
+
+    private func send(_ frame: XiaomiTVProtocol.ScheduledFrame) {
+        guard !completed, !stateLock.withLock({ cancelled }) else { return }
+        guard configurationIsCurrent?() != false else {
+            finish(.failure(.cancelled))
+            return
+        }
+        let now = ContinuousClock().now
+        guard lastSentAt != nil || plan.canStart(remaining: now.duration(to: deadline)) else {
+            finish(.failure(.timedOut))
+            return
+        }
+        guard now < deadline else {
+            finish(.failure(hasSentFrames ? .deliveryUnconfirmed : .timedOut))
+            return
+        }
+        // If the process/queue was suspended beyond MiLink's automatic key-release
+        // window, stop instead of starting a second, unintended POWER press.
+        if plan.isLongPress, let lastSentAt, lastSentAt.duration(to: now) >= .milliseconds(175) {
+            finish(.failure(.deliveryUnconfirmed))
+            return
+        }
+        stateLock.lock()
+        guard !cancelled else { stateLock.unlock(); return }
+        sentAny = true
+        lastSentAt = now
+        connection.send(content: frame.bytes, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            let failed = error != nil
+            self.queue.async { [self] in self.processed(failed: failed) }
+        })
+        stateLock.unlock()
+    }
+
+    private func processed(failed: Bool) {
+        guard !completed, !stateLock.withLock({ cancelled }) else { return }
+        if failed {
+            finish(.failure(.deliveryUnconfirmed))
+            return
+        }
+        processedFrames += 1
+        if processedFrames == plan.frames.count { finish(.success(())) }
+    }
+
+    private func finish(_ result: Result<Void, XiaomiTVFailure>) {
+        guard !completed else { return }
+        completed = true
+        stateLock.withLock { cancelled = true }
+        workItems.forEach { $0.cancel() }
+        workItems.removeAll()
+        // MainActor/UUID isolation is supplied by the controller's completion.
+        // Cancellation sends no extra DOWN or POWER replay; TV automatic release
+        // is the fallback if a transport failure prevents delivery of the final UP.
+        completion(result)
+    }
+}
+
 /// MiLink binary interoperability facts; original implementation, no third-party source.
 /// https://github.com/EndLess728/MiTV-Remote (protocol description)
 /// https://developer.android.com/reference/android/view/KeyEvent#KEYCODE_SLEEP
 private enum XiaomiTVProtocol {
+    static let powerHoldMilliseconds = 2200
+    static let repeatMilliseconds = 100
+    static let acknowledgementMarginMilliseconds = 500
+
+    struct ScheduledFrame: Sendable {
+        let offsetMilliseconds: Int
+        let bytes: Data
+    }
+
+    struct KeyPlan: Sendable {
+        let frames: [ScheduledFrame]
+        let expectedIDs: Set<UInt32>
+        let isLongPress: Bool
+
+        func canStart(remaining: Duration) -> Bool {
+            remaining > .zero && (!isLongPress || remaining >= .milliseconds(
+                powerHoldMilliseconds + acknowledgementMarginMilliseconds))
+        }
+    }
+
     struct KeyPair {
         let bytes: Data
     }
 
-    static func keyPair(command: XiaomiTVCommand, downID: UInt32, upID: UInt32) -> KeyPair {
-        KeyPair(bytes: keyFrame(command: command, action: 0, id: downID)
+    static func messageCount(for command: XiaomiTVCommand) -> Int {
+        command == .powerMenu ? powerHoldMilliseconds / repeatMilliseconds + 1 : 2
+    }
+
+    /// POWER must only be constructed by keyPlan's sustained sequence.
+    static func keyPair(command: XiaomiTVCommand, downID: UInt32, upID: UInt32) -> KeyPair? {
+        guard command != .powerMenu else { return nil }
+        return KeyPair(bytes: keyFrame(command: command, action: 0, id: downID)
                     + keyFrame(command: command, action: 1, id: upID))
     }
 
-    private static func keyFrame(command: XiaomiTVCommand, action: Int32, id: UInt32) -> Data {
+    static func keyPlan(command: XiaomiTVCommand, messageIDs: [UInt32]) -> KeyPlan? {
+        guard messageIDs.count == messageCount(for: command),
+              Set(messageIDs).count == messageIDs.count else { return nil }
+        guard command == .powerMenu else {
+            guard let pair = keyPair(command: command, downID: messageIDs[0], upID: messageIDs[1]) else { return nil }
+            return KeyPlan(frames: [.init(offsetMilliseconds: 0, bytes: pair.bytes)],
+                expectedIDs: Set(messageIDs), isLongPress: false)
+        }
+        var frames: [ScheduledFrame] = []
+        for index in 0..<(messageIDs.count - 1) {
+            frames.append(.init(offsetMilliseconds: index * repeatMilliseconds,
+                bytes: keyFrame(command: command, action: 0, repeatCount: Int32(index), id: messageIDs[index])))
+        }
+        frames.append(.init(offsetMilliseconds: powerHoldMilliseconds,
+            bytes: keyFrame(command: command, action: 1, id: messageIDs[messageIDs.count - 1])))
+        return KeyPlan(frames: frames, expectedIDs: Set(messageIDs), isLongPress: true)
+    }
+
+    private static func keyFrame(command: XiaomiTVCommand, action: Int32, repeatCount: Int32 = 0, id: UInt32) -> Data {
         var fields = Data()
         func int32(_ tag: UInt8, _ value: Int32) {
             fields.append(tag)
@@ -424,7 +690,7 @@ private enum XiaomiTVProtocol {
         int32(2, action)  // 0 = DOWN, 1 = UP
         int32(3, command.keyCode)
         int32(4, 0)       // scanCode
-        int32(5, 0)       // repeat
+        int32(5, repeatCount) // repeat
         int32(6, 0)       // flags
         // Zero makes the TV fill in its own uptime; a Mac clock is not Android uptime.
         int64(7, 0)       // downTime
@@ -534,13 +800,79 @@ private enum XiaomiTVProtocol {
             goldenUp[7] = 0x05
             goldenUp[19] = 1
             try require(up == Data(goldenUp))
-            try require(keyPair(command: .sleep, downID: 0x01020304, upID: 0x01020305).bytes == down + up)
+            try require(keyPair(command: .sleep, downID: 0x01020304, upID: 0x01020305)?.bytes == down + up)
             try require(XiaomiTVCommand.volumeUp.keyCode == 24 && XiaomiTVCommand.volumeDown.keyCode == 25)
             try require(XiaomiTVCommand.sleep.keyCode == 223 && XiaomiTVCommand.sleep.keyCode != 26)
             var goldenWake = golden
             goldenWake[24] = 0xe0
             try require(keyFrame(command: .wake, action: 0, id: 0x01020304) == Data(goldenWake)
                 && XiaomiTVCommand.wake.keyCode == 224)
+            try require(XiaomiTVCommand.up.keyCode == 19 && XiaomiTVCommand.down.keyCode == 20
+                && XiaomiTVCommand.left.keyCode == 21 && XiaomiTVCommand.right.keyCode == 22
+                && XiaomiTVCommand.ok.keyCode == 23 && XiaomiTVCommand.back.keyCode == 4)
+            try require(XiaomiTVCommand.allCases.filter { $0.keyCode == 26 } == [.powerMenu])
+            try require(keyPair(command: .powerMenu, downID: 1, upID: 2) == nil)
+            let powerIDs = (1...messageCount(for: .powerMenu)).map { UInt32($0) }
+            guard let power = keyPlan(command: .powerMenu, messageIDs: powerIDs),
+                  let ordinary = keyPlan(command: .sleep, messageIDs: [0x01020304, 0x01020305]) else { return false }
+            try require(ordinary.frames.count == 1 && ordinary.frames[0].bytes == down + up
+                && ordinary.expectedIDs == [0x01020304, 0x01020305] && !ordinary.isLongPress)
+            try require(power.isLongPress && power.frames.count == 23 && power.expectedIDs == Set(powerIDs))
+            try require(power.frames.first?.offsetMilliseconds == 0
+                && power.frames.last?.offsetMilliseconds == 2200)
+            try require(!power.canStart(remaining: .milliseconds(2699))
+                && power.canStart(remaining: .milliseconds(2700)))
+            try require(!ordinary.canStart(remaining: .zero) && ordinary.canStart(remaining: .milliseconds(1)))
+            try require(keyPlan(command: .powerMenu, messageIDs: Array(powerIDs.dropLast())) == nil)
+            try require(keyPlan(command: .powerMenu, messageIDs: Array(repeating: 1, count: powerIDs.count)) == nil)
+            for (index, scheduled) in power.frames.enumerated() {
+                // Full golden comparison also checks timestamps, flags, source/device,
+                // fixed-width tags, independent IDs, and absence of field lengths.
+                var expected = golden
+                expected[4] = 0
+                expected[5] = 0
+                expected[6] = 0
+                expected[7] = UInt8(index + 1)
+                expected[24] = 26
+                let isUp = index == power.frames.count - 1
+                expected[19] = isUp ? 1 : 0
+                expected[34] = isUp ? 0 : UInt8(index)
+                try require(scheduled.bytes == Data(expected))
+                if index > 0 {
+                    try require(scheduled.offsetMilliseconds - power.frames[index - 1].offsetMilliseconds == 100)
+                }
+            }
+
+            // Every long-press ID must be acknowledged, even if data is fragmented;
+            // duplicate/foreign ACKs and heartbeats cannot fill a missing slot.
+            var powerACKs = Acknowledgements(expectedIDs: power.expectedIDs)
+            for id in powerIDs.dropLast() {
+                for byte in response(id) { try powerACKs.consume(Data([byte])) }
+            }
+            try powerACKs.consume(response(powerIDs[0]) + response(99) + frame(type: 2, payload: Data()))
+            try require(!powerACKs.isComplete)
+            try powerACKs.consume(response(powerIDs[powerIDs.count - 1]))
+            try require(powerACKs.isComplete)
+            var reverseACKs = Acknowledgements(expectedIDs: power.expectedIDs)
+            let reversed = powerIDs.reversed().reduce(into: Data()) { $0.append(response($1)) }
+            try reverseACKs.consume(reversed)
+            try require(reverseACKs.isComplete)
+            try require(Acknowledgements.maximumFrames >= power.frames.count + 10)
+
+            try require(XiaomiTVQueuePolicy.lifetime(for: .volumeUp) == .milliseconds(1400)
+                && XiaomiTVQueuePolicy.lifetime(for: .volumeDown) == .milliseconds(1400)
+                && XiaomiTVQueuePolicy.lifetime(for: .powerMenu) == .seconds(4)
+                && XiaomiTVQueuePolicy.lifetime(for: nil) == .seconds(4))
+            try require(XiaomiTVQueuePolicy.accepts(.volumeUp, pending: [], hasActive: true))
+            try require(!XiaomiTVQueuePolicy.accepts(.volumeUp, pending: [.volumeDown], hasActive: false))
+            try require(!XiaomiTVQueuePolicy.accepts(.volumeDown, pending: [.wake, .volumeUp], hasActive: true))
+            try require(XiaomiTVQueuePolicy.accepts(.ok, pending: [.volumeUp], hasActive: true))
+            try require(!XiaomiTVQueuePolicy.accepts(.wake, pending: Array(repeating: .wake, count: 7), hasActive: true))
+            let queued: [XiaomiTVCommand?] = [.volumeUp, .back, .volumeDown, nil, .wake]
+            let kept = queued.filter { !XiaomiTVQueuePolicy.shouldCancelPending($0, incoming: .powerMenu) }
+            try require(kept == [.back, nil, .wake])
+            try require(!XiaomiTVQueuePolicy.shouldCancelPending(.volumeUp, incoming: .ok)
+                && !XiaomiTVQueuePolicy.shouldCancelPending(.ok, incoming: .powerMenu))
 
             var parser = Acknowledgements(expectedIDs: [1, 2])
             let unrelated = response(99) + response(1, code: 1) + frame(type: 2, payload: Data())

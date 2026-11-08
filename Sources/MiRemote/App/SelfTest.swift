@@ -243,6 +243,8 @@ enum SelfTest {
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
         expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
         expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
+        expect(TelevisionPowerMenuState.selfCheck(), "电视原生关机确认、异常回执与取消导航（无真实操作）")
+        expect(VoiceDeliveryGate.selfCheck(), "语音关闭总门、旧会话隔离与清理代次（无音频输出）")
         expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")
         expect(VoicePressGate.selfCheck(), "语音短按不启动音频、长按预录音与结束清理")
@@ -252,6 +254,7 @@ enum SelfTest {
         expect(DockNavigationController.selfCheck(), "真实Dock四向选择、沿轴发键与取消代次")
         expect(ApplicationNavigationGestures.selfCheck(), "应用导航即时预选、短按提交与长按取消")
         expect(MappingEngine.applicationNavigationSelfCheck(), "应用导航路由、快速连按、菜单优先和全局长按")
+        expect(MappingEngine.inputGenerationSelfCheck(), "输入失效立即撤销长按凭据，不依赖延迟主线程回调")
         expect(AppNavigationGeometry.selfCheck(), "通用控件四向几何选择与分区")
         expect(ApplicationNavigationController.selfCheck(), "应用导航会话/取消与输入状态")
         expect(Set(KeyRemapper.table.map(\.key)).isSuperset(of: [.volUp, .volDown]),

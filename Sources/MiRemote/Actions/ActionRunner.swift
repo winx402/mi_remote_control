@@ -118,8 +118,14 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
 
     private func runTelevision(_ command: XiaomiTVCommand) {
         let settings = Self.televisionSettings.withLock { $0 }
+        let issuedAt = ContinuousClock().now
         Self.televisionOperations.withLock { $0.pending += 1 }
         Task { @MainActor in
+            if command == .volumeUp || command == .volumeDown,
+               issuedAt.duration(to: ContinuousClock().now) > .milliseconds(1400) {
+                self.recordTelevisionResult(.failure(.timedOut))
+                return
+            }
             guard Self.televisionSettings.withLock({ $0.revision == settings.revision }) else {
                 recordTelevisionResult(.failure(.cancelled))
                 return
@@ -199,8 +205,9 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
         case "tv_standby": runTelevision(.sleep)
         case "tv_wake": runTelevision(.wake)
         case "tv_off":
-            Self.televisionOperations.withLock { $0.failures += 1 }
-            log("真正关机尚未接入；电视待机请使用 tv_standby。")
+            if let overlay = Self.onOverlay {
+                DispatchQueue.main.async { overlay("television_power") }
+            } else { runTelevision(.powerMenu) }
         case "volume_up":   aux(NX_KEYTYPE_SOUND_UP)
         case "volume_down": aux(NX_KEYTYPE_SOUND_DOWN)
         case "mute":        aux(NX_KEYTYPE_MUTE)

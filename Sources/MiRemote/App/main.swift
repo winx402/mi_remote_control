@@ -170,24 +170,30 @@ while let argument = args.first {
         // 10s+2s 的超时清理定时器——主进程提前退出会把二者截断/孤儿化。
         // 轮询「宏不在跑 && 无活动 shell 进程组」，最短 1s，硬上限 120s（超时
         // 时对残余 shell 组 TERM→KILL 清扫后退出）。
+        let earliestRunActionExit = Date().addingTimeInterval(1)
         let runActionDeadline = Date().addingTimeInterval(120)
-        func pollRunActionExit() {
+        // Network.framework delegates and structured-concurrency completions also
+        // use this run loop. Bound each pump as in TelevisionCLI; an indefinite
+        // run() can defer dispatch timers enough to break a sustained POWER press.
+        let runActionKeepAlive = Timer(timeInterval: 0.05, repeats: true) { _ in }
+        RunLoop.main.add(runActionKeepAlive, forMode: .default)
+        while true {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+            guard Date() >= earliestRunActionExit else { continue }
             let done = !MacroEngine.shared.isRunning && ShellProcessRegistry.shared.activeCount == 0
                 && ActionRunner.pendingTelevisionCommands == 0
             if done || Date() > runActionDeadline {
+                runActionKeepAlive.invalidate()
                 ShellProcessRegistry.shared.terminateAll()
                 exit(done && ActionRunner.televisionCommandFailures == 0 ? 0 : 1)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { pollRunActionExit() }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { pollRunActionExit() }
-        RunLoop.main.run()
     case "--help", "-h":
         print("miremote                     GUI 模式（设置窗口 + 引擎）")
         print("miremote --ui-preview        GUI 但不启动引擎（开发验证）")
         print("miremote [--list-audio-devices] [--output <name>] [--wav <path>] [--gain <dB>] [--verbose]")
         print("         [--keys] [--config <path>] [--doubao] [--run-action '<action json>']")
-        print("         --tv status|volume-up|volume-down|standby|wake [--config <path>]")
+        print("         --tv status|volume-up|volume-down|standby|wake|off|power-menu [--config <path>]")
         print("         [--doctor] [--login-item on|off|status] [--claude-hooks install|uninstall|status]")
         print("         [--print-default-config] [--validate-config <path>]")
         print("         [--render-system-menu <png-path>]（离屏渲染，不启动遥控服务）")

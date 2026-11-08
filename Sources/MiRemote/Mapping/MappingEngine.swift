@@ -163,6 +163,14 @@ final class MappingEngine: @unchecked Sendable {
     /// true → TapEngine 卸载 hidutil 映射（遥控键回系统原生）+ 健康检查豁免重装，
     /// false → 重装映射。接线期设置，之后只读。
     var onSuspendChanged: ((Bool) -> Void)?
+    private let inputGenerationLock = OSAllocatedUnfairLock(initialState: UInt64(0))
+    var inputGeneration: UInt64 { inputGenerationLock.withLock { $0 } }
+    var onInputReset: (() -> Void)?
+
+    private func invalidateInputSession() {
+        inputGenerationLock.withLock { $0 &+= 1 }
+        if let handler = onInputReset { mainDispatch { handler() } }
+    }
 
     /// 暂停/恢复遥控。暂停期间所有按键事件（含 IOHID 通道的返回键）在引擎入口丢弃，
     /// 并复位输入运行态（清层/在途定时器，防卡键卡层）；重复设置同值为幂等无副作用。
@@ -330,6 +338,7 @@ final class MappingEngine: @unchecked Sendable {
     // MARK: - 对外 API 实现（均在执行上下文内）
 
     private func _setConfig(_ config: MappingConfig) {
+        invalidateInputSession()
         applicationNavigationGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
@@ -358,6 +367,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _setActiveProfile(_ bundleID: String?) {
+        invalidateInputSession()
         applicationNavigationGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
@@ -374,6 +384,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _resetInputState(_ reason: String, preserveReservedPresses: Bool = true) {
+        invalidateInputSession()
         applicationNavigationGestures.reset(preservePressed: preserveReservedPresses)
         reservedDirectionGestures.reset(preservePressed: preserveReservedPresses)
         CodexNavigation.cancelScrolling()
@@ -1175,6 +1186,28 @@ extension MappingEngine {
                   !TransientSystemUI.isMissionControlActive() else { return false }
         }
         return true
+    }
+
+    static func inputGenerationSelfCheck() -> Bool {
+        let runner = RecordingRunner()
+        var deliveries: [() -> Void] = []
+        var resets = 0
+        let engine = MappingEngine(config: MappingConfig(), runner: runner, delegate: nil,
+            dispatch: { $0() }, scheduleAfter: { _, _ in }, mainDispatch: { deliveries.append($0) },
+            reservedMouseIsActive: { false }, reservedMouseHandle: { _, _ in })
+        engine.onInputReset = { resets += 1 }
+        let heldAt = engine.inputGeneration
+        engine._resetInputState("test lost keyUp", preserveReservedPresses: false)
+        // The hold lease expires before the delayed main-thread notification runs.
+        guard engine.inputGeneration != heldAt, resets == 0, runner.actions.isEmpty else { return false }
+        let afterReset = engine.inputGeneration
+        engine._setConfig(MappingConfig())
+        guard engine.inputGeneration != afterReset else { return false }
+        let beforeProfile = engine.inputGeneration
+        engine._setActiveProfile("test.application")
+        guard engine.inputGeneration != beforeProfile else { return false }
+        deliveries.forEach { $0() }
+        return resets == 3 && runner.actions.isEmpty
     }
 
     /// Reserved Space holds use fake actions, panels and mouse outputs only.

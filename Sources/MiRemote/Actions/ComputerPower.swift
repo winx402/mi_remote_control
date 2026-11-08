@@ -82,6 +82,20 @@ struct PowerMenuState {
         case tvVolumeDown
         case quitCurrentApp
         case quitApp(bundleID: String)
+        case launchApp(bundleID: String)
+        case systemAction(String)
+        case focusInput
+        case openSettings
+
+        /// 遥控器由入口统一计时；鼠标使用同一 0.6 秒确认规则。
+        /// 电视关机只打开电视自己的确认菜单，无须在本机重复确认。
+        var requiresHoldConfirmation: Bool {
+            switch self {
+            case .computer, .quitCurrentApp, .quitApp: return true
+            case .systemAction(let action): return ["lock_screen", "display_sleep"].contains(action)
+            default: return false
+            }
+        }
 
         var keepsMenuOpen: Bool {
             switch self {
@@ -176,7 +190,7 @@ struct PowerMenuState {
 
     mutating func handle(_ key: RemoteKey) -> Effect {
         guard isOpen else { return .none }
-        if [.back, .power, .home, .tv].contains(key) {
+        if [.back, .power, .home, .tv, .menu].contains(key) {
             close()
             return .dismiss
         }
@@ -202,6 +216,22 @@ struct PowerMenuState {
               !current.disabled else { return .none }
         updateSelection(current)
         return activateSelection()
+    }
+
+    /// 指针聚焦与明确激活分离；不信任调用方携带的命令或 disabled 标记。
+    mutating func focus(_ choice: Choice) {
+        guard isOpen, !isExecuting,
+              let current = choices.first(where: { $0.id == choice.id }),
+              !current.disabled else { return }
+        updateSelection(current)
+    }
+
+    /// 分类点击仅移动到该分类记忆的最近可用列，不执行任何动作。
+    mutating func focusSection(_ id: String) {
+        guard isOpen, !isExecuting,
+              let section = sections.first(where: { $0.id == id }),
+              let choice = preferredChoice(in: section) else { return }
+        updateSelection(choice)
     }
 
     private mutating func updateSelection(_ choice: Choice) {
@@ -242,20 +272,24 @@ struct PowerMenuState {
                 updateSelection(.cancel)
                 return
             }
-            let section = groups[next]
-            let column = min(rememberedColumns[section.id] ?? preferredColumn,
-                             section.choices.count - 1)
-            // 分类中的禁用项不可选；优先靠近原列，等距时选择左侧。
-            if let enabled = section.choices.indices.filter({ !section.choices[$0].disabled })
-                .min(by: { left, right in
-                    let leftDistance = abs(left - column)
-                    let rightDistance = abs(right - column)
-                    return leftDistance == rightDistance ? left < right : leftDistance < rightDistance
-                }) {
-                updateSelection(section.choices[enabled])
+            if let choice = preferredChoice(in: groups[next]) {
+                updateSelection(choice)
                 return
             }
         }
+    }
+
+    private func preferredChoice(in section: Section) -> Choice? {
+        let column = min(rememberedColumns[section.id] ?? preferredColumn,
+                         section.choices.count - 1)
+        // 分类中的禁用项不可选；优先靠近原列，等距时选择左侧。
+        let enabled = section.choices.indices.filter { !section.choices[$0].disabled }
+            .min { left, right in
+                let leftDistance = abs(left - column)
+                let rightDistance = abs(right - column)
+                return leftDistance == rightDistance ? left < right : leftDistance < rightDistance
+            }
+        return enabled.map { section.choices[$0] }
     }
 
     private mutating func activateSelection() -> Effect {
@@ -376,6 +410,56 @@ struct PowerMenuState {
               state.handle(.right) == .none, state.selection == volume,
               state.handle(.up) == .none, state.selection == .cancel,
               state.handle(.down) == .none, state.selection == volume else { return false }
+        // 指针聚焦不执行；分类点击恢复各自列，并使用列表中的权威项目。
+        state.open(choices: [wake, standby, off, volume, .sleep, .shutDown, unavailable])
+        state.focus(volume)
+        guard state.selection == volume, !state.isExecuting else { return false }
+        state.focusSection("这台 Mac")
+        guard state.selection == .shutDown, !state.isExecuting else { return false }
+        state.focusSection("电视")
+        guard state.selection == volume, !state.isExecuting else { return false }
+        state.focus(off)
+        let forgedDisabled = Choice(id: off.id, title: "伪造可用", symbol: "power", section: "电视",
+                                    command: .tvOff)
+        state.focus(forgedDisabled)
+        guard state.select(forgedDisabled) == .none, state.selection == volume else { return false }
+        state.focus(.cancel)
+        guard state.isOpen, !state.isExecuting, state.selection == .cancel else { return false }
+        state.focusSection("电视")
+        state.focusSection("不可用")
+        state.focusSection("不存在")
+        state.focus(Choice(id: "unknown", title: "未知", symbol: "app", section: "电视"))
+        guard state.selection == volume, !state.isExecuting else { return false }
+        let forged = Choice(id: wake.id, title: "伪造", symbol: "app", section: "其他",
+                            command: .computer(.shutDown))
+        state.focus(forged)
+        guard state.selection == wake, state.handle(.ok) == .execute(.tvWake) else { return false }
+        state.focus(.sleep)
+        state.focusSection("这台 Mac")
+        guard state.selection == wake, state.isExecuting,
+              state.complete(.success(())) == .dismiss else { return false }
+        state.focus(volume)
+        state.focusSection("电视")
+        guard !state.isOpen, !state.isExecuting else { return false }
+        // 确认规则是命令元数据，遥控与鼠标共享；电视使用设备原生确认。
+        let requiresHold: [Command] = [.computer(.sleep), .computer(.shutDown),
+                                      .quitCurrentApp, .quitApp(bundleID: "example.app"),
+                                      .systemAction("lock_screen"), .systemAction("display_sleep")]
+        let immediate: [Command] = [.tvWake, .tvStandby, .tvOff, .tvVolumeUp, .tvVolumeDown,
+                                   .launchApp(bundleID: "example.app"), .focusInput, .openSettings,
+                                   .systemAction("mission_control"), .systemAction("mute")]
+        guard requiresHold.allSatisfy(\.requiresHoldConfirmation),
+              immediate.allSatisfy({ !$0.requiresHoldConfirmation }) else { return false }
+        // 新增入口仍走唯一执行闸门，聚焦不会改变完成/错误约定。
+        for command in immediate {
+            let choice = Choice(id: "entry", title: "入口", symbol: "app", section: "控制", command: command)
+            state.open(choices: [choice])
+            state.focus(choice)
+            guard !state.isExecuting, state.handle(.ok) == .execute(command),
+                  state.select(choice) == .none else { return false }
+            let effect = state.complete(.success(()))
+            guard effect == (command.keepsMenuOpen ? .none : .dismiss) else { return false }
+        }
         // 多个分类全禁用与完全无分类时，反复循环仍只停在取消。
         for choices in [[unavailable, unavailableLast], []] {
             state.open(choices: choices)

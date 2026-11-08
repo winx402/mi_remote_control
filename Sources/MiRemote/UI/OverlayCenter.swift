@@ -145,6 +145,10 @@ final class OverlayUIState: ObservableObject {
     @Published var codexIndex = 0
     @Published var powerMenu = PowerMenuState()
     @Published var televisionPowerStatus: String?
+    @Published var powerConfirmingID: String?
+    @Published var powerGeneration: UInt64 = 0
+    @Published var confirmationInputGeneration: UInt64 = 0
+    @Published var televisionMenu = TelevisionPowerMenuState()
 }
 
 /// 窗口选择器的菜单键三段流程：全局跨桌面 → 当前 App → 关闭。
@@ -193,6 +197,7 @@ final class OverlayCenter {
         case appWheel = "app_wheel"
         case codexSessions = "codex_sessions"
         case computerPower = "computer_power"
+        case televisionPower = "television_power"
     }
 
     private weak var model: AppModel?
@@ -224,6 +229,11 @@ final class OverlayCenter {
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
     private var televisionPowerStatus: String?
+    private var televisionMenu = TelevisionPowerMenuState()
+    private var televisionMenuConfiguration: XiaomiTVConfiguration?
+    private var powerConfirmingID: String?
+    private var powerConfirmTimer: Timer?
+    private var powerOKHeld = false
     private var powerGeneration: UInt64 = 0
     /// 窗口选择/系统菜单/教程不应无限占用遥控路由；10s 无操作自动收起。
     private static let overlayIdleSeconds: TimeInterval = 10
@@ -264,7 +274,8 @@ final class OverlayCenter {
 
     /// 异步失败回落可能重复到达；已有同一面板时保持打开，不执行 toggle。
     func ensureOpen(_ name: String) {
-        guard active?.rawValue != name else { return }
+        let canonical = name == "system_menu" ? "computer_power" : name
+        guard active?.rawValue != canonical else { return }
         open(name)
     }
 
@@ -274,8 +285,13 @@ final class OverlayCenter {
             onOpenSettings?()
             return
         }
-        guard let kind = Kind(rawValue: name) else {
+        guard let requestedKind = Kind(rawValue: name) else {
             log("未知浮层名: \(name)")
+            return
+        }
+        let kind: Kind = requestedKind == .systemMenu ? .computerPower : requestedKind
+        if kind == .televisionPower, active != kind, !XiaomiTVController.shared.isIdle {
+            log("电视控制繁忙，未重复请求电源菜单")
             return
         }
         if active == kind {
@@ -293,7 +309,7 @@ final class OverlayCenter {
             return
         }
         if active != nil { close() }
-        if kind == .windowPicker || kind == .systemMenu || kind == .computerPower {
+        if kind == .windowPicker || kind == .systemMenu || kind == .computerPower || kind == .televisionPower {
             MouseMode.shared.deactivate()
             mouseStatusText = nil
         }
@@ -318,6 +334,7 @@ final class OverlayCenter {
             showPanel()
         case .computerPower:
             powerGeneration &+= 1
+            reloadControlApplications()
             ActionRunner.configureTelevision(model?.config.television)
             let foreground = NSWorkspace.shared.frontmostApplication
             powerApplication = (foreground?.processIdentifier == NSRunningApplication.current.processIdentifier
@@ -328,7 +345,8 @@ final class OverlayCenter {
             let douyinRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.bytedance.douyin.desktop")
                 .contains { !$0.isTerminated && $0.activationPolicy == .regular }
             powerMenu.open(choices: PowerMenuCatalog.choices(televisionConfigured: XiaomiTVController.shared.isConfigured,
-                currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning))
+                currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning,
+                apps: menuApps.map { (id: $0.id, title: $0.name) }))
             televisionPowerStatus = nil
             if wakeTelevision, XiaomiTVController.shared.isConfigured {
                 televisionPowerStatus = "正在尝试唤醒电视…"
@@ -343,6 +361,24 @@ final class OverlayCenter {
                 }
             }
             showPanel()
+        case .televisionPower:
+            ActionRunner.configureTelevision(model?.config.television)
+            let configuration = model?.config.television
+            televisionMenuConfiguration = configuration
+            powerGeneration &+= 1
+            televisionMenu = TelevisionPowerMenuState()
+            showPanel()
+            let token = powerGeneration
+            XiaomiTVController.shared.perform(.powerMenu, matching: configuration) { [weak self] result in
+                guard let self else { return }
+                guard self.active == .televisionPower, self.powerGeneration == token else {
+                    // Closing while the hold was in flight cancels its resulting dialog.
+                    if TelevisionPowerMenuState.mayHaveOpened(result) { XiaomiTVController.shared.dismissPowerMenu(matching: configuration) }
+                    return
+                }
+                self.televisionMenu.opened(result)
+                self.sync(animated: false)
+            }
         case .tutorial:
             quickLook.setVisible(true,
                                  bundleID: frontApp?.bundleIdentifier,
@@ -376,17 +412,24 @@ final class OverlayCenter {
         // 捕获遥控键：浮层期间事件不走动作分发（引擎 mainDispatch 保证主线程回调）。
         engine?.setOverlayCapture({ [weak self] event in
             MainActor.assumeIsolated { self?.handleKey(event) }
-        }, immediateDirections: kind == .systemMenu || kind == .computerPower)
+        }, immediateDirections: kind == .systemMenu || kind == .computerPower || kind == .televisionPower)
     }
 
     func close() {
         guard active != nil else { return }
+        let dismissTV = active == .televisionPower && televisionMenu.mayBeOpen
+        let televisionConfiguration = televisionMenuConfiguration
         active = nil
         onActiveChanged?()
         powerGeneration &+= 1
         powerMenu.close()
         powerApplication = nil
         televisionPowerStatus = nil
+        televisionMenu = TelevisionPowerMenuState()
+        televisionMenuConfiguration = nil
+        cancelPowerConfirmation(refresh: false)
+        powerOKHeld = false
+        if dismissTV { XiaomiTVController.shared.dismissPowerMenu(matching: televisionConfiguration) }
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexIndex = 0
@@ -448,6 +491,7 @@ final class OverlayCenter {
         case .appWheel:     handleWheelKey(event.key)
         case .codexSessions: handleCodexKey(event.key)
         case .computerPower: handlePowerKey(event.key)
+        case .televisionPower: handleTelevisionPowerKey(event.key)
         case .tutorial:
             // 再按 Home / 返回 / OK 关闭；其余键吞掉（教程页不该有副作用）。
             if event.key == .home || event.key == .back || event.key == .ok { close() }
@@ -456,6 +500,10 @@ final class OverlayCenter {
 
     /// 松键：结束按住连发；OK 松开撤销危险动作确认（gamepad-ux D2/D3）。
     private func keyUp(_ key: RemoteKey) {
+        if key == .ok {
+            powerOKHeld = false
+            cancelPowerConfirmation(refresh: true)
+        }
         if repeatKey == key { stopRepeat() }
         if key == .ok, confirmingIndex != nil { cancelConfirm(refresh: true) }
     }
@@ -633,7 +681,8 @@ final class OverlayCenter {
         // 系统可能正在等待 Automation 授权或保存文件，结果到达前保留反馈位置。
         if active == .computerPower, powerMenu.isExecuting { return }
         // 会话列表需要阅读标题；给它比图标菜单更长的空闲时间。
-        let idleSeconds = active == .codexSessions ? 60 : Self.overlayIdleSeconds
+        let idleSeconds: TimeInterval = active == .televisionPower ? 90
+            : active == .codexSessions ? 60 : active == .computerPower ? 30 : Self.overlayIdleSeconds
         overlayIdleTimer = Timer.scheduledTimer(withTimeInterval: idleSeconds,
                                                 repeats: false) { [weak self] _ in
             Task { @MainActor in self?.close() }
@@ -649,12 +698,113 @@ final class OverlayCenter {
     // MARK: 电脑电源列表
 
     private func handlePowerKey(_ key: RemoteKey) {
+        if key == .ok {
+            guard !powerOKHeld else { return }
+            powerOKHeld = true
+            if powerMenu.selection.command?.requiresHoldConfirmation == true {
+                beginPowerConfirmation()
+                return
+            }
+        } else { cancelPowerConfirmation(refresh: false) }
         handlePowerEffect(powerMenu.handle(key))
     }
 
     private func selectPowerChoice(_ choice: PowerMenuState.Choice) {
         guard active == .computerPower else { return }
+        cancelPowerConfirmation(refresh: false)
+        if choice.command?.requiresHoldConfirmation == true {
+            powerMenu.focus(choice)
+            sync()
+            return
+        }
         handlePowerEffect(powerMenu.select(choice))
+    }
+
+    private func focusPowerChoice(_ choice: PowerMenuState.Choice) {
+        guard active == .computerPower else { return }
+        cancelPowerConfirmation(refresh: false)
+        powerMenu.focus(choice)
+        sync()
+    }
+
+    private func focusPowerSection(_ section: String) {
+        guard active == .computerPower else { return }
+        cancelPowerConfirmation(refresh: false)
+        powerMenu.focusSection(section)
+        sync()
+    }
+
+    private func confirmPowerChoice(_ choice: PowerMenuState.Choice, generation: UInt64, inputGeneration: UInt64) {
+        guard active == .computerPower, powerGeneration == generation,
+              (engine?.inputGeneration ?? 0) == inputGeneration,
+              powerMenu.selection.id == choice.id else { return }
+        cancelPowerConfirmation(refresh: false)
+        handlePowerEffect(powerMenu.select(choice))
+    }
+
+    private func beginPowerConfirmation() {
+        guard powerConfirmingID == nil, !powerMenu.isExecuting else { return }
+        let choice = powerMenu.selection
+        let token = powerGeneration
+        let inputToken = engine?.inputGeneration ?? 0
+        powerConfirmingID = choice.id
+        sync(animated: false)
+        let timer = Timer(timeInterval: SystemMenuCatalog.confirmHoldSeconds, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.powerOKHeld, self.powerConfirmingID == choice.id else { return }
+                self.confirmPowerChoice(choice, generation: token, inputGeneration: inputToken)
+            }
+        }
+        powerConfirmTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func cancelPowerConfirmation(refresh: Bool) {
+        powerConfirmTimer?.invalidate()
+        powerConfirmTimer = nil
+        let changed = powerConfirmingID != nil
+        powerConfirmingID = nil
+        if refresh, changed { sync(animated: false) }
+    }
+
+    /// Input loss must abort holds even if the physical keyUp never arrives.
+    func invalidateInputConfirmation() {
+        powerOKHeld = false
+        cancelPowerConfirmation(refresh: false)
+        cancelConfirm(refresh: false)
+        stopRepeat()
+        if active == .computerPower, !powerMenu.isExecuting { powerMenu.focus(.cancel) }
+        sync(animated: false)
+    }
+
+    private func reloadControlApplications() {
+        let apps: [DockApplications.Entry]
+        if let ids = model?.config.menuFavoriteApps { apps = ids.compactMap { DockApplications.resolve($0) } }
+        else { apps = DockApplications.pinned() }
+        var ids = Set<String>()
+        menuApps = Array(apps.filter { ids.insert($0.id).inserted }.prefix(6))
+    }
+
+    private func handleTelevisionPowerKey(_ key: RemoteKey) {
+        guard active == .televisionPower else { return }
+        guard XiaomiTVController.shared.matches(televisionMenuConfiguration) else {
+            close()
+            open("system_menu")
+            return
+        }
+        switch televisionMenu.handle(key) {
+        case .none: sync(animated: false)
+        case .cancel:
+            close()
+            open("system_menu")
+        case .send(let command):
+            let token = powerGeneration
+            XiaomiTVController.shared.perform(command, matching: televisionMenuConfiguration) { [weak self] result in
+                guard let self, self.active == .televisionPower, self.powerGeneration == token else { return }
+                self.televisionMenu.received(result, key: key)
+                self.sync(animated: false)
+            }
+        }
     }
 
     private func handlePowerEffect(_ effect: PowerMenuState.Effect) {
@@ -665,6 +815,22 @@ final class OverlayCenter {
             close()
         case .execute(let command):
             stopRepeat()
+            cancelPowerConfirmation(refresh: false)
+            switch command {
+            case .tvOff:
+                guard XiaomiTVController.shared.isIdle else {
+                    _ = powerMenu.complete(.failure(.message("电视控制繁忙，请稍后再打开关机菜单。")))
+                    sync(animated: false)
+                    return
+                }
+                open("television_power")
+                return
+            case .launchApp, .systemAction, .focusInput, .openSettings:
+                close()
+                PowerMenuActions.perform(command, currentApplication: nil) { _ in }
+                return
+            default: break
+            }
             restartOverlayIdleTimer()
             sync(animated: false)
             let token = powerGeneration
@@ -737,6 +903,10 @@ final class OverlayCenter {
             uiState.codexIndex = codexIndex
             uiState.powerMenu = powerMenu
             uiState.televisionPowerStatus = televisionPowerStatus
+            uiState.powerConfirmingID = powerConfirmingID
+            uiState.powerGeneration = powerGeneration
+            uiState.confirmationInputGeneration = engine?.inputGeneration ?? 0
+            uiState.televisionMenu = televisionMenu
         }
         if animated {
             withAnimation(Motion.select) { apply() }
@@ -763,7 +933,11 @@ final class OverlayCenter {
             onDismiss: { [weak self] in self?.close() },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
             onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) },
-            onPowerSelect: { [weak self] in self?.selectPowerChoice($0) }))
+            onPowerSelect: { [weak self] in self?.selectPowerChoice($0) },
+            onPowerFocus: { [weak self] in self?.focusPowerChoice($0) },
+            onPowerSection: { [weak self] in self?.focusPowerSection($0) },
+            onPowerConfirmed: { [weak self] in self?.confirmPowerChoice($0, generation: $1, inputGeneration: $2) },
+            onTelevisionKey: { [weak self] in self?.handleTelevisionPowerKey($0) }))
         panel = p
         return p
     }
@@ -1026,6 +1200,9 @@ enum HintBarCatalog {
                     Hint(keys: [.left, .right], text: "选按钮"),
                     Hint(keys: [.ok], text: "确认"),
                     Hint(keys: [.back, .power], text: "取消")]
+        case .televisionPower:
+            return [Hint(keys: [.up, .down, .left, .right], text: "选择电视关机项"),
+                    Hint(keys: [.ok], text: "电视确认"), Hint(keys: [.back], text: "取消电视菜单")]
         }
     }
 
@@ -1150,6 +1327,10 @@ private struct OverlayRootView: View {
     let onMenuSelect: (Int) -> Void
     let onMenuActivate: (Int) -> Void
     let onPowerSelect: (PowerMenuState.Choice) -> Void
+    let onPowerFocus: (PowerMenuState.Choice) -> Void
+    let onPowerSection: (String) -> Void
+    let onPowerConfirmed: (PowerMenuState.Choice, UInt64, UInt64) -> Void
+    let onTelevisionKey: (RemoteKey) -> Void
 
     private var visible: Bool { state.kind != nil }
 
@@ -1175,8 +1356,15 @@ private struct OverlayRootView: View {
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
                 case .computerPower:
+                    let generation = state.powerGeneration
+                    let inputGeneration = state.confirmationInputGeneration
                     PowerMenuView(state: state.powerMenu, onSelect: onPowerSelect,
-                                  televisionStatus: state.televisionPowerStatus)
+                        televisionStatus: state.televisionPowerStatus, favoriteApps: state.menuApps,
+                        onFocus: onPowerFocus, onFocusSection: onPowerSection,
+                        onConfirmed: { choice in onPowerConfirmed(choice, generation, inputGeneration) },
+                        confirmingID: state.powerConfirmingID)
+                case .televisionPower:
+                    TelevisionPowerMenuView(state: state.televisionMenu, onKey: onTelevisionKey)
                 default:
                     EmptyView()
                 }

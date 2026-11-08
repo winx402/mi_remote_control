@@ -128,13 +128,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   action: #selector(showCodexSessions), keyEquivalent: "")
         sessions.target = self
         appMenu.addItem(sessions)
-        let systemMenu = NSMenuItem(title: "系统功能菜单…", action: #selector(showSystemMenu), keyEquivalent: "")
+        let systemMenu = NSMenuItem(title: "控制中心…", action: #selector(showSystemMenu), keyEquivalent: "")
         systemMenu.target = self
         appMenu.addItem(systemMenu)
         let dockMenu = NSMenuItem(title: "Dock 应用选择…", action: #selector(showDockPicker), keyEquivalent: "")
-        let powerMenu = NSMenuItem(title: "电源与应用…", action: #selector(showPowerMenu), keyEquivalent: "")
-        powerMenu.target = self
-        appMenu.addItem(powerMenu)
         dockMenu.target = self
         appMenu.addItem(dockMenu)
         let diagnostics = NSMenuItem(title: "检查抖音导航…", action: #selector(diagnoseDouyinNavigation), keyEquivalent: "")
@@ -394,6 +391,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, let km = services.keyMapper, let filter = services.hidFilter else { return }
             self.dockNavigation.engine = km.engine
+            km.engine.onInputReset = { [weak self] in
+                MainActor.assumeIsolated { self?.overlayCenter?.invalidateInputConfirmation() }
+            }
             km.engine.onApplicationNavigation = { [weak self] key, down in
                 MainActor.assumeIsolated { self?.applicationNavigation.handle(key, isDown: down) }
             }
@@ -461,6 +461,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     default: break
                     }
                     switch action {
+                    case .system("tv_off"):
+                        self.dockNavigation.close()
+                        self.overlayCenter?.open("television_power")
                     case .overlay(let name): self.openOverlay(name, wakeTelevision: name == "computer_power")
                     case .mouseMode:
                         self.dockNavigation.close()

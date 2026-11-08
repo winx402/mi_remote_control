@@ -301,6 +301,78 @@ final class LevelMeterSink: PCMSink, @unchecked Sendable {
 
 // MARK: - 语音链路（M1）
 
+/// 纯门控：off 会丢弃待确认的长按；重新启用后必须先等旧物理会话 STOP，再收新 START。
+/// 不执行音频、输入设备或键盘操作，供生产链路与 self-check 共用。
+struct VoiceDeliveryGate {
+    private(set) var enabled = true
+    private var physicalSession = false
+    private var acceptsFrames = false
+    private var pressGate = VoicePressGate()
+
+    @discardableResult mutating func setEnabled(_ value: Bool) -> Bool {
+        guard enabled != value else { return false }
+        enabled = value
+        if !value { cancelPending() }
+        return true
+    }
+
+    mutating func begin(nowNs: UInt64, holdMs: Int, actionsEnabled: Bool) {
+        guard !physicalSession else { return } // 重复 START 不重置已开始/待确认的会话。
+        physicalSession = true
+        acceptsFrames = enabled
+        pressGate.begin(nowNs: nowNs, holdMs: holdMs,
+                        enabled: enabled && (holdMs == 0 || actionsEnabled))
+    }
+
+    mutating func receive(_ frame: VoicePressGate.Frame, nowNs: UInt64) -> VoicePressGate.Delivery? {
+        guard enabled, acceptsFrames else { return nil }
+        return pressGate.receive(frame, nowNs: nowNs)
+    }
+
+    @discardableResult mutating func end() -> Bool {
+        physicalSession = false
+        acceptsFrames = false
+        return pressGate.end()
+    }
+
+    mutating func cancelPending() {
+        acceptsFrames = false
+        _ = pressGate.end()
+    }
+
+    static func selfCheck() -> Bool {
+        let frame = VoicePressGate.Frame(data: Data([1]), sync: nil)
+        var gate = VoiceDeliveryGate()
+        // CLI 默认允许纯音频桥（没有 IME/切输入动作）。重复 START 不重新开始。
+        gate.begin(nowNs: 0, holdMs: 0, actionsEnabled: false)
+        guard case .begin? = gate.receive(frame, nowNs: 1) else { return false }
+        gate.begin(nowNs: 2, holdMs: 0, actionsEnabled: false)
+        guard case .frames? = gate.receive(frame, nowNs: 3) else { return false }
+        guard gate.setEnabled(false), gate.receive(frame, nowNs: 4) == nil else { return false }
+        // off→on 不能续播同一物理会话；重复 START 也不能绕过。
+        gate.setEnabled(true)
+        gate.begin(nowNs: 5, holdMs: 0, actionsEnabled: true)
+        guard gate.receive(frame, nowNs: 6) == nil, !gate.end() else { return false }
+        // off 时到达的 START/音频全部丢弃，开关本身不会补发 START。
+        gate.setEnabled(false)
+        gate.begin(nowNs: 7, holdMs: 0, actionsEnabled: true)
+        guard gate.receive(frame, nowNs: 8) == nil else { return false }
+        gate.setEnabled(true)
+        guard gate.receive(frame, nowNs: 9) == nil, !gate.end() else { return false }
+        // 长按尚未到阈值时关闭，即使过阈值/重新启用也不能交付旧缓存。
+        gate.begin(nowNs: 10, holdMs: 600, actionsEnabled: true)
+        guard gate.receive(frame, nowNs: 100) == nil else { return false }
+        gate.setEnabled(false)
+        guard gate.receive(frame, nowNs: 700_000_010) == nil else { return false }
+        gate.setEnabled(true)
+        guard gate.receive(frame, nowNs: 800_000_010) == nil, !gate.end() else { return false }
+        gate.begin(nowNs: 900_000_010, holdMs: 600, actionsEnabled: true)
+        guard case .begin(let frames)? = gate.receive(frame, nowNs: 1_500_000_010),
+              frames.count == 1, gate.end() else { return false }
+        return gate.receive(frame, nowNs: 1_600_000_010) == nil
+    }
+}
+
 final class VoiceBridgeApp: ATVVBridgeDelegate {
     private let decoder = ADPCMDecoder()
     private let post: PCMPostprocessor
@@ -310,8 +382,26 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 配置位：GUI 主线程写、ATVV 队列读——锁保护（Bool 竞态读写是未定义行为，
     /// 且会话中途切换会导致 stop 侧清理判断错位，见下方会话锁存）。
     private let cfgLock = NSLock()
+    /// GUI 开关与 ATVV 回调串行化。不得持锁调用会等待主线程 TIS 的 shutdown。
+    private let sessionLock = NSLock()
+    private var deliveryGate = VoiceDeliveryGate()
+    private var cleanupCount = 0
     private var _switchInput: Bool
     private var _doubao: Bool
+    /// CLI 默认保留音频桥；GUI off 必须显式关闭此总门。
+    var voiceEnabled: Bool {
+        get { sessionLock.lock(); defer { sessionLock.unlock() }; return deliveryGate.enabled }
+        set {
+            sessionLock.lock()
+            guard deliveryGate.setEnabled(newValue), !newValue else {
+                sessionLock.unlock()
+                return
+            }
+            let restoreInput = prepareForceEndLocked()
+            sessionLock.unlock()
+            completeForceEnd(restoreInput: restoreInput)
+        }
+    }
     /// GUI 语音页可切换（模式 A=true / 模式 B=false）。
     var switchInput: Bool {
         get { cfgLock.lock(); defer { cfgLock.unlock() }; return _switchInput }
@@ -328,7 +418,6 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var sessionActive = false
     private var sessionSwitchedMic = false
     private var sessionDoubao = false
-    private var pressGate = VoicePressGate()
     private var _minimumHoldMs = 0
     var minimumHoldMs: Int {
         get { cfgLock.lock(); defer { cfgLock.unlock() }; return _minimumHoldMs }
@@ -371,19 +460,24 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     func atvvDisconnected(error: String?) {
+        atvvVoiceStopped() // 断连也是物理会话边界，避免重连后的新 START 被旧锁存拦住。
         log("断开连接\(error.map { ": \($0)" } ?? "")（自动重连中）")
         onConnection?(false, nil)
     }
 
     func atvvVoiceStarted() {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
         let delay = minimumHoldMs
-        pressGate.begin(nowNs: DispatchTime.now().uptimeNanoseconds, holdMs: delay,
-                        enabled: delay == 0 || switchInput || doubao)
+        deliveryGate.begin(nowNs: DispatchTime.now().uptimeNanoseconds, holdMs: delay,
+                           actionsEnabled: switchInput || doubao)
+        if cleanupCount > 0 { deliveryGate.cancelPending() }
     }
 
     private func beginVoiceSession() {
         log("语音开始")
         onVoiceActive?(true)
+        restoreGeneration &+= 1
         restoreWork?.cancel()
         restoreWork = nil
         // 会话锁存：本会话按此刻的配置执行并记录实际做过的操作，
@@ -408,12 +502,17 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     private var restoreWork: DispatchWorkItem?
+    private var restoreGeneration: UInt64 = 0
+    /// 即使新会话取消了旧延迟恢复，off 收尾仍须记得恢复曾经切过的输入设备。
+    private var inputNeedsRestore = false
     private var pendingMicSwitch = false
     private var pendingTrigger = false
     private var triggered = false
 
     func atvvVoiceStopped() {
-        guard pressGate.end() else { return }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard deliveryGate.end() else { return }
         log("语音结束")
         onVoiceActive?(false)
         pendingMicSwitch = false
@@ -429,8 +528,16 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         if didDoubao && didTrigger { VoiceTrigger.end() } // 只有真正触发过才停
         if didSwitch {
             // 延迟还原麦克风：给识别收尾留 1.2s，期间听到的是 BlackHole 静音而非环境音
-            let work = DispatchWorkItem {
+            restoreGeneration &+= 1
+            let generation = restoreGeneration
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.sessionLock.lock()
+                defer { self.sessionLock.unlock() }
+                guard generation == self.restoreGeneration else { return }
                 DefaultInput.restore()
+                self.inputNeedsRestore = false
+                self.restoreWork = nil
                 log("默认麦克风已还原")
             }
             restoreWork = work
@@ -442,7 +549,17 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 服务停止兜底：语音会话仍在进行时按锁存状态强制收尾
     ///（松开触发键、还原默认麦克风），防止 stop 后修饰键粘住/麦克风停在 BlackHole。
     func forceEndSessionIfActive() {
-        _ = pressGate.end()
+        sessionLock.lock()
+        let restoreInput = prepareForceEndLocked()
+        sessionLock.unlock()
+        completeForceEnd(restoreInput: restoreInput)
+    }
+
+    /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
+    private func prepareForceEndLocked() -> Bool {
+        cleanupCount += 1
+        deliveryGate.cancelPending()
+        restoreGeneration &+= 1
         let hadPendingMicRestore = restoreWork != nil
         restoreWork?.cancel()
         restoreWork = nil
@@ -461,16 +578,27 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             onVoiceActive?(false)
             sink.streamStopped()
         }
-        // 即使 ATVV 已先发 VoiceStopped，普通 end 仍可能在等待最短按住/去抖；
-        // 服务停止必须无条件取消延迟并同步补 keyUp/恢复输入法。
+        return didSwitch || hadPendingMicRestore || inputNeedsRestore
+    }
+
+    private func completeForceEnd(restoreInput: Bool) {
+        // shutdown 可能同步等待主线程 TIS，主线程也可能正在切换 GUI 开关：
+        // 不持 sessionLock 等待。cleanupCount 在此期间阻止新 START/PCM 交付。
         VoiceTrigger.shutdown()
-        if didSwitch || hadPendingMicRestore {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if restoreInput {
             DefaultInput.restore()
+            inputNeedsRestore = false
         }
+        cleanupCount -= 1
     }
 
     func atvvAudioFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
-        guard let delivery = pressGate.receive(.init(data: frame, sync: sync),
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard cleanupCount == 0 else { return }
+        guard let delivery = deliveryGate.receive(.init(data: frame, sync: sync),
                                               nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
         switch delivery {
         case .begin(let frames):
@@ -485,6 +613,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         if pendingMicSwitch {
             pendingMicSwitch = false
             let engaged = DefaultInput.engage(deviceName: micDeviceName)
+            if engaged { inputNeedsRestore = true }
             cfgLock.lock(); sessionSwitchedMic = engaged; cfgLock.unlock()
             log(engaged
                 ? "默认麦克风 → \(micDeviceName)"

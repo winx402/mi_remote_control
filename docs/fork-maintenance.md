@@ -44,7 +44,7 @@ open /Applications/MiRemote.app
 | 音量（按住连续调节） | 音量＋／－ |
 | 电视、Mac 与应用操作面板 | 电源单击 |
 
-电源面板按“小米电视／这台 Mac／应用”分组，同类按钮横排，上下切分类、左右在类内选按钮，保留各类上次列并跳过不可用项。提供电视唤醒、待机、音量、Mac 休眠／关机、退出当前 App、退出抖音及取消。选项采用数据目录，后续可追加能力；默认选中取消。OK 或鼠标点击明确选项才执行，电视操作不会回落到 Mac 电源动作。面板方向优先于全局左右长按，避免选项时切桌面。Mac 仍走正常 System Events 电源流程，不使用强制关机；首次实际执行可能要求自动化授权。应用退出使用打开面板前捕获的目标并保留保存／取消流程，不强杀进程。音量成功后保留面板，其余成功后关闭；错误回到取消并保留反馈。
+电源键与菜单双击现在进入同一个控制中心；`computer_power` 与 `system_menu` 是兼容入口。左侧固定分类，右侧显示当前分类的横向功能卡，包含常用 App、小米电视、工作区、媒体、这台 Mac 和应用管理。上下循环切分类，左右类内选择，取消是默认项。普通功能按 OK／单击执行；Mac 电源、锁屏及退出应用沿用 0.6 秒长按确认，提前松开、输入失效或设备断开均撤销。确认凭据核对菜单与实时输入代次，避免丢 keyUp 后执行旧操作。常用 App 沿用原收藏配置，统一面板的遥控和鼠标使用同一动作出口。
 
 ### 小米电视联动
 
@@ -52,9 +52,9 @@ open /Applications/MiRemote.app
 
 “通用 → 小米电视”保存本机专属的 `television` 配置（enabled、局域网 IPv4 host、port，默认 6091），未配置时不连接电视。可选择遥控器音量键控制小米电视或 Mac；电视未连接时不把电视指令误发为 Mac 音量或关机。本机地址不进入源预设与仓库。连接检查仅验证服务 TCP 可达，不代表电视屏幕正在开启。
 
-采用 MiLink 本地协议，音量使用 Android KeyCode 24／25；明确命名的“待机”使用 `KEYCODE_SLEEP` 223，唤醒使用 `KEYCODE_WAKEUP` 224（已醒时无作用），不使用开关切换键 26。遥控器电源键尝试一次224，已开机时不关机；面板已打开时再次电源仍尝试唤醒并收起面板，覆盖电视在面板打开期间被其他遥控器待机的情况。菜单栏打开面板不会主动唤醒电视。每次命令成对发送 DOWN／UP，等待两条匹配确认后才报告送达；入队起 4 秒限时、最多 8 个请求、配置变化会取消旧目标，模糊失败不自动重发。不能以 TCP 可达或 ACK 判断屏幕是否亮着。
+采用 MiLink 本地协议，音量使用 Android KeyCode 24／25；明确命名的“待机”使用 `KEYCODE_SLEEP` 223，唤醒使用 `KEYCODE_WAKEUP` 224（已醒时无作用），不使用开关切换键 26。遥控器电源键尝试一次224，已开机时不关机；面板已打开时再次电源仍尝试唤醒并收起面板，覆盖电视在面板打开期间被其他遥控器待机的情况。菜单栏打开面板不会主动唤醒电视。每次命令成对发送 DOWN／UP，等待两条匹配确认后才报告送达；一般命令入队起 4 秒限时（音量缩短为 1.4 秒）、最多 8 个请求、配置变化会取消旧目标，模糊失败不自动重发。不能以 TCP 可达或 ACK 判断屏幕是否亮着。
 
-真正关机与待机已经分开：本轮用户选择先验证待机唤醒，真关机入口暂不可用，`tv_off`/`--tv off`明确失败，不再发送待机。后续可验证电视原生电源菜单；真关机后如果网络服务停止，224无法送达，能否网络开机要单独实测 WOL/CEC/IR 等恢复通路，不能以记录的上次操作假装当前电源状态。
+电视“关机…”已接入原生确认流程，与 223 待机分开：MiLink 对 26 发送真实 2.2 秒长按（23 帧、100 ms 间隔），调出电视自己的电源菜单；本机随后进入电视确认模式，方向与 OK 只发给该电视，由用户在电视画面选择“关机”并确认，不按固定菜单位置盲选。回执只证明序列送达，不宣称电视已关机；回执不完整时先要求用户确认菜单可见。返回会取消排队的旧电视导航并发送 TV Back。旧面板、旧输入代次或旧设备配置的回调不会执行新目标。长按剩余时限不足时不发 DOWN，断连、取消或时序异常不会自动重放 POWER。当前固件是否显示原生菜单以及真正关机的结果仍待用户实测；自动开机未验证成功，关机后的恢复继续依赖用户已确认可用的原电视遥控器。
 
 脚本入口不启动 GUI、蓝牙或按键映射，可以和 GUI 并行。示例中的配置来自本机，不在命令行重复暴露地址：
 
@@ -64,10 +64,13 @@ open /Applications/MiRemote.app
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv volume-down
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv standby
 /Applications/MiRemote.app/Contents/MacOS/miremote --tv wake
+/Applications/MiRemote.app/Contents/MacOS/miremote --tv off
 python3 scripts/test-television-client.py --binary /Applications/MiRemote.app/Contents/MacOS/miremote
 ```
 
-`--tv` 可另带 `--config 路径`；`standby`与`wake`只作用于电视，绝不关闭 Mac。loopback 测试验证真实 CLI 的成对报文、分片／乱序确认、少确认不重发、待机/唤醒键码、拒绝把off混作待机，以及通用 `--run-action` 的异步等待，所有测试只连接本机假电视。协议事实参考 [Mi TV Remote](https://github.com/EndLess728/MiTV-Remote) 和 [Android KeyEvent](https://developer.android.com/reference/android/view/KeyEvent#KEYCODE_SLEEP)，本项目未复制第三方客户端代码。
+`--tv` 可另带 `--config 路径`；`standby`／`wake`作用于电视，`off`／`power-menu`只打开电视原生电源菜单，真正关机须在电视确认。还支持 `up/down/left/right/ok/back` 单次导航。`system("tv_off")` 在 GUI 中进入电视确认模式；`--run-action` 等无 GUI 脚本只请求菜单。loopback 测试覆盖相对音量、待机／唤醒、导航、23 帧长按、分片／乱序回执、部分回执不重发，以及通用脚本异步等待；只连接本机假电视。协议依据见 [Mi TV Remote](https://github.com/EndLess728/MiTV-Remote) 与 [Android KeyEvent](https://developer.android.com/reference/android/view/KeyEvent#KEYCODE_SLEEP)。
+
+历史“电视音量数字不变但实际声音小、重启电视恢复”的原因尚未证实，未自动调整增益、绝对音量或声音模式。已收紧音量有效期与排队数，菜单请求会清理过期音量；同时修正 GUI 语音 off 后仍可能启动音频桥的旁路。off 停止新 PCM/输入法触发，已缓冲音频沿用最多约 2.2 秒正常排空。CLI 默认纯音频桥保持可用。下次故障应在重启前记录播放器自身音量、当前 HDMI 输出和电视声音模式，并区分电视自带应用与 Mac HDMI 是否都受影响。
 
 ### 其他按键
 
@@ -81,7 +84,7 @@ HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.ap
 
 长按菜单进入真实 macOS Dock 的应用选择模式；四个方向都沿 App 图标顺序选择，OK 打开／激活，返回取消，闲置后自动退出。适配 Dock 的左侧、底部、右侧位置与自动隐藏。Dock 模式中左右按键只选 App；退出模式后恢复全局左右长按。选择只通过系统键盘和公开 Accessibility 接口，不改 Dock 的固定项与布局。
 
-系统菜单顶部的常用 App 默认跟随 Dock 固定项，最多 6 个；可在“通用 → 系统功能菜单 · 常用应用”自定义、排序或隐藏。可选 `menuFavoriteApps` 保存 bundle ID 列表，具体个人选择只保留在本机配置中。菜单打开时四方向按下即移动，关闭菜单后恢复全局左右长按。菜单同时支持遥控器和鼠标；退出、锁屏等项目仍要求长按确认。
+控制中心“常用 App”默认跟随 Dock 固定项，最多 6 个；仍可在通用设置中自定义、排序或隐藏，个人列表只保留在本机配置。分类与功能卡按下即响应，不等待全局左右双击；面板内方向捕获优先于全局左右长按。退出、锁屏及 Mac 电源操作保留明确的长按确认。
 
 | Codex 专用操作 | 按键 |
 | --- | --- |
@@ -117,10 +120,13 @@ HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.ap
 
 ```sh
 .build/miremote --self-test
+python3 scripts/test-television-client.py --binary .build/miremote
 .build/miremote --render-system-menu .build/system-menu-preview.png
 git diff --check
 bash -n script/build_and_run.sh
 ```
+
+本次统一面板版本通过 235 项逻辑自检和 12 项本机电视协议模拟场景；另验证通用脚本会等宏延时与异步 shell 完成。通用脚本以 50 ms 有界主循环处理回调，避免长按电源帧因无限期 run-loop 等待而中断。这些检查不证明电视原生菜单可见或真实关机成功，实机结果单独记录。
 
 自检只验证逻辑。真实按键应先在独立空白文档中测试 Return、删除、鼠标模式，再在 Codex 测试命令菜单和模型选择；不要在含有待发送文字的聊天输入框测试 Return。“识别按键”页仍会执行映射，不是隔离测试环境。
 

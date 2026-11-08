@@ -21,7 +21,7 @@ def read_exact(connection, count):
     return data
 
 
-def read_key(connection):
+def read_key(connection, repeat=0):
     kind, length = struct.unpack(">BH", read_exact(connection, 3))
     assert kind == 4 and length == 65
     code, message_id, data_length = struct.unpack(">BIH", read_exact(connection, 7))
@@ -35,7 +35,7 @@ def read_key(connection):
         fields[tag] = int.from_bytes(payload[offset + 1:offset + 1 + width], "big", signed=True)
         offset += width + 1
     assert offset == 58 and fields[7] == fields[8] == 0
-    assert fields[1] == fields[4] == fields[5] == fields[6] == 0
+    assert fields[1] == fields[4] == fields[6] == 0 and fields[5] == repeat
     assert fields[10] == -1 and fields[11] == 0x101
     return message_id, fields
 
@@ -96,9 +96,52 @@ def scenario(binary, root, base_config, verb, expected_key=None, partial=False, 
             args = [str(binary), "--tv", verb, "--config", str(config_path)]
         result = subprocess.run(args, capture_output=True, text=True, timeout=9)
         worker.join(timeout=8)
-        assert not worker.is_alive() and not failures, failures
+        assert not worker.is_alive() and not failures, (failures, result.returncode, result.stdout, result.stderr)
         assert (result.returncode != 0) if partial else (result.returncode == 0), result.stdout + result.stderr
         print(f"PASS {verb}{' partial ACK' if partial else ''}{' generic action' if generic else ''}")
+
+
+def power_menu_scenario(binary, root, base_config, partial=False, generic=False):
+    failures = []
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0)); listener.listen(2); listener.settimeout(8)
+        config = dict(base_config, television={"enabled": True, "host": "127.0.0.1", "port": listener.getsockname()[1]})
+        path = root / "power-menu-config.json"; path.write_text(json.dumps(config))
+
+        def serve():
+            try:
+                with listener.accept()[0] as connection:
+                    connection.settimeout(5)
+                    started = time.monotonic(); ids = []
+                    for index in range(23):
+                        message_id, fields = read_key(connection, repeat=index if index < 22 else 0)
+                        assert fields[3] == 26 and fields[2] == (0 if index < 22 else 1)
+                        assert message_id not in ids
+                        ids.append(message_id)
+                    assert time.monotonic() - started >= 2.05, "POWER was sent as a short pair"
+                    values = ids[:-1] if partial else ids
+                    response = b"".join(ack(i) for i in reversed(values))
+                    connection.sendall(response[:2]); time.sleep(.02); connection.sendall(response[2:])
+                    if not partial: assert connection.recv(1) == b"", "unexpected POWER replay"
+                listener.settimeout(.15)
+                try:
+                    extra, _ = listener.accept(); extra.close()
+                    raise AssertionError("POWER was automatically retried")
+                except TimeoutError: pass
+            except Exception as error: failures.append(repr(error))
+
+        worker = threading.Thread(target=serve, daemon=True); worker.start()
+        verb = "power-menu" if partial else "off"
+        arguments = [str(binary), "--config", str(path), "--run-action", json.dumps({"type": "system", "value": "tv_off"})] if generic else [str(binary), "--tv", verb, "--config", str(path)]
+        result = subprocess.run(arguments,
+                                capture_output=True, text=True, timeout=8)
+        worker.join(timeout=6)
+        assert not worker.is_alive() and not failures, (failures, result.returncode, result.stdout, result.stderr)
+        if partial: assert result.returncode != 0, result.stdout + result.stderr
+        else:
+            assert result.returncode == 0, result.stdout + result.stderr
+            if not generic: assert "不代表电视已经关机" in result.stdout
+        print("PASS native power menu" + (" partial ACK, no retry" if partial else " sustained POWER + confirmation required") + (" generic action" if generic else ""))
 
 
 def main():
@@ -114,9 +157,12 @@ def main():
         scenario(args.binary, root, base_config, "wake", 224)
         scenario(args.binary, root, base_config, "volume-down", 25, partial=True)
         scenario(args.binary, root, base_config, "volume-down", 25, generic=True)
-        rejected = subprocess.run([str(args.binary), "--tv", "off"], capture_output=True, text=True, timeout=3)
-        assert rejected.returncode != 0 and "尚未接入" in rejected.stdout
-        print("PASS true shutdown is not aliased to standby")
+        scenario(args.binary, root, base_config, "up", 19)
+        scenario(args.binary, root, base_config, "ok", 23)
+        scenario(args.binary, root, base_config, "back", 4)
+        power_menu_scenario(args.binary, root, base_config)
+        power_menu_scenario(args.binary, root, base_config, partial=True)
+        power_menu_scenario(args.binary, root, base_config, generic=True)
 
 
 if __name__ == "__main__":

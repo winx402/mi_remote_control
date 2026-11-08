@@ -7,14 +7,10 @@ enum TelevisionCLI {
 
     static func run(_ arguments: [String]) -> Int32 {
         guard let verb = arguments.first,
-              ["status", "volume-up", "volume-down", "standby", "wake", "off"].contains(verb),
+              ["status", "volume-up", "volume-down", "standby", "wake", "off", "power-menu", "up", "down", "left", "right", "ok", "back"].contains(verb),
               arguments.count == 1 || (arguments.count == 3 && arguments[1] == "--config") else {
-            print("用法：miremote --tv status|volume-up|volume-down|standby|wake [--config 路径]")
+            print("用法：miremote --tv status|volume-up|volume-down|standby|wake|off|power-menu|up|down|left|right|ok|back [--config 路径]")
             return 2
-        }
-        guard verb != "off" else {
-            print("真正关机尚未接入；待机请使用 --tv standby，唤醒请使用 --tv wake。")
-            return 1
         }
         let path = arguments.count == 3 ? arguments[2] : nil
         let client = XiaomiTVController.shared
@@ -27,8 +23,10 @@ enum TelevisionCLI {
         if verb == "status" {
             client.checkConnection { completion.result = $0 }
         } else {
-            let command: XiaomiTVCommand = verb == "volume-up" ? .volumeUp : verb == "volume-down" ? .volumeDown
-                : verb == "wake" ? .wake : .sleep
+            let commands: [String: XiaomiTVCommand] = ["volume-up": .volumeUp, "volume-down": .volumeDown,
+                "standby": .sleep, "wake": .wake, "off": .powerMenu, "power-menu": .powerMenu,
+                "up": .up, "down": .down, "left": .left, "right": .right, "ok": .ok, "back": .back]
+            guard let command = commands[verb] else { return 2 }
             client.perform(command) { completion.result = $0 }
         }
         let keepAlive = Timer(timeInterval: 0.05, repeats: true) { _ in }
@@ -42,7 +40,11 @@ enum TelevisionCLI {
         client.stop()
         switch result {
         case .success:
-            print(verb == "status" ? "电视本地控制服务可达；这不代表屏幕开关状态。" : "电视已确认收到按键；实际结果请查看电视。")
+            if verb == "off" || verb == "power-menu" {
+                print("电视电源菜单指令已送达；请在电视上选择“关机”并确认。这不代表电视已经关机。")
+            } else {
+                print(verb == "status" ? "电视本地控制服务可达；这不代表屏幕开关状态。" : "电视已确认收到按键；实际结果请查看电视。")
+            }
             return 0
         case .failure(let failure): print(failure.message); return 1
         case nil: print("等待电视确认超时；不会自动重发指令。"); return 1

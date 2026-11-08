@@ -233,8 +233,11 @@ struct PowerMenuState {
         let current = selection.id == Choice.cancel.id
             ? groups.count : groups.firstIndex(where: { $0.id == selection.section })
         guard let current else { return }
-        var next = current + delta
-        while (0...groups.count).contains(next) {
+        let rowCount = groups.count + 1
+        var next = current
+        // 取消也是最后一行；最多检查一圈，全部禁用或无分类时安全停在取消。
+        for _ in 0..<rowCount {
+            next = (next + delta + rowCount) % rowCount
             if next == groups.count {
                 updateSelection(.cancel)
                 return
@@ -252,7 +255,6 @@ struct PowerMenuState {
                 updateSelection(section.choices[enabled])
                 return
             }
-            next += delta
         }
     }
 
@@ -315,7 +317,8 @@ struct PowerMenuState {
               state.handle(.up) == .none, state.selection == standby,
               state.handle(.right) == .none, state.selection == volume,
               state.handle(.right) == .none, state.selection == volume,
-              state.handle(.up) == .none, state.selection == volume,
+              state.handle(.up) == .none, state.selection == .cancel,
+              state.handle(.down) == .none, state.selection == volume,
               state.handle(.down) == .none, state.selection == .shutDown,
               state.handle(.left) == .none, state.selection == .sleep,
               state.handle(.up) == .none, state.selection == volume else { return false }
@@ -359,11 +362,29 @@ struct PowerMenuState {
                   state.handle(.ok) == .none,
                   state.complete(.success(())) == .dismiss, !state.isOpen else { return false }
         }
-        state.open(choices: [unavailable])
-        guard state.handle(.up) == .none, state.selection == .cancel,
-              state.select(.sleep) == .none, state.handle(.ok) == .dismiss else { return false }
-        state.open(choices: [])
-        return state.sections.isEmpty && state.choices == [.cancel]
-            && state.selection == .cancel && state.handle(.ok) == .dismiss
+        // 首尾循环包含取消行，跳过首尾整组禁用，并保留各类列记忆。
+        let unavailableLast = Choice(id: "disabled.last", title: "不可用", symbol: "xmark",
+                                     section: "末尾不可用", disabled: true)
+        state.open(choices: [unavailable, wake, volume, .sleep, unavailableLast])
+        guard state.handle(.down) == .none, state.selection == wake,
+              state.handle(.left) == .none, state.selection == wake,
+              state.handle(.up) == .none, state.selection == .cancel,
+              state.handle(.up) == .none, state.selection == .sleep,
+              state.handle(.down) == .none, state.selection == .cancel,
+              state.handle(.down) == .none, state.selection == wake,
+              state.handle(.right) == .none, state.selection == volume,
+              state.handle(.right) == .none, state.selection == volume,
+              state.handle(.up) == .none, state.selection == .cancel,
+              state.handle(.down) == .none, state.selection == volume else { return false }
+        // 多个分类全禁用与完全无分类时，反复循环仍只停在取消。
+        for choices in [[unavailable, unavailableLast], []] {
+            state.open(choices: choices)
+            for key in [RemoteKey.up, .down, .up, .down, .left, .right] {
+                guard state.handle(key) == .none, state.selection == .cancel,
+                      !state.isExecuting else { return false }
+            }
+            guard state.select(.sleep) == .none, state.handle(.ok) == .dismiss else { return false }
+        }
+        return state.sections.isEmpty && state.choices == [.cancel] && !state.isOpen
     }
 }

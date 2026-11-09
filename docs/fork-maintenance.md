@@ -54,7 +54,7 @@ open /Applications/MiRemote.app
 
 采用 MiLink 本地协议，音量使用 Android KeyCode 24／25；明确命名的“待机”使用 `KEYCODE_SLEEP` 223，唤醒使用 `KEYCODE_WAKEUP` 224（已醒时无作用），不使用开关切换键 26。遥控器电源键尝试一次224，已开机时不关机；面板已打开时再次电源仍尝试唤醒并收起面板，覆盖电视在面板打开期间被其他遥控器待机的情况。菜单栏打开面板不会主动唤醒电视。每次命令成对发送 DOWN／UP，等待两条匹配确认后才报告送达；一般命令入队起 4 秒限时（音量缩短为 1.4 秒）、最多 8 个请求、配置变化会取消旧目标，模糊失败不自动重发。不能以 TCP 可达或 ACK 判断屏幕是否亮着。
 
-电视“关机…”已接入原生确认流程，与 223 待机分开：MiLink 对 26 发送真实 2.2 秒长按（23 帧、100 ms 间隔），调出电视自己的电源菜单；本机随后进入电视确认模式，方向与 OK 只发给该电视，由用户在电视画面选择“关机”并确认，不按固定菜单位置盲选。回执只证明序列送达，不宣称电视已关机；回执不完整时先要求用户确认菜单可见。返回会取消排队的旧电视导航并发送 TV Back。旧面板、旧输入代次或旧设备配置的回调不会执行新目标。长按剩余时限不足时不发 DOWN，断连、取消或时序异常不会自动重放 POWER。2026-11-09 用户已确认原生电源菜单能出现，且可以关机；开机仍失败。此前待机后本地服务离线、WOL 未亮屏的结果继续保留；后续服务恢复可达不能反推关机期间一直在线，唤醒 ACK 也不能证明亮屏。关机后的恢复仍使用用户已确认可用的原电视遥控器，下一步需核对唤醒试验前后的实际画面。
+电视“关机…”已接入原生确认流程，与 223 待机分开：MiLink 对 26 发送真实 2.2 秒长按（23 帧、100 ms 间隔），调出电视自己的电源菜单；本机随后进入电视确认模式，方向与 OK 只发给该电视，由用户在电视画面选择“关机”并确认，不按固定菜单位置盲选。回执只证明序列送达，不宣称电视已关机；回执不完整时先要求用户确认菜单可见。返回会取消排队的旧电视导航并发送 TV Back。旧面板、旧输入代次或旧设备配置的回调不会执行新目标。长按剩余时限不足时不发 DOWN，断连、取消或时序异常不会自动重放 POWER。2026-11-09 用户已确认原生电源菜单能出现，且可以关机；开机仍失败。此前待机后本地服务离线、WOL 未亮屏的结果继续保留；后续服务恢复可达不能反推关机期间一直在线，唤醒 ACK 也不能证明亮屏。用户进一步确认：最新一次唤醒 ACK 到达前，电视已用原遥控器手动打开并显示 Mac；该回执不计为唤醒成功。关机后的恢复仍使用原电视遥控器，下一步验证独立的 CEC 或红外通路，优先复用用户已有设备。
 
 脚本入口不启动 GUI、蓝牙或按键映射，可以和 GUI 并行。示例中的配置来自本机，不在命令行重复暴露地址：
 
@@ -76,7 +76,7 @@ python3 scripts/test-television-client.py --binary /Applications/MiRemote.app/Co
 
 按键恢复保留原有周期健康检查，并在遥控器接入、系统唤醒和 GUI 显示参数变化后执行短时、有界复查。确认映射仍在位则不重写，查询未确认则不盲装，确认缺失才修复；暂停、停止及新的恢复批次会作废旧回调。恢复只释放已记录的原生按下状态，不生成新的按下动作。`com.miremote.controller / KeyMappingRecovery` 日志用于区分恢复时间；这项改进不等于已证实或消除电视自身控制服务的启动延迟。
 
-HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.apple.com/en-us/108928)未将 M2 Mac mini 的内置 HDMI 列入 CEC 支持名单；指定的 Apple USB-C Digital AV Multiport Adapter 和 Belkin 转接器可在 Apple silicon / macOS 14.4+ 提供系统自动 CEC，但这不等于应用获得任意 CEC 发包接口。恢复视频信号、请求 Mac 显示器醒来与发送 CEC 命令是不同能力，不能混作已验证的电视开机。
+HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.apple.com/en-us/108928)未将 M2 Mac mini 的内置 HDMI 列入 CEC 支持名单；指定的 Apple USB-C Digital AV Multiport Adapter 和 Belkin 转接器可在 Apple silicon / macOS 14.4+ 提供系统自动 CEC，但这不等于应用获得任意 CEC 发包接口。恢复视频信号、请求 Mac 显示器醒来与发送 CEC 命令是不同能力，不能混作已验证的电视开机。 若需要脚本直接发送 CEC 开机，可评估独立 USB-CEC 适配器及 libCEC；[厂商 macOS 文档](https://support.pulse-eight.com/support/solutions/articles/30000053024-cec-adapter-setting-up-libcec-on-macos)提供 `cec-client` 的 `on 0` 命令。它与普通 USB-C 转 HDMI 转接器不同，仍需核验电视 CEC 设置、现有分辨率和实机冷启动效果，未接入前不宣称可用。
 
 遥控器自动换主机尚未实现，也未确认 2 Pro 的多主机保留配对与主机选择协议。Mac 端释放某条 CoreBluetooth 连接不能保证系统 HID 物理链路释放，更不能命令电视交还连接；详见 [Apple cancelPeripheralConnection](https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/cancelperipheralconnection(_:))。检测到 HDMI 变化只解决触发条件，不解决蓝牙交接本身。现阶段不自动解绑、重配或抢占遥控器。
 

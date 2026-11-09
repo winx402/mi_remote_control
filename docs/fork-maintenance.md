@@ -78,6 +78,15 @@ python3 scripts/test-television-client.py --binary /Applications/MiRemote.app/Co
 
 HDMI 唤醒需按实际连接验证。[Apple 兼容性说明](https://support.apple.com/en-us/108928)未将 M2 Mac mini 的内置 HDMI 列入 CEC 支持名单；指定的 Apple USB-C Digital AV Multiport Adapter 和 Belkin 转接器可在 Apple silicon / macOS 14.4+ 提供系统自动 CEC，但这不等于应用获得任意 CEC 发包接口。恢复视频信号、请求 Mac 显示器醒来与发送 CEC 命令是不同能力，不能混作已验证的电视开机。 若需要脚本直接发送 CEC 开机，可评估独立 USB-CEC 适配器及 libCEC；[厂商 macOS 文档](https://support.pulse-eight.com/support/solutions/articles/30000053024-cec-adapter-setting-up-libcec-on-macos)提供 `cec-client` 的 `on 0` 命令。它与普通 USB-C 转 HDMI 转接器不同，仍需核验电视 CEC 设置、现有分辨率和实机冷启动效果，未接入前不宣称可用。
 
+现有接线可先做显示输出恢复试验，检查电视是否会自行随信号恢复而亮屏；尚未实测成功，不接入常用电源键。`scripts/probe-hdmi-signal-wake.sh` 默认只预览，`--run` 请求 Mac 显示器熄屏 5 秒后恢复，`--standby-first` 先通过 MiRemote 请求电视待机。使用临时 `caffeinate -i -s` 保持 Mac 运行，先安排恢复任务再执行 `pmset displaysleepnow`，中断时也请求显示恢复，不修改持久电源设置。该试验不发送 CEC，不保证 HDMI 电压或热插拔信号发生变化；命令退出成功、显示唤醒请求完成都不代表电视已亮屏，须记录测试前后真实画面。
+
+```sh
+# 预览，不改变电视或 Mac 的显示状态
+scripts/probe-hdmi-signal-wake.sh --standby-first
+# 已确认测试前状态后运行；电视已经黑屏时省略 --standby-first
+scripts/probe-hdmi-signal-wake.sh --run --standby-first
+```
+
 遥控器自动换主机尚未实现，也未确认 2 Pro 的多主机保留配对与主机选择协议。Mac 端释放某条 CoreBluetooth 连接不能保证系统 HID 物理链路释放，更不能命令电视交还连接；详见 [Apple cancelPeripheralConnection](https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/cancelperipheralconnection(_:))。检测到 HDMI 变化只解决触发条件，不解决蓝牙交接本身。现阶段不自动解绑、重配或抢占遥控器。
 
 返回长按使用独立全局 `quit_app` 动作，请求当前前台应用正常退出，保留应用自己的保存／取消流程。一次按住只请求一次，松手不补发返回；单击仍执行当前应用原有返回操作。退出前会释放鼠标拖拽并收起临时面板。鼠标模式仍可用返回单击或闲置 20 秒退出。

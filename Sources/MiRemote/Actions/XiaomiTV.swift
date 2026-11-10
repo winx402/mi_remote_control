@@ -252,6 +252,31 @@ final class XiaomiTVController: ObservableObject {
         perform(.back) { _ in }
     }
 
+    /// Discard navigation belonging to an ended local TV-control context, without
+    /// sending Back to a TV that may already have restarted. A committed POWER
+    /// hold is allowed to finish so cancellation cannot turn it into a short press.
+    func abandonMenuNavigation(matching expected: XiaomiTVConfiguration?) {
+        guard matches(expected) else { return }
+        let navigation: Set<XiaomiTVCommand> = [.up, .down, .left, .right, .ok, .back]
+        let cancelled = pending.filter { request in
+            request.operation.command.map(navigation.contains) == true
+        }
+        let ids = Set(cancelled.map(\.id))
+        pending.removeAll { ids.contains($0.id) }
+        var unsent: Session?
+        if let session = active, let command = session.request.operation.command,
+           navigation.contains(command), session.sender?.cancelIfUnsent() ?? true {
+            active = nil
+            session.cancel()
+            unsent = session
+        }
+        cancellationDepth += 1
+        unsent?.request.completion(.failure(.cancelled))
+        cancelled.forEach { $0.completion(.failure(.cancelled)) }
+        cancellationDepth -= 1
+        startNextIfNeeded()
+    }
+
     /// 仅测试 TCP 是否可达，不发送按键，也不能据此推断电视电源状态。
     func checkConnection(completion: @escaping @MainActor @Sendable (Result<Void, XiaomiTVFailure>) -> Void) {
         enqueue(.checkConnection, completion: completion)
@@ -534,6 +559,16 @@ private final class XiaomiTVKeySender: @unchecked Sendable {
     }
 
     var hasSentFrames: Bool { stateLock.withLock { sentAny } }
+
+    /// Linearize the decision with send(): a DOWN cannot slip between checking
+    /// sentAny and cancelling the connection. A committed pair is left intact.
+    func cancelIfUnsent() -> Bool {
+        stateLock.withLock {
+            guard !sentAny, !cancelled else { return false }
+            cancelled = true
+            return true
+        }
+    }
 
     func start() {
         queue.async { [self] in

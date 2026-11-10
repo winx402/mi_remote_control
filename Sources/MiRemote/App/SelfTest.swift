@@ -244,6 +244,7 @@ enum SelfTest {
         expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
         expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
         expect(TelevisionPowerMenuState.selfCheck(), "电视原生关机确认、异常回执与取消导航（无真实操作）")
+        expect(ATVVReconnectPlan.selfCheck(), "ATVV 重连窗口合并、一次已知尝试、停止与旧代隔离")
         expect(VoiceDeliveryGate.selfCheck(), "语音关闭总门、旧会话隔离与清理代次（无音频输出）")
         expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")

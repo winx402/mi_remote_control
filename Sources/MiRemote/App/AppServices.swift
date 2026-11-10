@@ -834,6 +834,24 @@ final class AppServices {
     private var workspaceObservers: [NSObjectProtocol] = []
     /// AppKit 显示参数通知来自 default center，必须在同一 center 解除。
     private var displayParametersObserver: NSObjectProtocol?
+    /// All callers run on the main queue. GUI ends temporary TV-key routing
+    /// when its display or physical-input context is no longer current.
+    var onRemoteContextChanged: ((String) -> Void)?
+
+    private func reconnectForExternalDisplay(reason: String) {
+        guard started, options.keys else { return }
+        guard keyMapper?.engine.isSuspended != true else {
+            bridge.cancelReconnectRequest(reason: "遥控已暂停")
+            return
+        }
+        let externalDisplay = NSScreen.screens.contains { screen in
+            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
+            return CGDisplayIsBuiltin(CGDirectDisplayID(id.uint32Value)) == 0
+        }
+        // Display presence is not proof that the TV has selected this HDMI input.
+        if externalDisplay { bridge.requestReconnect(reason: reason) }
+        else { bridge.cancelReconnectRequest(reason: "未检测到外接显示器") }
+    }
 
     /// 启动期语音触发三级合并（纯函数，供自测）：内置默认 ← 配置 global 规则 ← CLI 标志。
     /// cliIME 双层 Optional：nil=CLI 未给；.some(nil)=--ime none（不切输入法）；.some(v)=指定前缀。
@@ -937,22 +955,38 @@ final class AppServices {
             // 映射生命周期：设备/显示服务重建后，短窗口复核实际映射，确认缺失才重装；
             // 设备移除 / 系统睡眠可能丢 keyUp → 复位引擎与 tap 的按压状态。
             hid.onDeviceMatched = { [weak tap] in tap?.scheduleMappingRecovery(reason: "设备接入") }
-            hid.onDeviceRemoved = { [weak km, weak tap] in
+            hid.onDeviceRemoved = { [weak self, weak km, weak tap] in
+                self?.onRemoteContextChanged?("遥控器已断开")
                 km?.engine.resetInputState(reason: "设备移除")
                 tap?.resetPressState()
             }
             let wsnc = NSWorkspace.shared.notificationCenter
             workspaceObservers.append(wsnc.addObserver(
-                forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak tap] _ in
+                forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self, weak tap] _ in
                 tap?.scheduleMappingRecovery(reason: "系统唤醒")
+                self?.onRemoteContextChanged?("系统唤醒")
+                self?.reconnectForExternalDisplay(reason: "系统唤醒且存在外接显示")
             })
             displayParametersObserver = NotificationCenter.default.addObserver(
                 forName: NSApplication.didChangeScreenParametersNotification,
-                object: nil, queue: nil) { [weak tap] _ in
+                object: nil, queue: .main) { [weak self, weak tap] _ in
                 tap?.scheduleMappingRecovery(reason: "显示参数变化")
+                self?.onRemoteContextChanged?("显示连接变化")
+                self?.reconnectForExternalDisplay(reason: "显示连接变化且存在外接显示")
+            }
+            for notification in [NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification] {
+                workspaceObservers.append(wsnc.addObserver(
+                    forName: notification, object: nil, queue: .main) { [weak self] note in
+                    let awake = note.name == NSWorkspace.screensDidWakeNotification
+                    self?.onRemoteContextChanged?(awake ? "显示输出恢复" : "显示输出休眠")
+                    if awake { self?.reconnectForExternalDisplay(reason: "外接显示输出恢复") }
+                    else { self?.bridge.cancelReconnectRequest(reason: "显示输出休眠") }
+                })
             }
             workspaceObservers.append(wsnc.addObserver(
-                forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [weak km, weak tap] _ in
+                forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self, weak km, weak tap] _ in
+                self?.onRemoteContextChanged?("系统即将休眠")
+                self?.bridge.cancelReconnectRequest(reason: "系统即将休眠")
                 km?.engine.resetInputState(reason: "系统睡眠")
                 tap?.resetPressState()
             })
@@ -968,6 +1002,9 @@ final class AppServices {
         health.startPeriodicChecks()
         log("启动，输出设备: \(options.outputName ?? "系统默认")\(options.wavPath.map { "，WAV: \($0)" } ?? "")")
         bridge.start()
+        DispatchQueue.main.async { [weak self] in
+            self?.reconnectForExternalDisplay(reason: "启动且存在外接显示")
+        }
     }
 
     /// 停止并恢复系统状态（hidutil 中转恢复、语音断开、shell 进程组清扫）。幂等。

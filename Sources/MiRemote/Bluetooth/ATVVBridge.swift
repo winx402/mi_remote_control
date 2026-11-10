@@ -111,6 +111,18 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private static let backoff: [Double] = [1, 2, 5]
     private var reconnectAttempt = 0
 
+    /// Only a locally verified GATT peer UUID is persisted; no address or bond is
+    /// created here. CoreBluetooth connection success does not establish HID input.
+    private static let rememberedPeripheralKey = "MiRemote.ATVV.lastVerifiedPeripheralIdentifier"
+    private let defaults: UserDefaults
+    private var reconnectPlan = ATVVReconnectPlan()
+    private var reconnectWindowWork: DispatchWorkItem?
+    private var pendingConnectWork: DispatchWorkItem?
+    private var connectionWindowToken: UInt64?
+    /// Retain the current peripheral until its cancellation callback arrives, so
+    /// a delayed callback cannot be mistaken for a new attempt on the same object.
+    private var pendingConnectionCancellation = false
+
     private var peripheral: CBPeripheral?
     private var txChar: CBCharacteristic?
     private var audioChar: CBCharacteristic?
@@ -167,8 +179,9 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     // MARK: - 生命周期
 
-    init(delegate: ATVVBridgeDelegate?) {
+    init(delegate: ATVVBridgeDelegate?, defaults: UserDefaults = .standard) {
         self.delegate = delegate
+        self.defaults = defaults
         super.init()
         // 在专用 queue 上创建 central，delegate 回调都落到该 queue。
         central = CBCentralManager(delegate: self, queue: queue)
@@ -188,6 +201,61 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
+    /// Requests an 18-second BLE reconnect window. Repeated wake/display events
+    /// merge; an existing connection or capability negotiation is left untouched.
+    /// This never pairs a device, disconnects another host, or asserts HID takeover.
+    func requestReconnect(reason: String) {
+        queue.async { [weak self] in
+            guard let self, self.shouldRun else { return }
+            guard self.peripheral == nil else {
+                self.log("RECONNECT_REQUEST ignored (connection active or pending) reason=\(reason)")
+                return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard let token = self.reconnectPlan.begin(now: now) else {
+                self.log("RECONNECT_REQUEST merged reason=\(reason)")
+                return
+            }
+            self.reconnectWindowWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.shouldRun, self.reconnectPlan.end(token: token) else { return }
+                self.reconnectWindowWork = nil
+                self.log("RECONNECT_WINDOW ended; returning to passive discovery")
+                // Only cancel a still-pending connection owned by this window.
+                // A connected peer may still be negotiating ATVV and is preserved.
+                if self.connectionWindowToken == token {
+                    self.cancelPendingConnect(reason: "explicit BLE reconnect window ended")
+                }
+                if self.peripheral == nil { self.attemptConnect() }
+            }
+            self.reconnectWindowWork = work
+            self.queue.asyncAfter(deadline: .now() + ATVVReconnectPlan.windowDuration, execute: work)
+            self.log("RECONNECT_WINDOW started (18s; BLE request only) reason=\(reason)")
+            self.attemptConnect()
+        }
+    }
+
+    /// Ends only the explicit reconnect window, preserving ordinary discovery
+    /// and any peer that has already connected (including ATVV negotiation).
+    func cancelReconnectRequest(reason: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let token = self.reconnectPlan.token
+            let hadWindow = self.reconnectWindowWork != nil
+            // Advance the token even if the old work has already been queued.
+            self.reconnectPlan.stop()
+            self.reconnectWindowWork?.cancel()
+            self.reconnectWindowWork = nil
+            if hadWindow {
+                self.log("RECONNECT_WINDOW cancelled reason=\(reason)")
+                if self.connectionWindowToken == token {
+                    self.cancelPendingConnect(reason: reason)
+                }
+            }
+            if self.shouldRun, self.peripheral == nil { self.attemptConnect() }
+        }
+    }
+
     /// 同步停止并断开。调用返回时，stop 之前已排入 ATVV 队列的全部语音回调
     /// 都已处理完，且后续外设回调因 peripheral 已摘除而不会再进入 VoiceBridgeApp。
     /// 仅由 AppServices 生命周期线程调用，不得从 ATVV queue 内调用。
@@ -195,6 +263,9 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         queue.sync {
             shouldRun = false
             log("STOP requested")
+            reconnectPlan.stop()
+            reconnectWindowWork?.cancel()
+            reconnectWindowWork = nil
             interruptVoiceContinuityProbe(.cancelled, detail: "应用停止，诊断已取消。")
             teardownConnection(disconnect: true)
         }
@@ -371,7 +442,21 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - 连接策略
 
     private func attemptConnect() {
-        guard shouldRun, central.state == .poweredOn else { return }
+        guard shouldRun, central.state == .poweredOn, peripheral == nil else { return }
+
+        // Explicit display/wake windows may request one known peer directly.
+        // Outside that window preserve the original connected-list/scan behavior.
+        let now = ProcessInfo.processInfo.systemUptime
+        if reconnectPlan.takeKnownAttempt(now: now),
+           let rawID = defaults.string(forKey: Self.rememberedPeripheralKey),
+           let id = UUID(uuidString: rawID) {
+            if let known = central.retrievePeripherals(withIdentifiers: [id]).first {
+                log("ATVV_FOUND_KNOWN (locally verified UUID)")
+                connect(to: known)
+                return
+            }
+            log("ATVV_KNOWN unavailable in CoreBluetooth cache; falling back")
+        }
 
         // 首选：系统已因 HID 保持连接，直接取回已连接外设（最常见路径）。
         let connected = central.retrieveConnectedPeripherals(withServices: [serviceUUID])
@@ -382,11 +467,14 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
 
         // 否则扫描该 service。
-        log("ATVV_SCAN_START service=\(serviceUUID.uuidString)")
-        central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+        if !central.isScanning {
+            log("ATVV_SCAN_START service=\(serviceUUID.uuidString)")
+            central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+        }
     }
 
     private func connect(to p: CBPeripheral) {
+        guard shouldRun, central.state == .poweredOn, peripheral == nil else { return }
         interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接代次改变，诊断已终止。")
         central.stopScan()
         // 新连接开一代，旧代闭包全部作废。
@@ -394,11 +482,55 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         resetSessionState()
         peripheral = p
         p.delegate = self
+        pendingDisconnectReason = nil
+        connectionWindowToken = reconnectPlan.activeToken(now: ProcessInfo.processInfo.systemUptime)
         log("CONNECTING gen=\(generation)")
         central.connect(p, options: nil)
+        schedulePendingConnectTimeout()
+    }
+
+    private func schedulePendingConnectTimeout() {
+        pendingConnectWork?.cancel()
+        let g = generation
+        let delay = reconnectPlan.pendingTimeout(now: ProcessInfo.processInfo.systemUptime)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.shouldRun, self.generation == g else { return }
+            self.pendingConnectWork = nil
+            self.cancelPendingConnect(reason: "BLE connection attempt timed out")
+        }
+        pendingConnectWork = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Cancellation is completed by didFail/didDisconnect, then the usual backoff
+    /// resumes discovery. Keeping peripheral attached prevents same-object reuse
+    /// before a terminal callback and preserves existing callback cleanup semantics.
+    private func cancelPendingConnect(reason: String) {
+        guard let p = peripheral, p.state == .connecting,
+              !pendingConnectionCancellation else { return }
+        pendingConnectionCancellation = true
+        pendingConnectWork?.cancel()
+        pendingConnectWork = nil
+        pendingDisconnectReason = reason
+        log("CONNECT_CANCEL_PENDING reason=\(reason)")
+        central.cancelPeripheralConnection(p)
+    }
+
+    private func rememberVerifiedPeripheral() {
+        guard capsReady, capsRequested, audioSubscribed, controlSubscribed,
+              let p = peripheral, p.state == .connected else { return }
+        let value = p.identifier.uuidString
+        if defaults.string(forKey: Self.rememberedPeripheralKey) != value {
+            defaults.set(value, forKey: Self.rememberedPeripheralKey)
+            log("ATVV_KNOWN saved after valid capability handshake")
+        }
     }
 
     private func resetSessionState() {
+        pendingConnectWork?.cancel()
+        pendingConnectWork = nil
+        connectionWindowToken = nil
+        pendingConnectionCancellation = false
         batteryRefreshWork?.cancel()
         batteryRefreshWork = nil
         batteryChar = nil
@@ -436,6 +568,8 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func teardownConnection(disconnect: Bool) {
         interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接结束，诊断已终止。")
+        // Invalidate reconnect work even if stop/start happens within its delay.
+        generation += 1
         if let p = peripheral {
             // 代际隔离：摘掉旧外设的 delegate，杜绝跨代的 peripheral 级回调回流。
             p.delegate = nil
@@ -445,6 +579,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
         central.stopScan()
         peripheral = nil
+        pendingDisconnectReason = nil
         resetSessionState()
     }
 
@@ -517,6 +652,15 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             log("CONNECTED ignored (stale peripheral)")
             return
         }
+        // A timeout may have requested cancellation just before this callback was
+        // queued. Do not promote that cancelled attempt into an active session.
+        guard !pendingConnectionCancellation else {
+            log("CONNECTED after pending cancellation; cancelling local attempt")
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        pendingConnectWork?.cancel()
+        pendingConnectWork = nil
         reconnectAttempt = 0
         log("CONNECTED name=\(peripheral.name ?? "?")")
         // 同时发现 ATVV 与标准电池服务；电池纯只读旁路，不参与握手状态机。
@@ -535,6 +679,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         interruptVoiceContinuityProbe(.disconnected, detail: "蓝牙连接失败。")
         self.peripheral?.delegate = nil
         self.peripheral = nil
+        pendingDisconnectReason = nil
         resetSessionState()
         scheduleReconnect()
     }
@@ -764,6 +909,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         selectedCodec = 0x02
         let wasReady = capsReady
         capsReady = true
+        rememberVerifiedPeripheral()
         log("CAPS_OK selectedCodec=0x02, awaiting mic key")
         // UI 的“遥控器已连接”必须代表 ATVV 能力协商完成，而不只是 BLE 链路建成。
         if !wasReady {

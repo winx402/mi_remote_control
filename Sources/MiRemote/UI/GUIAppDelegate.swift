@@ -353,6 +353,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: 服务事件接线
 
     private func wireCallbacks(services: AppServices, levelSink: LevelMeterSink) {
+        services.onRemoteContextChanged = { [weak self] reason in
+            MainActor.assumeIsolated { self?.overlayCenter?.invalidateTelevisionControlContext(reason: reason) }
+        }
         let healthConnection = services.voiceApp.onConnection
         services.voiceApp.onConnection = { [weak self] ok, name in
             healthConnection?(ok, name)

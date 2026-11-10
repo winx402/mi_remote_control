@@ -954,7 +954,13 @@ final class AppServices {
             }
             // 映射生命周期：设备/显示服务重建后，短窗口复核实际映射，确认缺失才重装；
             // 设备移除 / 系统睡眠可能丢 keyUp → 复位引擎与 tap 的按压状态。
-            hid.onDeviceMatched = { [weak tap] in tap?.scheduleMappingRecovery(reason: "设备接入") }
+            hid.onDeviceMatched = { [weak self, weak tap] in
+                tap?.scheduleMappingRecovery(reason: "设备接入")
+                // Pairing through System Settings may stop the remote advertising
+                // before the app's service scan sees it. Retrieve its now-connected
+                // ATVV service when the OS has actually enumerated the target HID.
+                self?.bridge.requestReconnect(reason: "系统已接入遥控器按键设备")
+            }
             hid.onDeviceRemoved = { [weak self, weak km, weak tap] in
                 self?.onRemoteContextChanged?("遥控器已断开")
                 km?.engine.resetInputState(reason: "设备移除")

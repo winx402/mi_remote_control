@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import os
 
 /// 只读本地会话元数据；不恢复会话，也不向模型发送请求。
 @MainActor
@@ -32,9 +33,17 @@ final class CodexSessions {
 
     struct Snapshot: Sendable {
         var entries: [Entry] = []
+        var currentID: String?
         var isLoading = false
         var notice: String?
         var error: String?
+
+        func selection(after previous: Snapshot, index: Int, userMoved: Bool) -> Int {
+            let prior = previous.entries.indices.contains(index) ? previous.entries[index].id : nil
+            let anchor = userMoved ? prior : currentID ?? prior
+            if let anchor, let found = entries.firstIndex(where: { $0.id == anchor }) { return found }
+            return min(max(index, 0), max(0, entries.count - 1))
+        }
     }
 
     /// 两级代次检查挡住「关闭后回调」和「快速重开后旧回调覆盖新列表」。
@@ -49,19 +58,48 @@ final class CodexSessions {
         let nextCursor: String?
     }
 
+    private static let trace = Logger(subsystem: "com.miremote.controller", category: "CodexSessionAnchor")
     private var generation = Generation()
     private var worker: Worker?
 
     deinit { worker?.cancel() }
 
-    func load(onUpdate: @escaping @MainActor @Sendable (Snapshot) -> Void) {
+    @MainActor private final class LoadState {
+        var latest = Snapshot(isLoading: true)
+        var indexed: Entry?
+    }
+
+    func load(identity: CodexSessionIdentity?, onUpdate: @escaping @MainActor @Sendable (Snapshot) -> Void) {
         cancel()
         let token = generation.value
-        let next = Worker { [weak self] snapshot in
-            // 同一串行 worker 到主队列的 FIFO 顺序保住分页快照先后关系。
+        let state = LoadState()
+        let publish: @MainActor () -> Void = { [weak self] in
+            guard self?.generation.accepts(token) == true else { return }
+            var result = state.latest
+            if let indexed = state.indexed {
+                if !result.entries.contains(where: { $0.id == indexed.id }) {
+                    result.entries = Self.sorted(result.entries + [indexed])
+                }
+                result.currentID = indexed.id
+            } else {
+                result.currentID = identity?.resolve(in: result.entries,
+                    complete: !result.isLoading && result.notice == nil && result.error == nil)
+            }
+            if !result.isLoading { Self.trace.notice("identity=\(identity != nil) match=\(result.currentID != nil)") }
+            onUpdate(result)
+        }
+        if let identity {
+            Task {
+                let match = await Task.detached(priority: .userInitiated) { identity.lookupInIndex() }.value
+                guard generation.accepts(token), let match else { return }
+                state.indexed = match
+                publish()
+            }
+        }
+        let next = Worker { snapshot in
             DispatchQueue.main.async {
-                guard let self, self.generation.accepts(token) else { return }
-                onUpdate(snapshot)
+                state.latest = snapshot
+                publish()
             }
         }
         worker = next
@@ -108,6 +146,7 @@ final class CodexSessions {
 
     nonisolated static func selfCheck() -> Bool {
         let fixture = #"{"data":[{"id":"older","name":"  第一个\n会话  ","updatedAt":1,"preview":"PRIVATE PREVIEW","cwd":"/private/example"},{"id":"newer","name":null,"updatedAt":3},{"id":"same-time","name":"   ","updatedAt":3}],"nextCursor":"next-page"}"#
+        guard CodexSessionIdentity.selfCheck() else { return false }
         guard let page = try? JSONDecoder().decode(Page.self, from: Data(fixture.utf8)),
               page.data.count == 3, page.nextCursor == "next-page",
               page.data[0].title == "第一个 会话",
@@ -118,6 +157,10 @@ final class CodexSessions {
               movedIndex(0, delta: -1, count: 3) == 0,
               movedIndex(1, delta: 8, count: 3) == 2,
               movedIndex(0, delta: 1, count: 0) == 0 else { return false }
+        let previous = Snapshot(entries: [page.data[0]])
+        let loaded = Snapshot(entries: [page.data[2], page.data[0], page.data[1]], currentID: page.data[1].id)
+        guard loaded.selection(after: previous, index: 0, userMoved: false) == 2,
+              loaded.selection(after: previous, index: 0, userMoved: true) == 1 else { return false }
         var generation = Generation()
         let first = generation.advance()
         guard generation.accepts(first) else { return false }

@@ -227,6 +227,7 @@ final class OverlayCenter {
     private let codexSessions = CodexSessions()
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexIndex = 0
+    private var browsedSessions = false
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
     private var televisionPowerStatus: String?
@@ -413,19 +414,16 @@ final class OverlayCenter {
             showPanel()
             restartWheelIdleTimer()
         case .codexSessions:
+            let identity = CodexSessionIdentity.capture()
+            browsedSessions = false
             codexIndex = 0
             codexSnapshot = CodexSessions.Snapshot(isLoading: true)
             showPanel()
-            codexSessions.load { [weak self] snapshot in
+            codexSessions.load(identity: identity) { [weak self] snapshot in
                 guard let self, self.active == .codexSessions else { return }
-                let selectedID = self.codexSnapshot.entries.indices.contains(self.codexIndex)
-                    ? self.codexSnapshot.entries[self.codexIndex].id : nil
+                self.codexIndex = snapshot.selection(after: self.codexSnapshot, index: self.codexIndex,
+                                                     userMoved: self.browsedSessions)
                 self.codexSnapshot = snapshot
-                if let selectedID, let index = snapshot.entries.firstIndex(where: { $0.id == selectedID }) {
-                    self.codexIndex = index
-                } else {
-                    self.codexIndex = min(self.codexIndex, max(0, snapshot.entries.count - 1))
-                }
                 self.sync(animated: false)
             }
         }
@@ -968,6 +966,7 @@ final class OverlayCenter {
 
     private func codexStep(_ delta: Int) {
         guard !codexSnapshot.entries.isEmpty else { return }
+        browsedSessions = true
         codexIndex = CodexSessions.movedIndex(codexIndex, delta: delta,
                                              count: codexSnapshot.entries.count)
         restartOverlayIdleTimer()

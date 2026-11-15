@@ -78,6 +78,12 @@ struct CodexSessionsView: View {
             Text(entry.title)
                 .font(.body.weight(selected ? .semibold : .regular))
                 .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+            if entry.id == snapshot.currentID {
+                Text("当前会话").font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+            }
             if entry.updatedAt > 0 {
                 Text(Date(timeIntervalSince1970: entry.updatedAt), style: .relative)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)

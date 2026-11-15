@@ -57,6 +57,7 @@ struct XiaomiTVConfiguration: Codable, Equatable, Sendable {
 enum XiaomiTVCommand: String, CaseIterable, Sendable {
     case volumeUp
     case volumeDown
+    case mute
     case sleep
     case wake
     /// Open the TV's own menu with a sustained POWER press; never send POWER as a short pair.
@@ -68,11 +69,12 @@ enum XiaomiTVCommand: String, CaseIterable, Sendable {
     case ok
     case back
 
-    fileprivate var isVolume: Bool { self == .volumeUp || self == .volumeDown }
+    fileprivate var isVolume: Bool { self == .volumeUp || self == .volumeDown || self == .mute }
 
     fileprivate var keyCode: Int32 {
         switch self {
         case .volumeUp: return 24
+        case .mute: return 164 // Android KEYCODE_VOLUME_MUTE
         case .volumeDown: return 25
         // Android KEYCODE_SLEEP is a no-op when already asleep. Never substitute POWER (26).
         case .sleep: return 223
@@ -91,6 +93,7 @@ enum XiaomiTVCommand: String, CaseIterable, Sendable {
     fileprivate var title: String {
         switch self {
         case .volumeUp: return "电视音量增加"
+        case .mute: return "电视静音切换"
         case .volumeDown: return "电视音量降低"
         case .sleep: return "电视休眠"
         case .wake: return "电视唤醒"
@@ -242,7 +245,7 @@ final class XiaomiTVController: ObservableObject {
         guard matches(expected) else { return }
         let cancelled = pending.filter { request in
             guard let command = request.operation.command else { return false }
-            return [.up, .down, .left, .right, .ok, .back, .volumeUp, .volumeDown].contains(command)
+            return [.up, .down, .left, .right, .ok, .back, .volumeUp, .volumeDown, .mute].contains(command)
         }
         let ids = Set(cancelled.map(\.id))
         pending.removeAll { ids.contains($0.id) }
@@ -837,6 +840,7 @@ private enum XiaomiTVProtocol {
             try require(up == Data(goldenUp))
             try require(keyPair(command: .sleep, downID: 0x01020304, upID: 0x01020305)?.bytes == down + up)
             try require(XiaomiTVCommand.volumeUp.keyCode == 24 && XiaomiTVCommand.volumeDown.keyCode == 25)
+            try require(XiaomiTVCommand.mute.keyCode == 164 && messageCount(for: .mute) == 2)
             try require(XiaomiTVCommand.sleep.keyCode == 223 && XiaomiTVCommand.sleep.keyCode != 26)
             var goldenWake = golden
             goldenWake[24] = 0xe0

@@ -397,6 +397,10 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private let cfgLock = NSLock()
     /// GUI 开关与 ATVV 回调串行化。不得持锁调用会等待主线程 TIS 的 shutdown。
     private let sessionLock = NSLock()
+    private var pendingVoiceResolution: UUID?
+    private var pendingVoiceFrames: [VoicePressGate.Frame] = []
+    private var pendingVoiceStopped = false
+    private var pendingVoiceOverflow = false
     private var deliveryGate = VoiceDeliveryGate()
     /// 旧 Codex 两按听写隔离 ATVV；专用按住动作单独缓冲／交付 PCM。
     private var suppressPhysicalSession = false
@@ -453,6 +457,12 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 仅查询锁保护的配置／前台快照，不得在 ATVV 队列读取 AppKit UI。
     var shouldSuppressPhysicalVoice: (() -> Bool)?
     var shouldUseCodexPhysicalHold: (() -> Bool)?
+    /// Live targeting is resolved on main before acquiring sessionLock, shared
+    /// with HID's per-press claim so BLE/HID arrival order cannot change routes.
+    var shouldReserveDouyinPhysicalVoice: (() -> Bool)?
+    var reserveDouyinPhysicalVoice: (() -> Bool)?
+    var releaseDouyinPhysicalVoice: (() -> Void)?
+    var resetDouyinPhysicalVoice: (() -> Void)?
 
     /// Codex 即将接管触发键；保留其 BLE 预缓存，作废通用会话的所有延迟动作。
     /// 调用者为主线程；shutdown 可能访问 TIS，必须在 sessionLock 外执行。
@@ -502,6 +512,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             defer { self.sessionLock.unlock() }
             guard self.codexRecognitionToken == token else { return }
             self.codexReleaseWork = nil
+            self.releaseDouyinPhysicalVoice?()
             _ = self.codexPCM.end()
             self.codexPhysicalSession = false
             self.physicalVoiceInProgress = false
@@ -569,11 +580,58 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     func atvvVoiceStarted() {
+        guard shouldReserveDouyinPhysicalVoice?() == true, let reserveDouyinPhysicalVoice else {
+            sessionLock.lock(); defer { sessionLock.unlock() }
+            startPhysicalVoiceLocked(douyinOwned: false)
+            return
+        }
+        // Never synchronously wait for main here: stopAndWait() drains this BLE
+        // queue from main. Buffer bounded PCM until the same HID claim is known.
         sessionLock.lock()
-        defer { sessionLock.unlock() }
+        if physicalVoiceInProgress || (pendingVoiceResolution != nil && !pendingVoiceStopped) {
+            sessionLock.unlock()
+            return
+        }
+        let ticket = UUID()
+        pendingVoiceResolution = ticket
+        pendingVoiceFrames.removeAll()
+        pendingVoiceStopped = false
+        pendingVoiceOverflow = false
+        sessionLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sessionLock.lock()
+            let valid = self.pendingVoiceResolution == ticket
+            self.sessionLock.unlock()
+            guard valid else { return }
+            let owned = reserveDouyinPhysicalVoice()
+            self.sessionLock.lock()
+            defer { self.sessionLock.unlock() }
+            guard self.pendingVoiceResolution == ticket else {
+                self.releaseDouyinPhysicalVoice?()
+                return
+            }
+            let frames = self.pendingVoiceFrames
+            let stopped = self.pendingVoiceStopped
+            let overflow = self.pendingVoiceOverflow
+            self.pendingVoiceResolution = nil
+            self.pendingVoiceFrames.removeAll()
+            if overflow {
+                // Losing the prefix invalidates the entire physical stream.
+                self.physicalVoiceInProgress = true
+                self.suppressPhysicalSession = true
+            } else {
+                self.startPhysicalVoiceLocked(douyinOwned: owned)
+                for frame in frames { self.processAudioFrameLocked(frame.data, sync: frame.sync) }
+            }
+            if stopped { self.stopPhysicalVoiceLocked() }
+        }
+    }
+
+    private func startPhysicalVoiceLocked(douyinOwned: Bool) {
         guard !physicalVoiceInProgress else { return }
         physicalVoiceInProgress = true
-        if shouldUseCodexPhysicalHold?() == true {
+        if douyinOwned || shouldUseCodexPhysicalHold?() == true {
             codexPhysicalSession = true
             codexPCM.begin()
             decoder.reset(predictor: 0, stepIndex: 0)
@@ -646,6 +704,15 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func atvvVoiceStopped() {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        if pendingVoiceResolution != nil {
+            pendingVoiceStopped = true
+            return
+        }
+        stopPhysicalVoiceLocked()
+    }
+
+    private func stopPhysicalVoiceLocked() {
+        releaseDouyinPhysicalVoice?()
         physicalVoiceInProgress = false
         if codexPhysicalSession {
             codexPhysicalSession = false
@@ -736,6 +803,10 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
     private func prepareForceEndLocked() -> Bool {
         cleanupCount += 1
+        pendingVoiceResolution = nil
+        pendingVoiceFrames.removeAll()
+        pendingVoiceStopped = false
+        resetDouyinPhysicalVoice?()
         codexReleaseWork?.cancel()
         codexReleaseWork = nil
         let streamToken = codexPCM.end()
@@ -784,6 +855,20 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func atvvAudioFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        if pendingVoiceResolution != nil {
+            guard !pendingVoiceStopped, !pendingVoiceOverflow else { return }
+            guard pendingVoiceFrames.count < 128, frame.count <= 4096 else {
+                pendingVoiceFrames.removeAll()
+                pendingVoiceOverflow = true
+                return
+            }
+            pendingVoiceFrames.append(.init(data: frame, sync: sync))
+            return
+        }
+        processAudioFrameLocked(frame, sync: sync)
+    }
+
+    private func processAudioFrameLocked(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
         guard cleanupCount == 0, !suppressPhysicalSession else { return }
         if codexPhysicalSession {
             let packet = VoicePressGate.Frame(data: frame, sync: sync)
@@ -835,6 +920,8 @@ final class KeyMapperApp: HIDEngineDelegate, MappingEngineDelegate {
     let runner = ActionRunner()
     var engine: MappingEngine!
     let verbose: Bool
+    private var genericVoiceHIDEnabled: Bool
+    private var voiceHIDWasForwarded = false
 
     /// GUI 状态反馈钩子。
     var onLayerChanged: ((Int) -> Void)?
@@ -892,6 +979,7 @@ final class KeyMapperApp: HIDEngineDelegate, MappingEngineDelegate {
 
     init(config: MappingConfig, verbose: Bool) {
         self.verbose = verbose
+        genericVoiceHIDEnabled = config.globalShortcuts != nil
         engine = MappingEngine(config: config, runner: runner, delegate: self)
         runner.codexInputGeneration = { [weak engine] in
             guard let engine, !engine.isSuspended, !engine.tapRoute.uiCapture,
@@ -912,6 +1000,7 @@ final class KeyMapperApp: HIDEngineDelegate, MappingEngineDelegate {
             guard let self,
                   let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.processIdentifier != myPid else { return }
+            self.resetDouyinVoiceReservation()
             self.lastExternalApplication = app
             self.pushMRU(app)
             self.engine.setActiveProfile(app.bundleIdentifier)
@@ -935,7 +1024,80 @@ final class KeyMapperApp: HIDEngineDelegate, MappingEngineDelegate {
         onButtonEvent?(event)
         // M5 v2：Home 长按教程浮层改走引擎的 hold=.overlay("tutorial") 常规路径，
         // 浮层打开后由 uiCapture 捕获后续按键（含再按 Home 关闭）。
-        engine.handle(event)
+        var liveEligible = false
+        if event.key == .voice {
+            let route = onMain { () -> (eligible: Bool, deliver: Bool) in
+                if event.isDown {
+                    let eligible = reserveDouyinVoicePress(hid: true) == .live
+                    let deliver = eligible || genericVoiceHIDEnabled || voiceHIDWasForwarded
+                    voiceHIDWasForwarded = deliver
+                    return (eligible, deliver)
+                }
+                let wasLive = douyinVoiceOwner == .live
+                let deliver = voiceHIDWasForwarded || genericVoiceHIDEnabled
+                voiceHIDWasForwarded = false
+                releaseDouyinVoicePress(hid: true)
+                return (wasLive, deliver)
+            }
+            guard route.deliver else { return }
+            liveEligible = route.eligible
+        }
+        engine.handle(event, douyinLiveVoiceEligible: liveEligible)
+    }
+
+    private enum DouyinVoiceOwner { case live, suppressed, generic }
+    private var douyinVoiceOwner: DouyinVoiceOwner?
+    private var douyinHIDDown = false
+    private var douyinBLEDown = false
+    private var douyinHIDSeen = false
+    private func onMain<T>(_ body: () -> T) -> T {
+        Thread.isMainThread ? body() : DispatchQueue.main.sync(execute: body)
+    }
+    private func reserveDouyinVoicePress(hid: Bool) -> DouyinVoiceOwner {
+        if hid {
+            if !douyinHIDDown && douyinHIDSeen {
+                // A new HID press supersedes an old missing BLE STOP.
+                douyinBLEDown = false
+                douyinVoiceOwner = nil
+            }
+            douyinHIDDown = true
+            douyinHIDSeen = true
+        } else { douyinBLEDown = true }
+        if let douyinVoiceOwner { return douyinVoiceOwner }
+        let owner: DouyinVoiceOwner = MainActor.assumeIsolated {
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == DouyinLiveDictation.bundleID else { return .generic }
+            guard !engine.isSuspended, !engine.tapRoute.uiCapture,
+                  engine.tapRoute.effectiveLayer == 0, !MouseMode.shared.isActive,
+                  !TransientSystemUI.isMissionControlActive() else { return .suppressed }
+            return DouyinLiveDictation.canHandleVoice() ? .live : .generic
+        }
+        douyinVoiceOwner = owner
+        return owner
+    }
+    private func releaseDouyinVoicePress(hid: Bool) {
+        if hid { douyinHIDDown = false } else { douyinBLEDown = false }
+        if !douyinHIDDown && !douyinBLEDown {
+            douyinVoiceOwner = nil
+            douyinHIDSeen = false
+        }
+    }
+    func reserveDouyinBLEVoice() -> Bool {
+        reserveDouyinVoicePress(hid: false) != .generic
+    }
+    func updateVoiceHIDConfig(_ config: MappingConfig) {
+        onMain { genericVoiceHIDEnabled = config.globalShortcuts != nil }
+    }
+    func releaseDouyinBLEVoice() {
+        if Thread.isMainThread { releaseDouyinVoicePress(hid: false) }
+        else { DispatchQueue.main.async { [weak self] in self?.releaseDouyinVoicePress(hid: false) } }
+    }
+    func resetDouyinVoiceReservation() {
+        onMain {
+            douyinVoiceOwner = nil
+            douyinHIDDown = false
+            douyinBLEDown = false
+            douyinHIDSeen = false
+        }
     }
 
     func hidSeizeState(_ exclusive: Bool) {
@@ -977,6 +1139,11 @@ private final class VoiceRuleStore: @unchecked Sendable {
         let snapshotBundle = bundleID
         lock.unlock()
         return VoiceTriggerRouting.resolve(snapshotRules, bundleID: snapshotBundle)
+    }
+
+    func isDouyinFrontmost() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return bundleID == "com.bytedance.douyin.desktop"
     }
 
     func useCodexPhysicalHold() -> Bool {
@@ -1138,6 +1305,9 @@ final class AppServices {
         if options.keys {
             let config = loadOrCreateConfig(at: options.configPath)
             voiceRuleStore.update(config: config)
+            Task { @MainActor in
+                DouyinLiveDictation.configure(triggerConfig: VoiceTriggerRouting.resolve(config.voiceProfiles, bundleID: DouyinLiveDictation.bundleID))
+            }
             voiceApp.shouldSuppressPhysicalVoice = { [weak voiceRuleStore] in
                 voiceRuleStore?.suppressPhysicalVoice() ?? false
             }
@@ -1160,6 +1330,13 @@ final class AppServices {
                 }
             }
             let km = KeyMapperApp(config: config, verbose: options.verbose)
+            voiceApp.shouldReserveDouyinPhysicalVoice = { [weak voiceRuleStore] in voiceRuleStore?.isDouyinFrontmost() ?? false }
+            voiceApp.reserveDouyinPhysicalVoice = { [weak km] in km?.reserveDouyinBLEVoice() ?? false }
+            voiceApp.releaseDouyinPhysicalVoice = { [weak km] in km?.releaseDouyinBLEVoice() }
+            voiceApp.resetDouyinPhysicalVoice = { [weak km] in
+                if Thread.isMainThread { km?.resetDouyinVoiceReservation() }
+                else { DispatchQueue.main.async { km?.resetDouyinVoiceReservation() } }
+            }
             voiceRuleStore.update(bundleID: km.lastExternalApplication?.bundleIdentifier)
             km.onActiveApplication = { [weak voiceRuleStore] bundleID in
                 voiceRuleStore?.update(bundleID: bundleID)
@@ -1173,7 +1350,7 @@ final class AppServices {
             ActionRunner.onAppMRUBack = { [weak km] in km?.activateMRUBack() }
             let tap = TapEngine(delegate: km)
             tap.router = km.engine  // 方向键三态分流的快照来源
-            let filter = IOHIDOnlyFilter(km, voiceKey: config.globalShortcuts != nil)
+            let filter = IOHIDOnlyFilter(km, voiceKey: true)
             let hid = HIDEngine(delegate: filter)
             keyMapper = km
             tapEngine = tap
@@ -1205,6 +1382,7 @@ final class AppServices {
             }
             hid.onDeviceRemoved = { [weak self, weak km, weak tap] in
                 self?.onRemoteContextChanged?("遥控器已断开")
+                km?.resetDouyinVoiceReservation()
                 km?.engine.resetInputState(reason: "设备移除")
                 tap?.resetPressState()
             }
@@ -1235,6 +1413,7 @@ final class AppServices {
                 forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self, weak km, weak tap] _ in
                 self?.onRemoteContextChanged?("系统即将休眠")
                 self?.bridge.cancelReconnectRequest(reason: "系统即将休眠")
+                km?.resetDouyinVoiceReservation()
                 km?.engine.resetInputState(reason: "系统睡眠")
                 tap?.resetPressState()
             })
@@ -1293,12 +1472,18 @@ final class AppServices {
             ? config.settings.holdMs : 0
         FocusInput.extraTerminalBundles = Set(config.settings.terminalApps ?? [])
         voiceRuleStore.update(config: config)
+        Task { @MainActor in
+            DouyinLiveDictation.configure(triggerConfig: VoiceTriggerRouting.resolve(config.voiceProfiles, bundleID: DouyinLiveDictation.bundleID))
+        }
+        keyMapper?.resetDouyinVoiceReservation()
+        keyMapper?.updateVoiceHIDConfig(config)
         keyMapper?.engine.setConfig(config)
     }
 
     /// 体检「重建通道」：重装 hidutil 映射（TapEngine 内部含 tap 健康自愈）。
     /// 暂停/恢复遥控（UI 菜单栏面板的暂停 toggle 入口）。幂等。
     func setRemoteSuspended(_ suspended: Bool) {
+        if suspended { keyMapper?.resetDouyinVoiceReservation() }
         keyMapper?.engine.setSuspended(suspended)
     }
 

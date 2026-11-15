@@ -99,7 +99,7 @@ struct PowerMenuView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(state.selection.title).font(.headline).lineLimit(1).padding(6)
                         optionRow(state.canQuitSelectedApp ? "切换到 App" : "打开 App", symbol: "arrow.up.forward.app", selected: option == .open)
-                        optionRow(state.canQuitSelectedApp ? "退出 App · 长按 OK" : "退出 App · 未运行", symbol: "rectangle.portrait.and.arrow.right", selected: option == .quit)
+                        optionRow(state.canQuitSelectedApp ? "退出 App · 按 OK" : "退出 App · 未运行", symbol: "rectangle.portrait.and.arrow.right", selected: option == .quit)
                             .opacity(state.canQuitSelectedApp ? 1 : 0.45)
                     }
                     .padding(8).frame(width: width)

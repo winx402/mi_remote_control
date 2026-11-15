@@ -60,7 +60,25 @@ enum CodexDictation {
     @MainActor private static var remotePasteTask: Task<Void, Never>?
     @MainActor private static var pasteboardLease: PasteboardLease?
 
+    enum TargetScope { case codex, douyinLive }
+    @MainActor private static var activeScope: TargetScope = .codex
+    @MainActor private static var douyinTriggerConfig = VoiceTriggerConfig()
+    @MainActor private static var targetLabel: String { activeScope == .codex ? "Codex" : "抖音直播" }
+    @MainActor static var activeBundleID: String {
+        activeScope == .codex ? "com.openai.codex" : DouyinLiveDictation.bundleID
+    }
+    @MainActor static func configureDouyin(triggerConfig: VoiceTriggerConfig) {
+        douyinTriggerConfig = triggerConfig
+    }
+    @MainActor private static func focus(_ scope: TargetScope) -> Bool {
+        scope == .codex ? CodexConversationControls.focusForDictation() : DouyinLiveDictation.focusForDictation()
+    }
+    @MainActor private static func resolvedField(_ scope: TargetScope) -> AXUIElement? {
+        scope == .codex ? CodexConversationControls.resolvedDictationField() : DouyinLiveDictation.resolvedDictationField()
+    }
     private struct RemoteTarget {
+        let scope: TargetScope
+        let contextID: String?
         let pid: pid_t
         let element: AXUIElement
         let window: AXUIElement
@@ -97,6 +115,7 @@ enum CodexDictation {
     }
     private struct Session {
         let pid: pid_t
+        let target: RemoteTarget?
         let inputDevice: AudioDeviceID
         let route: Route
     }
@@ -152,26 +171,27 @@ enum CodexDictation {
     }
 
     /// 仅由映射引擎确认长按后调用；短按不会请求识别、切换输入法或写入文本。
-    @MainActor static func beginPhysicalHold() {
+    @MainActor static func beginPhysicalHold(scope: TargetScope = .codex) {
         // A second confirmed hold may supersede a released session still waiting
         // for cold startup; stop() below invalidates its callbacks and backlog.
         guard inputEnabled, !physicalHoldActive || remoteReleaseRequested else { return }
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.openai.codex" else { return }
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == (scope == .codex ? "com.openai.codex" : DouyinLiveDictation.bundleID) else { return }
         // 新一次按住不能把上次尚在等待的识别结果写进新上下文。
         stop(reason: nil, restoreImmediately: true)
         guard remoteIMEFinishing == nil else { return }
+        activeScope = scope
         onPhysicalHoldPrepare?()
         guard useRemoteMicrophone else {
             physicalHoldActive = true
             physicalHoldStartedAt = ProcessInfo.processInfo.systemUptime
-            toggle()
+            toggle(scope: scope)
             return
         }
         guard AXIsProcessTrusted() else {
-            notice("需要辅助功能权限，Codex 听写未开始。")
+            notice("需要辅助功能权限，\(targetLabel)听写未开始。")
             return
         }
-        guard CodexConversationControls.focusForDictation(), let target = captureRemoteTarget() else {
+        guard focus(scope), let target = captureRemoteTarget(scope: scope) else {
             notice("请点一下要输入的位置，再按住说话。")
             return
         }
@@ -261,9 +281,10 @@ enum CodexDictation {
 
     @MainActor private static func beginRemoteInputMethod(target: RemoteTarget) {
         let prefix = "com.tencent.inputmethod.wetype"
-        let cfg = VoiceTriggerConfig(keyName: triggerConfig.keyName, mode: .hold, imeBundlePrefix: prefix)
-        guard triggerConfig.mode == .hold, VoiceTriggerConfig.keyTable[cfg.keyName] != nil else {
-            notice("请将 Codex 语音快捷键设为与微信输入法一致的“按住说话”键。")
+        let configured = target.scope == .codex ? triggerConfig : douyinTriggerConfig
+        let cfg = VoiceTriggerConfig(keyName: configured.keyName, mode: .hold, imeBundlePrefix: prefix)
+        guard configured.mode == .hold, VoiceTriggerConfig.keyTable[cfg.keyName] != nil else {
+            notice("请将\(targetLabel)语音快捷键设为与微信输入法一致的“按住说话”键。")
             return
         }
         guard let source = enabledInputSource(prefix: prefix) else {
@@ -465,9 +486,7 @@ enum CodexDictation {
                 try? await Task.sleep(for: .milliseconds(350))
                 guard remoteIMEStopID == stopID else { return }
                 var recovery = InputCaptureStopRecovery()
-                let capture = pending.inputMethodPID.flatMap { pid in
-                    bridgeInput.map { InputCaptureState.read(pid: pid, device: $0) }
-                } ?? .unknown
+                guard let capture = await waitForRemoteInputMethodStop(pending, stopID: stopID) else { return }
                 let sameContext = remoteTargetHasFocus(pending.target)
                     && currentInputSourceMatches(prefix: "com.tencent.inputmethod.wetype")
                     && DefaultInput.currentDefault() == bridgeInput
@@ -482,9 +501,7 @@ enum CodexDictation {
                     try? await Task.sleep(for: .milliseconds(350))
                     guard remoteIMEStopID == stopID else { return }
                 }
-                let stopped = pending.inputMethodPID.flatMap { pid in
-                    bridgeInput.map { InputCaptureState.read(pid: pid, device: $0) }
-                } ?? .unknown
+                guard let stopped = await waitForRemoteInputMethodStop(pending, stopID: stopID) else { return }
                 remoteIMEStopID = nil
                 remoteIMEFinishingTimer?.invalidate()
                 remoteIMEFinishingTimer = nil
@@ -513,6 +530,24 @@ enum CodexDictation {
                 }
             }
         }
+    }
+
+    /// CoreAudio input-running can lag a released WeType hotkey while final text
+    /// is committed. Give that positive evidence a bounded settling window before
+    /// attempting the existing single recovery tap or reporting lingering capture.
+    @MainActor private static func waitForRemoteInputMethodStop(_ pending: RemoteInputMethodSession,
+                                                               stopID: UUID) async -> InputCaptureState? {
+        for attempt in 0...20 {
+            guard remoteIMEStopID == stopID else { return nil }
+            let capture = pending.inputMethodPID.flatMap { pid in
+                bridgeInput.map { InputCaptureState.read(pid: pid, device: $0) }
+            } ?? .unknown
+            guard capture == .running, attempt < 20 else { return capture }
+            // The existing context monitor cancels the generation on a real
+            // app/window/room/input change throughout this asynchronous wait.
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return .unknown
     }
 
     @MainActor private static func releaseRemoteInputMethodKey(_ current: RemoteInputMethodSession) -> Bool {
@@ -729,7 +764,7 @@ enum CodexDictation {
             onStateChanged?(false)
             switch evidence {
             case .textVerified:
-                status("已核实文字进入 Codex 原输入框，尚未发送。")
+                status("已核实文字进入原输入框，尚未发送。")
             case .changeVerified:
                 status("已核实原输入框的选区／字数按预期变化，但无法读取插入文字核对；尚未发送。")
             case .unconfirmed:
@@ -761,9 +796,9 @@ enum CodexDictation {
         finalTimeout = nil
     }
 
-    @MainActor private static func captureRemoteTarget() -> RemoteTarget? {
-        guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex",
-              let resolved = CodexConversationControls.resolvedDictationField(),
+    @MainActor private static func captureRemoteTarget(scope: TargetScope = .codex) -> RemoteTarget? {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == (scope == .codex ? "com.openai.codex" : DouyinLiveDictation.bundleID),
+              let resolved = resolvedField(scope),
               systemFocusAllows(resolved),
               let appFocused = axElement(AXUIElementCreateApplication(app.processIdentifier), attribute: kAXFocusedUIElementAttribute),
               CFEqual(appFocused, resolved),
@@ -774,7 +809,7 @@ enum CodexDictation {
         if let selection, !validRange(selection) { return nil }
         var pid: pid_t = 0
         guard AXUIElementGetPid(resolved, &pid) == .success, pid == app.processIdentifier else { return nil }
-        return RemoteTarget(pid: pid, element: resolved, window: window, selection: selection,
+        return RemoteTarget(scope: scope, contextID: scope == .douyinLive ? DouyinLiveDictation.contextID() : nil, pid: pid, element: resolved, window: window, selection: selection,
                             characterCount: characterCount(resolved))
     }
 
@@ -816,7 +851,9 @@ enum CodexDictation {
             return .changed(issue)
         }
         let resolved: RemoteDictationContextGuard.Observation
-        if let element = CodexConversationControls.resolvedDictationField() {
+        if target.scope == .douyinLive {
+            resolved = DouyinLiveDictation.targetObservation(target.element, window: target.window, contextID: target.contextID)
+        } else if let element = CodexConversationControls.resolvedDictationField() {
             resolved = CFEqual(element, target.element) ? .matched : .changed("resolved-input-field")
         } else { resolved = .unavailable("resolved-input-field") }
         let system = AXUIElementCreateSystemWide()
@@ -1131,25 +1168,39 @@ enum CodexDictation {
         Task { @MainActor in stop(reason: reason, restoreImmediately: true, showError: false) }
     }
 
+    @MainActor static func cancelCurrent(reason: String) {
+        stop(reason: reason, restoreImmediately: true, showError: false)
+    }
+
     /// 生命周期主线程可同步清理，防止退出前 Task 尚未运行。
     @MainActor static func shutdown() { stop(reason: "服务停止", restoreImmediately: true, showError: false) }
 
-    @MainActor private static func toggle() {
-        if preparing || session != nil {
+    @MainActor private static func toggle(scope: TargetScope = .codex) {
+        if (preparing || session != nil || remoteIME != nil || remoteSession != nil), activeScope == scope {
             stop(reason: nil, restoreImmediately: false)
             return
         }
+        if preparing || session != nil || remoteIME != nil || remoteSession != nil || remoteIMEFinishing != nil {
+            stop(reason: nil, restoreImmediately: true, showError: false)
+        }
+        guard remoteIMEFinishing == nil else { return }
+        activeScope = scope
         guard let app = NSWorkspace.shared.frontmostApplication,
-              CodexNavigation.isAllowedBundle(app.bundleIdentifier) else {
-            notice("请先将 Codex 切到前台，再使用听写。")
+              scope == .codex ? CodexNavigation.isAllowedBundle(app.bundleIdentifier) : app.bundleIdentifier == DouyinLiveDictation.bundleID else {
+            notice("请先将\(targetLabel)切到前台，再使用听写。")
             return
         }
         guard AXIsProcessTrusted() else {
-            notice("需要辅助功能权限，Codex 听写未开始。")
+            notice("需要辅助功能权限，\(targetLabel)听写未开始。")
             return
         }
-        guard CodexConversationControls.focusForDictation(), stillFrontmost(app.processIdentifier) else {
-            notice("无法确认 Codex 当前可编辑的聊天／表单输入框，本次未开始听写。")
+        guard focus(scope), stillFrontmost(app.processIdentifier) else {
+            notice("无法确认\(targetLabel)当前可编辑的输入框，本次未开始听写。")
+            return
+        }
+        let lockedTarget = scope == .douyinLive ? captureRemoteTarget(scope: scope) : nil
+        guard scope != .douyinLive || lockedTarget != nil else {
+            notice("无法锁存抖音直播聊天输入框，本次未开始听写。")
             return
         }
         guard let input = currentUsableInput() else {
@@ -1162,7 +1213,7 @@ enum CodexDictation {
         restoreTask = nil
 
         // 已启用且可选中的输入法优先；未启用微信时只尝试明确的系统听写菜单。
-        let cfg = triggerConfig
+        let cfg = scope == .codex ? triggerConfig : douyinTriggerConfig
         if let prefix = cfg.imeBundlePrefix,
            cfg.mode == .hold,
            VoiceTriggerConfig.keyTable[cfg.keyName] != nil,
@@ -1183,7 +1234,7 @@ enum CodexDictation {
                 guard stillFrontmost(app.processIdentifier),
                       currentUsableInput()?.id == input.id,
                       currentInputSourceMatches(prefix: prefix),
-                      CodexConversationControls.focusForDictation(),
+                      (lockedTarget.map { remoteTargetHasFocus($0) } ?? focus(scope)),
                       stillFrontmost(app.processIdentifier) else {
                     stop(reason: "输入框、输入法或音源已改变，听写未开始", restoreImmediately: true)
                     return
@@ -1193,7 +1244,7 @@ enum CodexDictation {
                     return
                 }
                 preparing = false
-                session = Session(pid: app.processIdentifier, inputDevice: input.id, route: .inputMethod(cfg))
+                session = Session(pid: app.processIdentifier, target: lockedTarget, inputDevice: input.id, route: .inputMethod(cfg))
                 didStart(inputName: input.name, method: "语音输入法快捷键已发送")
             }
             return
@@ -1208,10 +1259,10 @@ enum CodexDictation {
               AXUIElementPerformAction(start, kAXPressAction as CFString) == .success else {
             let reason = cfg.mode != .hold ? "输入法未设置为可安全释放的“按住说话”触发方式"
                 : cfg.imeBundlePrefix == nil ? "未配置可验证的语音输入法" : "未启用所选语音输入法"
-            notice("\(reason)，Codex 也未提供可用的“开始听写”菜单。请启用微信语音输入并匹配按住快捷键，或在系统键盘设置中启用听写；本次未开始。")
+            notice("\(reason)，\(targetLabel)也未提供可用的“开始听写”菜单。请启用微信语音输入并匹配按住快捷键，或在系统键盘设置中启用听写；本次未开始。")
             return
         }
-        session = Session(pid: app.processIdentifier, inputDevice: input.id, route: .system(axApp))
+        session = Session(pid: app.processIdentifier, target: lockedTarget, inputDevice: input.id, route: .system(axApp))
         didStart(inputName: input.name, method: "系统开始听写已请求")
     }
 
@@ -1224,6 +1275,10 @@ enum CodexDictation {
                 guard let session else { return }
                 guard stillFrontmost(session.pid), currentUsableInput()?.id == session.inputDevice else {
                     stop(reason: "应用或默认麦克风已改变", restoreImmediately: true)
+                    return
+                }
+                if let target = session.target, !remoteTargetHasFocus(target) {
+                    stop(reason: "直播间、窗口或输入焦点改变", restoreImmediately: true, showError: false)
                     return
                 }
                 if case .inputMethod(let config) = session.route,
@@ -1375,7 +1430,7 @@ enum CodexDictation {
     /// 常规状态仅日志；内容来自固定状态字符串，不包含音频／听写正文。
     @MainActor private static func status(_ message: String) {
         Logger(subsystem: "com.miremote.controller", category: "RemoteSpeech").notice("\(message, privacy: .public)")
-        log("Codex 听写：\(message)")
+        log("\(activeScope == .codex ? "Codex" : "抖音直播") 听写：\(message)")
     }
 
     // MARK: - 明确的系统菜单动作（不读取消息正文）

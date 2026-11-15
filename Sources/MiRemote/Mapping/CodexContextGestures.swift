@@ -65,6 +65,8 @@ final class CodexContextGestures {
         }
     }
 
+    func isTracking(_ key: RemoteKey) -> Bool { states[key] != nil }
+
     func consumeSuppressed(_ event: ButtonEvent) -> Bool {
         guard states[event.key]?.phase == .consumed else { return false }
         if !event.isDown { states.removeValue(forKey: event.key) }

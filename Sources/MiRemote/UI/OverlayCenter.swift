@@ -18,7 +18,7 @@ struct SystemMenuItem {
 }
 
 enum SystemMenuCatalog {
-    /// 网格条目（3 列）。全部走 ActionRunner 既有能力，无私有 API；危险项标红并集中排在末尾。
+    /// 网格条目（3 列）。全部走 ActionRunner 既有能力；危险项标红并集中排在末尾。
     static let items: [SystemMenuItem] = [
         .init(title: "调度中心",   symbol: "square.grid.3x2",             action: .system("mission_control")),
         .init(title: "应用窗口",   symbol: "square.on.square",            action: .system("app_expose")),
@@ -136,6 +136,8 @@ final class OverlayUIState: ObservableObject {
     @Published var pickerIndex = 0
     @Published var pickerCurrentAppOnly = false
     @Published var frontAppName: String?
+    @Published var douyinItems = DouyinMenuItem.functions
+    @Published var douyinMenuError: String?
     @Published var menuIndex = 0
     @Published var menuConfirming = false
     @Published var menuApps: [DockApplications.Entry] = []
@@ -194,6 +196,10 @@ final class OverlayCenter {
 
     enum Kind: String {
         case windowPicker = "window_picker"
+        case douyinCategories = "douyin_categories"
+        case douyinLive = "douyin_live"
+        case douyinRooms = "douyin_rooms"
+        var isDouyinMenu: Bool { self == .douyinLive || self == .douyinCategories || self == .douyinRooms }
         case systemMenu = "system_menu"
         case tutorial = "tutorial"
         case appWheel = "app_wheel"
@@ -219,9 +225,23 @@ final class OverlayCenter {
     private var pickerIndex = 0
     private var pickerCurrentAppOnly = false
     // 系统功能菜单状态
+    private var douyinRootItems: [DouyinMenuItem] = []
+    // Keep the other root layout only for this opening of the live menu.
+    private var alternateDouyinItems: [DouyinMenuItem]?
+    private var showsMoreDouyinSettings: Bool { douyinRootItems.contains(.collapseMore) }
+    private var readingDouyinOptions = false
+    private var douyinMenuGeneration: UInt64 = 0
+    private var douyinReadTask: Task<Void, Never>?
+    private var douyinPendingGroup: DouyinLiveOptions.Group?
+    private var douyinNativeReadDepth = 0
+    private var douyinMenuOpenedAt: TimeInterval?
+    private var douyinHomeTask: Task<Void, Never>?
+    private var douyinHomePending = false
+    private var douyinHomeGeneration: UInt64 = 0
     private var menuIndex = 0
     private var menuApps: [DockApplications.Entry] = []
     private var runningControlAppIDs: Set<String> = []
+    private var controlApplicationObservers: [NSObjectProtocol] = []
     // App 轮盘状态（停留式，DESIGN §3.1b：TV 长按弹出后松手停留，3s 无操作自动关）
     private var wheelApps: [NSRunningApplication] = []
     private var wheelIndex = 0
@@ -321,15 +341,41 @@ final class OverlayCenter {
             close()
             return
         }
+        invalidateDouyinHome()
         if active != nil { close() }
-        if kind == .windowPicker || kind == .systemMenu || kind == .computerPower || kind == .televisionPower {
+        if kind.isDouyinMenu || kind == .windowPicker || kind == .systemMenu || kind == .computerPower || kind == .televisionPower {
             MouseMode.shared.deactivate()
             mouseStatusText = nil
         }
         profileHintToken &+= 1
         active = kind
+        if kind.isDouyinMenu { douyinMenuOpenedAt = ProcessInfo.processInfo.systemUptime }
         onActiveChanged?()
         switch kind {
+        case .douyinCategories:
+            uiState.douyinItems = DouyinMenuItem.categories
+            menuIndex = DouyinFeedNavigation.currentCategoryName().flatMap { name in
+                uiState.douyinItems.firstIndex(of: .category(name))
+            } ?? 0
+            showPanel()
+        case .douyinRooms:
+            panel?.orderOut(nil)
+            switch DouyinControls.readLiveRooms() {
+            case .success(let names) where !names.isEmpty:
+                uiState.douyinItems = names.map(DouyinMenuItem.room)
+                menuIndex = 0
+                showPanel()
+            case .success:
+                close()
+                reportDouyinError("关注列表目前没有正在直播的主播")
+                return
+            case .failure(let error):
+                close()
+                reportDouyinError(error.localizedDescription)
+                return
+            }
+        case .douyinLive:
+            loadDouyinLiveMenu()
         case .windowPicker:
             pickerCurrentAppOnly = false
             reloadPickerEntries()
@@ -355,11 +401,8 @@ final class OverlayCenter {
                     $0.activationPolicy == .regular && !$0.isTerminated
                         && $0.processIdentifier != NSRunningApplication.current.processIdentifier ? $0 : nil
                 }
-            let douyinRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.bytedance.douyin.desktop")
-                .contains { !$0.isTerminated && $0.activationPolicy == .regular }
-            powerMenu.open(choices: PowerMenuCatalog.choices(televisionConfigured: XiaomiTVController.shared.isConfigured,
-                currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning,
-                apps: menuApps.map { (id: $0.id, title: $0.name) }))
+            powerMenu.open(choices: controlPowerChoices())
+            observeControlApplications()
             televisionPowerStatus = nil
             if wakeTelevision, XiaomiTVController.shared.isConfigured {
                 televisionPowerStatus = "正在尝试唤醒电视…"
@@ -439,12 +482,13 @@ final class OverlayCenter {
         guard active == kind else { return }
         if kind != .appWheel { restartOverlayIdleTimer() }
         installEscMonitor()
-        if kind == .televisionPower { hideHintBar() }
+        if kind == .televisionPower || kind.isDouyinMenu { hideHintBar() }
         else { showHintBar(HintBarCatalog.hints(for: kind)) }
         // 捕获遥控键：浮层期间事件不走动作分发（引擎 mainDispatch 保证主线程回调）。
         engine?.setOverlayCapture({ [weak self] event in
             MainActor.assumeIsolated { self?.handleKey(event) }
-        }, immediateDirections: kind == .systemMenu || kind == .computerPower || kind == .televisionPower)
+        }, immediateDirections: kind.isDouyinMenu || kind == .systemMenu || kind == .computerPower || kind == .televisionPower,
+           prioritizeNavigationTaps: kind.isDouyinMenu)
     }
 
     func close(dismissTelevisionMenu: Bool = true) {
@@ -454,10 +498,17 @@ final class OverlayCenter {
         televisionCleanup?.requested = active == .televisionPower && dismissTelevisionMenu && televisionMenu.isLoading
         let televisionConfiguration = televisionMenuConfiguration
         active = nil
+        invalidateDouyinRead()
+        douyinMenuOpenedAt = nil
+        douyinRootItems.removeAll()
+        alternateDouyinItems = nil
+        uiState.douyinMenuError = nil
         onActiveChanged?()
         powerGeneration &+= 1
         powerMenu.close()
         powerApplication = nil
+        for observer in controlApplicationObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        controlApplicationObservers.removeAll()
         televisionPowerStatus = nil
         televisionMenu = TelevisionPowerMenuState()
         televisionMenuConfiguration = nil
@@ -500,6 +551,7 @@ final class OverlayCenter {
     /// 全局返回长按 1.2s 触发：关闭所有浮层与 HUD。层态由引擎自清，
     /// 菜单栏/角标随 onLayerChanged 回到全局态。
     func escapeHatch() {
+        invalidateDouyinHome()
         close()
         mouseStatusText = nil
         noteLayer(0)
@@ -530,6 +582,36 @@ final class OverlayCenter {
             return
         }
         switch active {
+        case .douyinLive, .douyinCategories, .douyinRooms:
+            // Navigation out of an in-flight native read must never wait for it.
+            if readingDouyinOptions, [.up, .left, .down, .right, .ok].contains(event.key) { return }
+            if active == .douyinCategories && (event.key == .left || event.key == .right) { return }
+            switch event.key {
+            case .up, .left, .down, .right:
+                let step = { [weak self] in
+                    guard let self, let size = self.panel?.contentView?.bounds.size else { return }
+                    let layout = DouyinMenuLayout(items: self.uiState.douyinItems, availableSize: size)
+                    self.menuIndex = layout.move(self.menuIndex, key: event.key)
+                    self.sync()
+                }
+                step()
+                startRepeat(event.key, step: step)
+            case .ok:
+                if uiState.douyinItems.indices.contains(menuIndex) {
+                    performDouyinAction(uiState.douyinItems[menuIndex])
+                }
+            case .home:
+                if active == .douyinCategories { close() }
+                else {
+                    dismissDouyinMenu()
+                    _ = handleDouyinShortcut(.home) { self.open($0) }
+                }
+            case .back: backFromDouyinMenu()
+            case .menu:
+                if showsMoreDouyinSettings { toggleDouyinMenuSize() }
+                else { close() }
+            default: break
+            }
         case .windowPicker: handlePickerKey(event.key)
         case .systemMenu:   handleMenuKey(event.key)
         case .appWheel:     handleWheelKey(event.key)
@@ -577,6 +659,395 @@ final class OverlayCenter {
         repeatTimer?.invalidate()
         repeatTimer = nil
         repeatKey = nil
+    }
+
+    func handleDouyinShortcut(_ key: RemoteKey, openMenu: @escaping (String) -> Void) -> Bool {
+        // A delayed short tap belongs to the app that received the original press.
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.bytedance.douyin.desktop" else { return true }
+        if key == .home, douyinHomeTask != nil {
+            douyinHomePending = true
+            CodexNavigation.showNotice("返回首页后将打开栏目菜单")
+            return true
+        }
+        let page = DouyinFeedNavigation.shortcutPage()
+        if key == .home {
+            if case .category = page {
+                openMenu(Kind.douyinCategories.rawValue)
+            } else {
+                beginDouyinHome(checkMiniWindow: page == nil, openMenu: openMenu)
+            }
+            return true
+        }
+        guard let page else {
+            if key == .menu, DouyinLiveOptions.isMiniWindow() {
+                openMenu(Kind.douyinLive.rawValue)
+            } else {
+                reportDouyinError("正在等待抖音页面加载，请稍后再按一次")
+            }
+            return true
+        }
+        switch (key, page) {
+        case (.menu, .category("关注")):
+            openMenu(Kind.douyinRooms.rawValue)
+        case (.menu, .liveRoom):
+            openMenu(Kind.douyinLive.rawValue)
+        default: return false
+        }
+        return true
+    }
+
+    private func invalidateDouyinHome() {
+        douyinHomeGeneration &+= 1
+        douyinHomeTask?.cancel()
+        douyinHomeTask = nil
+        douyinHomePending = false
+    }
+
+    private func beginDouyinHome(checkMiniWindow: Bool, openMenu: @escaping (String) -> Void) {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+        invalidateDouyinRead()
+        invalidateDouyinHome()
+        let generation = douyinHomeGeneration
+        let started = ProcessInfo.processInfo.systemUptime
+        CodexNavigation.showNotice("正在返回推荐首页…")
+        log("DOUYIN_HOME_STARTED generation=\(generation)")
+        douyinHomeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.douyinHomeGeneration == generation {
+                    self.douyinHomeTask = nil
+                    self.douyinHomePending = false
+                }
+            }
+            // Give an interrupted native read one turn to observe invalidation and
+            // release its operation lock before Home starts changing the page.
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled, self.active == nil,
+                  self.douyinHomeGeneration == generation,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            while self.douyinNativeReadDepth > 0 {
+                try? await Task.sleep(for: .milliseconds(20))
+                guard !Task.isCancelled, self.active == nil,
+                      self.douyinHomeGeneration == generation,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            }
+            DouyinFeedNavigation.resetSelection()
+            let cancelled = { [weak self] in
+                guard let self else { return true }
+                return self.douyinHomeGeneration != generation || self.active != nil
+            }
+            let error: String?
+            if checkMiniWindow, DouyinLiveOptions.isMiniWindow() {
+                error = DouyinLiveOptions.returnToLargeWindow() ?? DouyinControls.goHome(shouldCancel: cancelled)
+            } else {
+                error = DouyinControls.goHome(shouldCancel: cancelled)
+            }
+            guard self.douyinHomeGeneration == generation,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            let pending = self.douyinHomePending
+            self.douyinHomeTask = nil
+            self.douyinHomePending = false
+            self.log("DOUYIN_HOME_COMPLETED generation=\(generation) elapsed_ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) success=\(error == nil)")
+            self.reportDouyinError(error)
+            if error == nil, pending, self.active == nil {
+                openMenu(Kind.douyinCategories.rawValue)
+            }
+        }
+    }
+
+    private func dismissDouyinMenu() {
+        close()
+        // Remove the full-screen hit target before operating the player below it.
+        panel?.orderOut(nil)
+    }
+
+    /// Every read belongs to one visible menu route. Invalidating before changing
+    /// route also prevents RunLoop-driven native reads from publishing after Back.
+    private func invalidateDouyinRead() {
+        douyinMenuGeneration &+= 1
+        douyinReadTask?.cancel()
+        douyinReadTask = nil
+        readingDouyinOptions = false
+        douyinPendingGroup = nil
+    }
+
+    private func douyinSelectionID(_ item: DouyinMenuItem) -> String {
+        switch item {
+        case .collapseMore: return "group:native"
+        case .playerGroup(let group): return "group:" + group.id
+        case .playerOption(let group, let option): return "option:" + group.id + ":" + option.id
+        default: return String(describing: item)
+        }
+    }
+
+    private func setDouyinItems(_ items: [DouyinMenuItem], focusing groupID: String? = nil) {
+        let selectedID = uiState.douyinItems.indices.contains(menuIndex)
+            ? douyinSelectionID(uiState.douyinItems[menuIndex]) : nil
+        uiState.douyinItems = items
+        let focusID = groupID.map { "group:" + $0 } ?? selectedID
+        menuIndex = items.firstIndex { douyinSelectionID($0) == focusID } ?? min(menuIndex, max(0, items.count - 1))
+    }
+
+    private func douyinRootMenu(groups: [DouyinLiveOptions.Group], needsRetry: Bool,
+                                startingWith initial: [DouyinMenuItem] = DouyinMenuItem.playbackControls) -> [DouyinMenuItem] {
+        var items = initial
+        for section in ["播放器设置", "弹幕设置", "礼物设置"] {
+            items += groups.filter { DouyinMenuItem.groupSection($0) == section }.map(DouyinMenuItem.playerGroup)
+            if section == "播放器设置", needsRetry { items.append(.retryPlayerOptions) }
+        }
+        items += DouyinMenuItem.roomControls
+        return items
+    }
+
+    private func loadDouyinLiveMenu(focusing groupID: String? = nil) {
+        guard active == .douyinLive else { return }
+        invalidateDouyinRead()
+        uiState.douyinMenuError = nil
+        // Useful controls appear before any AX request. A live refresh leaves the
+        // existing controls and selection visible until its replacement is ready.
+        if douyinRootItems.isEmpty {
+            douyinRootItems = DouyinMenuItem.functions
+            menuIndex = 0
+        }
+        setDouyinItems(douyinRootItems, focusing: groupID)
+        showPanel()
+        let generation = douyinMenuGeneration
+        let started = ProcessInfo.processInfo.systemUptime
+        log("DOUYIN_MENU_VISIBLE generation=\(generation) elapsed_ms=\(Int((started - (douyinMenuOpenedAt ?? started)) * 1000))")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.active == .douyinLive, self.douyinMenuGeneration == generation else { return }
+            self.panel?.displayIfNeeded()
+            self.log("DOUYIN_MENU_RENDERED generation=\(generation) elapsed_ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000))")
+        }
+        douyinReadTask = Task { @MainActor [weak self] in
+            let result = await DouyinLiveOptions.discoverMenu()
+            guard let self, !Task.isCancelled, self.active == .douyinLive,
+                  self.douyinMenuGeneration == generation else { return }
+            let items: [DouyinMenuItem]
+            switch result {
+            case .success(let discovery):
+                items = discovery.isMiniWindow ? [.returnToLargeWindow]
+                    : self.douyinRootMenu(groups: discovery.compactGroups, needsRetry: discovery.needsRetry)
+            case .failure(let error):
+                items = DouyinMenuItem.functions + [.retryPlayerOptions]
+                self.uiState.douyinMenuError = error.localizedDescription
+            }
+            self.douyinRootItems = items
+            self.setDouyinItems(items)
+            self.sync(animated: false)
+            self.log("DOUYIN_MENU_DISCOVERED generation=\(generation) elapsed_ms=\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) items=\(items.count)")
+            self.douyinReadTask = nil
+        }
+    }
+
+    private func openDouyinOptions(_ group: DouyinLiveOptions.Group, applying option: DouyinLiveOptions.Option? = nil) {
+        guard active == .douyinLive, !readingDouyinOptions else { return }
+        invalidateDouyinRead()
+        uiState.douyinMenuError = nil
+        readingDouyinOptions = true
+        douyinPendingGroup = group
+        let generation = douyinMenuGeneration
+        panel?.orderOut(nil)
+        douyinReadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.douyinMenuGeneration == generation {
+                    self.readingDouyinOptions = false
+                    self.douyinPendingGroup = nil
+                    self.douyinReadTask = nil
+                }
+            }
+            // Let AppKit flush the hidden panel before sending hover events to the client beneath.
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled, self.active == .douyinLive, self.douyinMenuGeneration == generation else { return }
+            self.douyinNativeReadDepth += 1
+            defer { self.douyinNativeReadDepth -= 1 }
+            let previousCancellation = DouyinLiveOptions.shouldCancelOperation
+            DouyinLiveOptions.shouldCancelOperation = { [weak self] in
+                guard let self else { return true }
+                return self.active != .douyinLive || self.douyinMenuGeneration != generation
+            }
+            defer { DouyinLiveOptions.shouldCancelOperation = previousCancellation }
+            if group.id == "native" {
+                self.readDouyinNativeGroups(group, generation: generation)
+            } else {
+                self.readDouyinOptions(group, applying: option, generation: generation)
+            }
+        }
+    }
+
+    private func readDouyinOptions(_ group: DouyinLiveOptions.Group, applying option: DouyinLiveOptions.Option?, generation: UInt64) {
+        if let option, let error = DouyinLiveOptions.execute(option, in: group) {
+            guard active == .douyinLive, douyinMenuGeneration == generation else { return }
+            uiState.douyinMenuError = error
+            showPanel()
+            restartOverlayIdleTimer()
+            return
+        }
+        guard active == .douyinLive, douyinMenuGeneration == generation else { return }
+        if option?.id == "reset", group.id.hasPrefix("danmaku.") {
+            // Reset changes sibling values too; leave no old value on those
+            // cards until its own native submenu confirms the new selection.
+            douyinRootItems = douyinRootItems.map { item in
+                if case .playerGroup(let current) = item, current.id.hasPrefix("danmaku.") {
+                    return .playerGroup(DouyinLiveOptions.refreshedGroup(current, options: []))
+                }
+                return item
+            }
+        }
+        let result = DouyinLiveOptions.options(in: group)
+        guard active == .douyinLive, douyinMenuGeneration == generation else { return }
+        var displayedGroup = group
+        if case .success(let options) = result {
+            displayedGroup = DouyinLiveOptions.refreshedGroup(group, options: options)
+            func refreshedItem(_ item: DouyinMenuItem) -> DouyinMenuItem {
+                if case .playerGroup(let current) = item, current.id == group.id {
+                    return .playerGroup(displayedGroup)
+                }
+                return item
+            }
+            douyinRootItems = douyinRootItems.map(refreshedItem)
+            alternateDouyinItems = alternateDouyinItems?.map(refreshedItem)
+        }
+        switch result {
+        case .success(let options) where options.count == 1 && options[0].id == "perform":
+            performAfterDismissingDouyinMenu { DouyinLiveOptions.execute(options[0], in: group) }
+            return
+        case .success(let options) where !options.isEmpty:
+            uiState.douyinItems = options.map { .playerOption(displayedGroup, $0) }
+            menuIndex = options.firstIndex(where: { $0.isSelected }) ?? 0
+        case .success:
+            uiState.douyinMenuError = "当前直播间没有可用的" + group.title + "选项"
+        case .failure(let error):
+            uiState.douyinMenuError = error.localizedDescription
+        }
+        showPanel()
+        restartOverlayIdleTimer()
+    }
+
+    private func readDouyinNativeGroups(_ group: DouyinLiveOptions.Group, generation: UInt64) {
+        let result = DouyinLiveOptions.nativeGroups(in: group)
+        guard active == .douyinLive, douyinMenuGeneration == generation else { return }
+        switch result {
+        case .success(let groups):
+            let compact = showsMoreDouyinSettings ? (alternateDouyinItems ?? []) : douyinRootItems
+            guard let toggle = compact.firstIndex(where: {
+                if case .playerGroup(let item) = $0 { return item.id == group.id }
+                return false
+            }) else { return }
+            let prefix = compact.prefix(toggle)
+            let basicIDs = Set(prefix.compactMap { item -> String? in
+                if case .playerGroup(let basic) = item { return basic.id }
+                return nil
+            })
+            alternateDouyinItems = compact
+            douyinRootItems = douyinRootMenu(groups: groups.filter { !basicIDs.contains($0.id) },
+                                            needsRetry: DouyinLiveOptions.needsRetry,
+                                            startingWith: Array(prefix) + [.collapseMore])
+            uiState.douyinItems = douyinRootItems
+            menuIndex = toggle
+        case .failure(let error):
+            uiState.douyinMenuError = error.localizedDescription
+        }
+        showPanel()
+        restartOverlayIdleTimer()
+    }
+
+    private func toggleDouyinMenuSize() {
+        guard active == .douyinLive, let alternate = alternateDouyinItems else { return }
+        invalidateDouyinRead()
+        alternateDouyinItems = douyinRootItems
+        douyinRootItems = alternate
+        uiState.douyinMenuError = nil
+        setDouyinItems(alternate, focusing: "native")
+        if panel?.isVisible == true { sync(animated: false) }
+        else { showPanel() }
+        restartOverlayIdleTimer()
+    }
+
+    private func backFromDouyinMenu() {
+        var group = douyinPendingGroup
+        if group == nil, case .playerOption(let current, _) = uiState.douyinItems.first { group = current }
+        if active == .douyinLive, let group {
+            invalidateDouyinRead()
+            setDouyinItems(douyinRootItems, focusing: group.id)
+            uiState.douyinMenuError = nil
+            showPanel()
+            restartOverlayIdleTimer()
+        } else if showsMoreDouyinSettings {
+            toggleDouyinMenuSize()
+        } else {
+            close()
+        }
+    }
+
+    private func reloadDouyinMenu(focusing groupID: String? = nil) {
+        loadDouyinLiveMenu(focusing: groupID)
+        restartOverlayIdleTimer()
+    }
+
+    private func performDouyinAction(_ item: DouyinMenuItem) {
+        guard active?.isDouyinMenu == true, uiState.douyinItems.contains(item) else { return }
+        switch item {
+        case .playerGroup(let group):
+            if group.id == "native", alternateDouyinItems != nil { toggleDouyinMenuSize() }
+            else { openDouyinOptions(group) }
+        case .playerOption(let group, let option):
+            if group.id == "volume" || group.id.hasPrefix("danmaku.") || group.id.hasPrefix("gift.") {
+                openDouyinOptions(group, applying: option)
+            } else {
+                performAfterDismissingDouyinMenu { DouyinLiveOptions.execute(option, in: group) }
+            }
+        case .collapseMore:
+            toggleDouyinMenuSize()
+        case .retryPlayerOptions:
+            if showsMoreDouyinSettings, let compact = alternateDouyinItems,
+               let group = compact.compactMap({ item -> DouyinLiveOptions.Group? in
+                   if case .playerGroup(let group) = item, group.id == "native" { return group }
+                   return nil
+               }).first { openDouyinOptions(group) }
+            else {
+                alternateDouyinItems = nil
+                reloadDouyinMenu()
+            }
+        case .returnToLargeWindow:
+            performAfterDismissingDouyinMenu(DouyinLiveOptions.returnToLargeWindow)
+        case .playback:
+            performAfterDismissingDouyinMenu(DouyinControls.togglePlayback)
+        case .enableSound:
+            performAfterDismissingDouyinMenu(DouyinControls.enableSound)
+        case .fullscreen:
+            performAfterDismissingDouyinMenu(DouyinControls.enterFullscreen)
+        case .category(let name):
+            performAfterDismissingDouyinMenu { await DouyinFeedNavigation.openCategory(named: name) }
+        case .room(let name):
+            performAfterDismissingDouyinMenu { DouyinControls.enterLiveRoom(named: name) }
+        case .clearClutter:
+            performAfterDismissingDouyinMenu(DouyinLiveClutter.clear)
+        case .chooseRoom:
+            open(Kind.douyinRooms.rawValue)
+        }
+    }
+
+    private func performAfterDismissingDouyinMenu(_ action: @escaping @MainActor () async -> String?) {
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        dismissDouyinMenu()
+        // Release the menu and its fading hint panel before querying the player's controls.
+        hintPanel?.orderOut(nil)
+        let generation = douyinMenuGeneration
+        Task { @MainActor [weak self] in
+            // Finishing a click in an AppKit overlay can deliver one final mouse-exit to Chromium.
+            try? await Task.sleep(for: .milliseconds(80))
+            guard let self, self.active == nil, self.douyinMenuGeneration == generation,
+                  let pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            self.reportDouyinError(await action())
+        }
+    }
+
+    func reportDouyinError(_ message: String?) {
+        guard let message else { return }
+        log(message)
+        CodexNavigation.showNotice(message)
     }
 
     private func pickerStep(_ key: RemoteKey) {
@@ -728,7 +1199,7 @@ final class OverlayCenter {
         if active == .computerPower, powerMenu.isExecuting { return }
         // 会话列表需要阅读标题；给它比图标菜单更长的空闲时间。
         var idleSeconds: TimeInterval = active == .televisionPower ? 30
-            : active == .codexSessions ? 60 : active == .computerPower ? 30 : Self.overlayIdleSeconds
+            : active == .codexSessions ? 60 : (active == .computerPower || active == .douyinLive) ? 30 : Self.overlayIdleSeconds
         if let televisionDeadline, active == .televisionPower {
             let remaining = ContinuousClock().now.duration(to: televisionDeadline).components
             idleSeconds = min(idleSeconds, max(0.05, Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18))
@@ -870,6 +1341,41 @@ final class OverlayCenter {
         runningControlAppIDs = Set(runningIDs.map { $0.lowercased() })
     }
 
+    private func controlPowerChoices() -> [PowerMenuState.Choice] {
+        let douyinRunning = NSRunningApplication.runningApplications(withBundleIdentifier: "com.bytedance.douyin.desktop")
+            .contains { !$0.isTerminated && $0.activationPolicy == .regular }
+        return PowerMenuCatalog.choices(televisionConfigured: XiaomiTVController.shared.isConfigured,
+            currentAppName: powerApplication?.localizedName, douyinRunning: douyinRunning,
+            apps: menuApps.map { (id: $0.id, title: $0.name) })
+    }
+
+    private func refreshControlApplications() {
+        guard active == .computerPower, !powerMenu.isExecuting else { return }
+        if powerApplication?.isTerminated == true { powerApplication = nil }
+        reloadControlApplications()
+        powerMenu.refreshChoices(controlPowerChoices())
+        if powerMenu.appOption != nil, case .launchApp(let id) = powerMenu.selection.command {
+            let running = runningControlAppIDs.contains(id.lowercased())
+            if powerMenu.canQuitSelectedApp != running { powerMenu.showAppOptions(running: running) }
+        }
+    }
+
+    /// terminate() 只确认请求已发送；实际退出后再更新绿点和退出可用性。
+    /// 只在当前面板订阅，旧面板排队中的通知不能修改后来打开的面板。
+    private func observeControlApplications() {
+        let generation = powerGeneration
+        let center = NSWorkspace.shared.notificationCenter
+        controlApplicationObservers = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification].map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.powerGeneration == generation else { return }
+                    self.refreshControlApplications()
+                    self.sync(animated: false)
+                }
+            }
+        }
+    }
+
     private func handleTelevisionPowerKey(_ key: RemoteKey) {
         guard active == .televisionPower else { return }
         if let televisionDeadline, ContinuousClock().now >= televisionDeadline {
@@ -951,6 +1457,7 @@ final class OverlayCenter {
                 open("television_power")
                 return
             case .launchApp, .systemAction, .focusInput, .openSettings:
+                if command.keepsMenuOpen { break }
                 close()
                 PowerMenuActions.perform(command, currentApplication: nil) { _ in }
                 return
@@ -965,6 +1472,7 @@ final class OverlayCenter {
                 if self.powerMenu.complete(result) == .dismiss {
                     self.close()
                 } else {
+                    self.refreshControlApplications()
                     self.restartOverlayIdleTimer()
                     self.sync(animated: false)
                 }
@@ -1091,6 +1599,8 @@ final class OverlayCenter {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.contentView = NSHostingView(rootView: OverlayRootView(state: uiState,
             onDismiss: { [weak self] in self?.close() },
+            onDouyinBack: { [weak self] in self?.backFromDouyinMenu() },
+            onDouyinAction: { [weak self] in self?.performDouyinAction($0) },
             onCodexNewChat: { [weak self] in self?.createCodexChat(tabID: $0) },
             onCodexTabSelected: { [weak self] in self?.selectCodexTab($0) },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
@@ -1107,11 +1617,13 @@ final class OverlayCenter {
         guard active != .televisionPower else { return }
         let p = ensurePanel()
         if let screen = NSScreen.main { p.setFrame(screen.frame, display: true) }
-        uiState.kind = nil       // 入场从隐藏态开始（消失后残留的 kind 已在 close 清空，这里兜底）
-        sync(animated: false)    // 数据先无动画就位
-        uiState.kind = nil
+        let alreadyShowing = p.isVisible && uiState.kind == active
+        sync(animated: false)
         p.orderFrontRegardless()
-        withAnimation(Motion.overlay) { uiState.kind = active }
+        if !alreadyShowing {
+            uiState.kind = nil
+            withAnimation(Motion.overlay) { uiState.kind = active }
+        }
     }
 
     // MARK: per-app profile 切换提示（gamepad-ux ⑦：换布局要让用户知道）
@@ -1123,6 +1635,8 @@ final class OverlayCenter {
     /// 闪一条提示条。基础态平时不常驻提示条，故到点自动收起。
     /// 浮层打开或已在功能层时不打扰——那两种状态的提示条另有主人。
     func noteProfileSwitch(_ bundleID: String?) {
+        if bundleID != "com.bytedance.douyin.desktop" { invalidateDouyinHome() }
+        if active?.isDouyinMenu == true, bundleID != "com.bytedance.douyin.desktop" { close() }
         guard active == nil, !dockNavigationActive, applicationNavigationMode == nil,
               mouseStatusText == nil, model?.activeLayer == 0 else { return }
         profileHintToken &+= 1
@@ -1335,6 +1849,9 @@ enum HintBarCatalog {
     /// 浮层键表（与各浮层 handleKey 路由保持一致）。
     static func hints(for kind: OverlayCenter.Kind) -> [Hint] {
         switch kind {
+        case .douyinLive, .douyinCategories, .douyinRooms:
+            return [Hint(keys: [.up, .down], text: "选择"), Hint(keys: [.ok], text: "执行"),
+                    Hint(keys: [.back], text: "关闭")]
         case .windowPicker:
             return [Hint(keys: [.up, .down], text: "选窗口（按住加速）"),
                     Hint(keys: [.left, .right], text: "翻页"),
@@ -1483,6 +2000,8 @@ struct HintBarView: View {
 private struct OverlayRootView: View {
     @ObservedObject var state: OverlayUIState
     let onDismiss: () -> Void
+    let onDouyinBack: () -> Void
+    let onDouyinAction: (DouyinMenuItem) -> Void
     let onCodexNewChat: (String) -> Void
     let onCodexTabSelected: (Int) -> Void
     let onMenuSelect: (Int) -> Void
@@ -1502,6 +2021,8 @@ private struct OverlayRootView: View {
                 .onTapGesture { onDismiss() }
             Group {
                 switch state.kind {
+                case .douyinLive, .douyinCategories, .douyinRooms:
+                    DouyinLiveMenu(items: state.douyinItems, selected: state.menuIndex, activate: onDouyinAction, onBack: onDouyinBack, message: state.douyinMenuError)
                 case .windowPicker:
                     WindowPickerView(entries: state.pickerEntries,
                                      selected: state.pickerIndex,

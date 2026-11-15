@@ -110,6 +110,30 @@ final class MappingEngine: @unchecked Sendable {
     /// 经 mainDispatch 投递到主线程交给浮层处理；浮层关闭（置 nil）即恢复。
     private var overlayHandler: ((ButtonEvent) -> Void)?
     private var immediateOverlayDirections = false
+    private var prioritizeOverlayNavigationTaps = false
+    /// Main-thread app-specific tap hook. False preserves the normal tap action
+    /// when the foreground Douyin action is unavailable.
+    var onDouyinShortTap: ((RemoteKey) -> Bool)?
+    /// Main-thread foreground Douyin Up/Down/OK hook. Returning false emits one
+    /// native arrow/Return stroke. Horizontal keys keep their normal routes;
+    /// modal capture, mouse and Mission Control win.
+    var onDouyinNavigationTap: ((RemoteKey) -> Bool)? {
+        didSet { dispatch { [weak self] in self?.publishTapRoute() } }
+    }
+    private var douyinNavigationPressed: Set<RemoteKey> = []
+    private var douyinNavigationSuppressed: Set<RemoteKey> = []
+    private lazy var douyinNavigationGestures: IndependentGestures = {
+        let gestures = IndependentGestures(schedule: scheduleAfter)
+        gestures.onGesture = { [weak self] key, _ in self?.fireDouyinNavigationTap(key) }
+        return gestures
+    }()
+    private var douyinNavigationActive: Bool {
+        activeBundleID == "com.bytedance.douyin.desktop" && onDouyinNavigationTap != nil
+    }
+    private func isDouyinNavigationKey(_ key: RemoteKey) -> Bool {
+        key == .up || key == .down || key == .ok
+    }
+    private var douyinTapContexts: [RemoteKey: (generation: UInt64, mouseActive: Bool)] = [:]
     private var applicationNavigationEnabled = false
     /// Snapshot the real editor on physical down; release must never pick a new one.
     var prepareCodexBackspace: () -> CodexBackspace.Press? = { nil }
@@ -161,6 +185,32 @@ final class MappingEngine: @unchecked Sendable {
         // Revocation discards recognition rather than committing a late result.
         gestures.onVoiceCancel = { [weak self] in
             self?.runIndependentLocal(.system("codex_context_voice_cancel"))
+        }
+        return gestures
+    }()
+    /// Eligibility is reserved on the main thread at physical down. A generic
+    /// Douyin foreground profile alone never takes ownership of voice presses.
+    private var douyinVoiceContextAvailable: Bool {
+        activeBundleID == "com.bytedance.douyin.desktop" && effectiveLayer == 0
+            && overlayHandler == nil && !reservedMouseIsActive()
+            && !TransientSystemUI.isMissionControlActive()
+    }
+    private lazy var douyinVoiceGestures: CodexContextGestures = {
+        let gestures = CodexContextGestures(schedule: scheduleAfter)
+        gestures.onVoiceTap = { [weak self] in
+            guard let self, self.douyinVoiceContextAvailable else { return }
+            self.runIndependentLocal(.system("douyin_live_voice_focus"))
+        }
+        gestures.onVoiceStart = { [weak self] in
+            guard let self, self.douyinVoiceContextAvailable else { return false }
+            self.runIndependentLocal(.system("douyin_live_voice_start"))
+            return true
+        }
+        gestures.onVoiceEnd = { [weak self] in
+            self?.runIndependentLocal(.system("douyin_live_voice_end"))
+        }
+        gestures.onVoiceCancel = { [weak self] in
+            self?.runIndependentLocal(.system("douyin_live_voice_cancel"))
         }
         return gestures
     }()
@@ -277,7 +327,8 @@ final class MappingEngine: @unchecked Sendable {
         // 其余方向继续直接改写，保留系统原生 autorepeat 与零延迟。
         let directions: Set<RemoteKey> = [.up, .down, .left, .right]
         let native = Set(directions.filter { key in
-            !applicationNavigationActive && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
+            !(douyinNavigationActive && isDouyinNavigationKey(key))
+                && !applicationNavigationActive && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
                 && (!independent || overlayDeclared(key)?.overrideBase != true)
                 && !codexContextKey(key)
         })
@@ -365,8 +416,10 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     /// 喂入原始按键事件。核心入口。
-    func handle(_ event: ButtonEvent) {
-        dispatch { [weak self] in self?._handle(event) }
+    func handle(_ event: ButtonEvent, douyinLiveVoiceEligible: Bool = false) {
+        dispatch { [weak self] in
+            self?._handle(event, douyinLiveVoiceEligible: douyinLiveVoiceEligible)
+        }
     }
 
     /// 复位全部输入运行态：作废在途定时器、清按键相位/瞬时层/OK 物理态，重发布快照。
@@ -380,11 +433,13 @@ final class MappingEngine: @unchecked Sendable {
 
     /// M5 v2 浮层键捕获：handler 非 nil 时所有遥控键改喂浮层（主线程回调），
     /// 置 nil 恢复正常动作分发。切换时复位输入运行态（清在途定时器/相位，防卡键）。
-    func setOverlayCapture(_ handler: ((ButtonEvent) -> Void)?, immediateDirections: Bool = false) {
+    func setOverlayCapture(_ handler: ((ButtonEvent) -> Void)?, immediateDirections: Bool = false,
+                           prioritizeNavigationTaps: Bool = false) {
         dispatch { [weak self] in
             guard let self else { return }
             self.overlayHandler = handler
             self.immediateOverlayDirections = handler != nil && immediateDirections
+            self.prioritizeOverlayNavigationTaps = handler != nil && prioritizeNavigationTaps
             self._resetInputState(handler != nil ? "浮层打开" : "浮层关闭")
         }
     }
@@ -410,9 +465,12 @@ final class MappingEngine: @unchecked Sendable {
         revokeLegacyVoicePress()
         applicationNavigationGestures.reset()
         codexContextGestures.reset()
+        douyinVoiceGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
+        resetDouyinNavigation()
+        douyinTapContexts.removeAll()
         gestureContexts.removeAll()
         independentHeld.removeAll()
         scrollRepeatingKeys.removeAll()
@@ -438,9 +496,11 @@ final class MappingEngine: @unchecked Sendable {
 
     private func _setActiveProfile(_ bundleID: String?) {
         invalidateInputSession()
+        resetDouyinNavigation()
         revokeLegacyVoicePress()
         applicationNavigationGestures.reset()
         codexContextGestures.reset()
+        douyinVoiceGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         contextGeneration &+= 1
@@ -459,9 +519,12 @@ final class MappingEngine: @unchecked Sendable {
         invalidateInputSession()
         applicationNavigationGestures.reset(preservePressed: preserveReservedPresses)
         codexContextGestures.reset(preservePressed: preserveReservedPresses)
+        douyinVoiceGestures.reset(preservePressed: preserveReservedPresses)
         reservedDirectionGestures.reset(preservePressed: preserveReservedPresses)
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
+        resetDouyinNavigation(preservePressed: preserveReservedPresses)
+        douyinTapContexts.removeAll()
         gestureContexts.removeAll()
         contextGeneration &+= 1
         for key in repeatTokens.keys { repeatTokens[key, default: 0] &+= 1 }
@@ -495,7 +558,7 @@ final class MappingEngine: @unchecked Sendable {
         states[.voice] = state
     }
 
-    private func _handle(_ event: ButtonEvent) {
+    private func _handle(_ event: ButtonEvent, douyinLiveVoiceEligible: Bool) {
         // 暂停态：遥控完全惰性——不进状态机、不追踪逃生、不喂浮层。
         if suspendedLock.withLock({ $0 }) { return }
         if event.key == .voice || event.key == .back, states[event.key]?.phase == .consumed {
@@ -505,9 +568,36 @@ final class MappingEngine: @unchecked Sendable {
         // A hold/context change consumes that physical press through release,
         // even if its global action focuses another app or opens a new panel.
         if !codexVoiceContextAvailable { codexContextGestures.cancelVoice() }
+        if !douyinVoiceContextAvailable { douyinVoiceGestures.cancelVoice() }
+        if douyinNavigationSuppressed.contains(event.key) {
+            if !event.isDown { douyinNavigationSuppressed.remove(event.key) }
+            return
+        }
         if applicationNavigationGestures.consumeSuppressed(event)
             || reservedDirectionGestures.consumeSuppressed(event)
-            || codexContextGestures.consumeSuppressed(event) { return }
+            || codexContextGestures.consumeSuppressed(event)
+            || douyinVoiceGestures.consumeSuppressed(event) { return }
+        if event.key == .voice,
+           douyinVoiceGestures.isTracking(.voice)
+            || (event.isDown && douyinLiveVoiceEligible && douyinVoiceContextAvailable
+                && (states[.voice]?.phase ?? .idle) == .idle
+                && !independentGestures.isTracking(.voice)) {
+            douyinVoiceGestures.handle(event, holdMs: overlayDeclared(.voice)?.holdMs ?? config.settings.holdMs)
+            return
+        }
+        if event.isDown, event.key == .home || event.key == .menu {
+            let tracking = independent ? independentGestures.isTracking(event.key)
+                : (states[event.key]?.phase ?? .idle) != .idle
+            if !tracking {
+                douyinTapContexts.removeValue(forKey: event.key)
+                if onDouyinShortTap != nil, activeBundleID == "com.bytedance.douyin.desktop",
+                   overlayHandler == nil,
+                   !TransientSystemUI.isMissionControlActive() {
+                    douyinTapContexts[event.key] = (inputGeneration, reservedMouseIsActive())
+                }
+            }
+        }
+        if handleDouyinNavigation(event) { return }
         if independent {
             handleIndependent(event)
             return
@@ -530,7 +620,9 @@ final class MappingEngine: @unchecked Sendable {
         }
         // 鼠标模式：方向/OK/菜单/返回由 MouseMode 消费（方向=移动、OK=左键、菜单=右键、
         // 返回=退出模式），消费后不再走普通映射；其余键（电源/音量/语音）照常。
-        if MouseMode.shared.handle(key: event.key, isDown: event.isDown) { return }
+        let douyinMouseTap = activeBundleID == "com.bytedance.douyin.desktop"
+            && onDouyinShortTap != nil && (event.key == .home || event.key == .menu)
+        if !douyinMouseTap, MouseMode.shared.handle(key: event.key, isDown: event.isDown) { return }
         // Home 打开的调度中心模式：左右直接切 Space，并续期 20 秒状态窗口。
         // 同一次按压的 keyUp 也在此吞掉，避免给普通按键状态机留下孤儿事件。
         if TransientSystemUI.isMissionControlActive(), isDirection(event.key) {
@@ -567,7 +659,61 @@ final class MappingEngine: @unchecked Sendable {
         }
     }
 
+    private func resetDouyinNavigation(preservePressed: Bool = true) {
+        if preservePressed { douyinNavigationSuppressed.formUnion(douyinNavigationPressed) }
+        else { douyinNavigationSuppressed.removeAll() }
+        douyinNavigationPressed.removeAll()
+        douyinNavigationGestures.reset()
+        for key in [RemoteKey.up, .down, .ok] {
+            douyinTapContexts.removeValue(forKey: key)
+        }
+    }
+
+    private func handleDouyinNavigation(_ event: ButtonEvent) -> Bool {
+        let key = event.key
+        guard isDouyinNavigationKey(key) else { return false }
+        guard douyinNavigationActive, overlayHandler == nil, !reservedMouseIsActive(),
+              !TransientSystemUI.isMissionControlActive() else {
+            // A mode can change without an input reset (for example mouse mode).
+            // The old physical press must not become a tap in the new mode.
+            if douyinNavigationGestures.isTracking(key) {
+                douyinNavigationGestures.cancel(key)
+                douyinTapContexts.removeValue(forKey: key)
+                douyinNavigationPressed.remove(key)
+                if event.isDown { douyinNavigationSuppressed.insert(key) }
+                return true
+            }
+            return false
+        }
+        if event.isDown {
+            douyinNavigationPressed.insert(key)
+            if !douyinNavigationGestures.isTracking(key) {
+                douyinTapContexts[key] = (inputGeneration, reservedMouseIsActive())
+            }
+        } else { douyinNavigationPressed.remove(key) }
+        douyinNavigationGestures.handle(event, policy: .init(
+            doubleMs: 0, holdMs: 1, hasDouble: false, hasHold: false))
+        return true
+    }
+
+    private func fireDouyinNavigationTap(_ key: RemoteKey) {
+        let fallback: () -> Void = { [weak self] in
+            let native = Self.nativeArrowName[key] ?? "return"
+            self?.runner.run(.keyStroke(key: native, mods: []))
+        }
+        if !routeDouyinShortTap(key, fallback: fallback) { fallback() }
+    }
+
     // MARK: 独立全局手势（保留槽 → 临时面板/鼠标 → App 单击/长按）
+
+    /// In Douyin, two short Home presses have two distinct destinations: the
+    /// recommendation feed and its category picker. Deliver each at key-up.
+    private func usesImmediateDouyinTap(_ key: RemoteKey) -> Bool {
+        guard key == .home || key == .menu else { return false }
+        if douyinTapContexts[key] != nil { return true }
+        return prioritizeOverlayNavigationTaps && activeBundleID == "com.bytedance.douyin.desktop"
+            && onDouyinShortTap != nil
+    }
 
     private func handleIndependent(_ event: ButtonEvent) {
         let key = event.key
@@ -667,7 +813,7 @@ final class MappingEngine: @unchecked Sendable {
         independentGestures.handle(event, policy: .init(
             doubleMs: max(0, config.settings.doubleMs),
             holdMs: max(1, reserved?.holdMs ?? config.settings.holdMs),
-            hasDouble: reserved?.double != nil && !(key == .back && codexEditingBackPress),
+            hasDouble: reserved?.double != nil && !usesImmediateDouyinTap(key) && !(key == .back && codexEditingBackPress),
             hasHold: reserved?.hold != nil || localHold != nil || mouseHold
                 || (key == .back && activeBundleID == "com.openai.codex")))
     }
@@ -766,6 +912,27 @@ final class MappingEngine: @unchecked Sendable {
         case .double: globalAction = reserved?.double
         case .hold: globalAction = reserved?.hold
         }
+        if gesture == .tap {
+            // Modal menus own navigation taps, while reserved double/hold
+            // gestures continue through the normal global priority below.
+            if prioritizeOverlayNavigationTaps, let handler = overlayHandler,
+               [.home, .menu, .back].contains(key),
+               context?.0 == contextGeneration, context?.1 == MouseMode.shared.isActive {
+                mainDispatch {
+                    handler(ButtonEvent(key: key, isDown: true, timeNs: 0))
+                    handler(ButtonEvent(key: key, isDown: false, timeNs: 0))
+                }
+                return
+            }
+            if routeDouyinShortTap(key, fallback: { [weak self] in
+                if let globalAction { self?.runIndependentGlobal(globalAction) }
+                else if self?.reservedMouseIsActive() == true {
+                    self?.reservedMouseHandle(key, true)
+                    self?.reservedMouseHandle(key, false)
+                }
+                else { self?.runIndependentLocal(self?.independentTapAction(key)) }
+            }) { return }
+        } else { douyinTapContexts.removeValue(forKey: key) }
         if let globalAction {
             runIndependentGlobal(globalAction)
             return
@@ -795,6 +962,33 @@ final class MappingEngine: @unchecked Sendable {
                 runIndependentLocal(binding(for: key)?.hold)
             }
         }
+    }
+
+    /// A tap may wait for a double window and then for the main thread. Check
+    /// its original input session at both boundaries, including fallback, so a
+    /// foreground/capture change cannot send an old app action into a new app.
+    private func routeDouyinShortTap(_ key: RemoteKey, fallback: @escaping () -> Void) -> Bool {
+        guard let context = douyinTapContexts.removeValue(forKey: key) else { return false }
+        let generation = context.generation
+        guard generation == inputGeneration, activeBundleID == "com.bytedance.douyin.desktop",
+              overlayHandler == nil, context.mouseActive == reservedMouseIsActive(),
+              !TransientSystemUI.isMissionControlActive() else { return true }
+        let handler = isDouyinNavigationKey(key) ? onDouyinNavigationTap : onDouyinShortTap
+        guard let handler else { return false }
+        mainDispatch { [weak self] in
+            guard let self, self.inputGeneration == generation, !self.isSuspended,
+                  context.mouseActive == self.reservedMouseIsActive(),
+                  !TransientSystemUI.isMissionControlActive() else { return }
+            if !handler(key) {
+                self.dispatch { [weak self] in
+                    guard let self, self.inputGeneration == generation, !self.isSuspended,
+                          context.mouseActive == self.reservedMouseIsActive(),
+                          !TransientSystemUI.isMissionControlActive() else { return }
+                    fallback()
+                }
+            }
+        }
+        return true
     }
 
     private func independentTapAction(_ key: RemoteKey) -> Action? {
@@ -846,6 +1040,7 @@ final class MappingEngine: @unchecked Sendable {
         guard action != .none else { return }
         applicationNavigationGestures.reset()
         codexContextGestures.reset()
+        douyinVoiceGestures.reset()
         switch action {
         case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
              .system("space_left"), .system("space_right"), .system("show_desktop"), .system("quit_app"):
@@ -909,6 +1104,7 @@ final class MappingEngine: @unchecked Sendable {
 
         // 2) 双击窗口内的第二次按下 → 判定双击。
         if st.phase == .waitingDouble {
+            douyinTapContexts.removeValue(forKey: key)
             st.seq &+= 1                 // 作废在途的 double→tap 定时器
             st.phase = .consumed         // 吞掉这次按压的松开
             states[key] = st
@@ -942,8 +1138,10 @@ final class MappingEngine: @unchecked Sendable {
         // Escape revokes pending Codex navigation/submit immediately, including
         // an OK press that began after the legacy menu hold was already running.
         invalidateInputSession()
+        resetDouyinNavigation()
         contextGeneration &+= 1
         codexContextGestures.reset()
+        douyinVoiceGestures.reset()
         overlayHandler = nil
         MouseMode.shared.deactivate()   // 迷路兜底：鼠标模式一并退出
         lockedLayer = 0
@@ -967,6 +1165,7 @@ final class MappingEngine: @unchecked Sendable {
 
     private func onHoldTimer(_ key: RemoteKey, _ token: Int) {
         guard var st = states[key], st.seq == token, st.phase == .down, !st.holdFired else { return }
+        douyinTapContexts.removeValue(forKey: key)
         st.holdFired = true
         states[key] = st
         if key == .back, activeBundleID == "com.openai.codex", effectiveLayer == 0 {
@@ -1035,7 +1234,7 @@ final class MappingEngine: @unchecked Sendable {
                 states[key] = st
             } else {
                 // 短按候选。配了 double 且 doubleMs>0 → 进等待窗口；否则零延迟发 tap。
-                let hasDouble = doubleAction(for: key) != nil
+                let hasDouble = doubleAction(for: key) != nil && !usesImmediateDouyinTap(key)
                 if hasDouble, config.settings.doubleMs > 0 {
                     st.phase = .waitingDouble
                     let token = st.seq
@@ -1065,6 +1264,13 @@ final class MappingEngine: @unchecked Sendable {
 
     /// 短按分发：层激活时优先 `layers["\(层)"]`，缺失退回 `tap`。
     private func fireTap(_ key: RemoteKey) {
+        let mouseTap = douyinTapContexts[key]?.mouseActive == true
+        if routeDouyinShortTap(key, fallback: { [weak self] in
+            if mouseTap {
+                self?.reservedMouseHandle(key, true)
+                self?.reservedMouseHandle(key, false)
+            } else { self?.fireTap(key) }
+        }) { return }
         if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0, key == .back {
             forwardApplicationNavigation(key, true)
             forwardApplicationNavigation(key, false)
@@ -1172,6 +1378,7 @@ final class MappingEngine: @unchecked Sendable {
         guard eff != lastNotifiedLayer else { return }
         lastNotifiedLayer = eff
         codexContextGestures.reset()
+        douyinVoiceGestures.reset()
         publishTapRoute()
         delegate?.layerChanged(eff)
         log("LAYER \(eff)")
@@ -2244,8 +2451,336 @@ extension MappingEngine {
             expect(runner.actions == [.system("mission_control")], "G profile slot overlay inherits gesture")
         }
 
+        ok = douyinShortTapSelfCheck() && ok
+        ok = douyinNavigationSelfCheck() && ok
+        ok = douyinVoiceSelfCheck() && ok
         if ok { print("[MappingEngine.selfCheck] all scenarios passed") }
         return ok
+    }
+
+    static func douyinShortTapSelfCheck() -> Bool {
+        var passed = true
+        func expect(_ condition: Bool, _ message: String) {
+            if !condition { passed = false; print("[MappingEngine.douyinShortTapSelfCheck] FAIL: \(message)") }
+        }
+        for independentMode in [false, true] {
+            let clock = ManualClock()
+            let runner = RecordingRunner()
+            var config = MappingConfig()
+            config.settings.holdMs = 600
+            config.settings.doubleMs = 250
+            let bindings = [
+                "home": KeyBinding(tap: .system("show_desktop"), hold: .system("volume_up"),
+                                   double: .system("mute")),
+                "menu": KeyBinding(tap: .overlay("menu"), hold: .system("volume_down"),
+                                   double: .system("play_pause")),
+                "back": KeyBinding(hold: .system("quit_app")),
+            ]
+            config.profiles["global"] = bindings
+            config.globalShortcuts = independentMode ? bindings : nil
+            var mainWork: [() -> Void] = []
+            var mouseActive = false
+            var mouseEvents: [String] = []
+            let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) },
+                mainDispatch: { mainWork.append($0) },
+                reservedMouseIsActive: { mouseActive },
+                reservedMouseHandle: { mouseEvents.append("\($0.rawValue)\($1 ? "+" : "-")") },
+                reservedMouseDeactivate: { mouseActive = false })
+            var taps: [RemoteKey] = []
+            var acceptsTap = true
+            engine.onDouyinShortTap = { taps.append($0); return acceptsTap }
+            func drainMain() {
+                while !mainWork.isEmpty { mainWork.removeFirst()() }
+            }
+            func event(_ key: RemoteKey, _ down: Bool) {
+                engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
+            }
+            func tap(_ key: RemoteKey) { event(key, true); event(key, false) }
+            func settle() { clock.advance(300); drainMain() }
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            tap(.home); drainMain(); tap(.menu); drainMain()
+            expect(taps == [.home, .menu] && runner.actions.isEmpty,
+                   "home/menu route on release without waiting for the double window (independent=\(independentMode))")
+            taps.removeAll()
+            engine.lockedLayer = 2; engine.recomputeLayer()
+            tap(.home); settle(); tap(.menu); settle()
+            expect(taps == [.home, .menu] && runner.actions.isEmpty, "Douyin taps override active mapping layers")
+            engine.lockedLayer = 0; engine.recomputeLayer(); taps.removeAll()
+            mouseActive = true
+            tap(.home); settle(); tap(.menu); settle()
+            expect(taps == [.home, .menu] && runner.actions.isEmpty && mouseEvents.isEmpty,
+                   "Douyin taps override mouse-mode short taps")
+            taps.removeAll()
+            acceptsTap = false
+            tap(.menu); settle()
+            expect(taps == [.menu] && (independentMode
+                ? runner.actions == [.overlay("menu")] && mouseEvents.isEmpty
+                : runner.actions.isEmpty && mouseEvents == ["menu+", "menu-"]),
+                   "declined mouse tap preserves original fallback")
+            if independentMode {
+                var noGlobalMenuTap = config
+                noGlobalMenuTap.globalShortcuts?["menu"]?.tap = nil
+                engine.setConfig(noGlobalMenuTap)
+                taps.removeAll(); runner.actions.removeAll(); mouseEvents.removeAll(); mouseActive = true
+                tap(.menu); settle()
+                expect(taps == [.menu] && runner.actions.isEmpty && mouseEvents == ["menu+", "menu-"],
+                       "declined unreserved mouse tap stays in MouseMode")
+                engine.setConfig(config)
+            }
+            mouseActive = false; taps.removeAll(); runner.actions.removeAll()
+            acceptsTap = false
+            tap(.menu); settle()
+            expect(taps == [.menu] && runner.actions == [.overlay("menu")], "declined menu preserves fallback")
+            taps.removeAll(); runner.actions.removeAll(); acceptsTap = true
+            for key in [RemoteKey.home, .menu] {
+                tap(key); clock.advance(40); tap(key); settle()
+                event(key, true); clock.advance(600); event(key, false); settle()
+            }
+            expect(taps == [.home, .home, .menu, .menu] && runner.actions == [.system("volume_up"), .system("volume_down")],
+                   "rapid independent taps stay in Douyin; long press stays global")
+            runner.actions.removeAll(); taps.removeAll()
+            engine.setActiveProfile("com.example.other")
+            tap(.home); clock.advance(40); tap(.home); settle()
+            expect(taps.isEmpty && runner.actions == [.system("mute")], "other apps keep global double")
+            runner.actions.removeAll()
+            tap(.home); settle()
+            expect(taps.isEmpty && runner.actions == [.system("show_desktop")], "other apps keep normal Home")
+            runner.actions.removeAll()
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            tap(.home); engine.setActiveProfile("com.example.other"); settle()
+            expect(taps.isEmpty && runner.actions.isEmpty, "switch before queued delivery discards old tap")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            tap(.menu); clock.advance(300)
+            engine.setActiveProfile("com.example.other"); drainMain()
+            expect(taps.isEmpty && runner.actions.isEmpty, "switch before main callback discards old tap")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            engine.onDouyinShortTap = { key in
+                taps.append(key); engine.setActiveProfile("com.example.other"); return false
+            }
+            tap(.menu); settle()
+            expect(taps == [.menu] && runner.actions.isEmpty, "declined callback cannot fallback into a new app")
+            taps.removeAll()
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            var captured: [RemoteKey] = []
+            engine.setOverlayCapture({ if $0.isDown { captured.append($0.key) } },
+                                     immediateDirections: true, prioritizeNavigationTaps: true)
+            for key in [RemoteKey.left, .right, .up, .down, .ok, .back, .menu, .home] { tap(key); settle() }
+            expect(captured == [.left, .right, .up, .down, .ok, .back, .menu, .home]
+                   && taps.isEmpty && runner.actions.isEmpty, "modal navigation beats app and global short taps")
+            if independentMode {
+                captured.removeAll()
+                tap(.home); clock.advance(40); tap(.home); settle()
+                event(.menu, true); clock.advance(600); event(.menu, false); settle()
+                expect(captured == [.home, .home] && runner.actions == [.system("volume_down")],
+                       "Douyin modal receives both taps immediately and preserves hold")
+            }
+        }
+        if passed { print("[MappingEngine.douyinShortTapSelfCheck] all scenarios passed") }
+        return passed
+    }
+
+    /// Physical voice owns exactly one live-room press. No OS repeat or stale
+    /// release may turn a hold into a tap or borrow another app's press.
+    static func douyinVoiceSelfCheck() -> Bool {
+        var passed = true
+        func expect(_ condition: Bool, _ message: String) {
+            if !condition { passed = false; print("[MappingEngine.douyinVoiceSelfCheck] FAIL: \(message)") }
+        }
+        for independentMode in [false, true] {
+            let clock = ManualClock()
+            let runner = RecordingRunner()
+            var config = MappingConfig()
+            config.settings.holdMs = 600
+            config.settings.doubleMs = 0
+            config.profiles["global"] = ["voice": KeyBinding(tap: .system("existing_voice_tap"),
+                                                           hold: .system("existing_voice_hold"))]
+            config.profiles["com.bytedance.douyin.desktop"] = ["voice": KeyBinding(holdMs: 450)]
+            config.globalShortcuts = independentMode ? [:] : nil
+            var mouseActive = false
+            let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) },
+                reservedMouseIsActive: { mouseActive })
+            func event(_ down: Bool, eligible: Bool = false) {
+                engine.handle(ButtonEvent(key: .voice, isDown: down, timeNs: 0),
+                              douyinLiveVoiceEligible: eligible)
+            }
+            func tap(eligible: Bool) { event(true, eligible: eligible); event(false) }
+            func take() -> [Action] { let result = runner.actions; runner.actions.removeAll(); return result }
+            let focus = Action.system("douyin_live_voice_focus")
+            let start = Action.system("douyin_live_voice_start")
+            let end = Action.system("douyin_live_voice_end")
+            let cancel = Action.system("douyin_live_voice_cancel")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            tap(eligible: true)
+            expect(take() == [focus], "live tap focuses the chat editor exactly once")
+            event(true, eligible: true); clock.advance(449); event(true)
+            expect(take().isEmpty, "repeat cannot trigger before local hold threshold")
+            clock.advance(1)
+            expect(take() == [start], "hold begins at the configured local threshold")
+            event(true, eligible: true); clock.advance(1500)
+            expect(take().isEmpty, "raw repeat and expired timers cannot start twice")
+            event(false); event(false)
+            expect(take() == [end], "hold release ends once without focusing")
+            tap(eligible: true); tap(eligible: true); clock.advance(1000)
+            expect(take() == [focus, focus], "rapid taps remain separate and invalidate hold timers")
+            tap(eligible: false)
+            expect(take() == [.system("existing_voice_tap")], "non-live Douyin keeps configured voice tap")
+            event(true); event(true, eligible: true); clock.advance(700); event(false)
+            expect(take() == [.system("existing_voice_hold")], "a repeated down cannot borrow a non-live press")
+            engine.setActiveProfile("com.example.other")
+            tap(eligible: true)
+            expect(take() == [.system("existing_voice_tap")], "eligibility cannot take voice from another app")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            event(true, eligible: true); clock.advance(100)
+            engine.setActiveProfile("com.example.other"); clock.advance(1000)
+            event(true, eligible: true); event(false)
+            expect(take().isEmpty, "profile loss before threshold consumes repeats and release")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            event(true, eligible: true); clock.advance(450); _ = take()
+            engine.setActiveProfile("com.example.other")
+            expect(take() == [cancel], "profile loss cancels active recognition")
+            event(false)
+            expect(take().isEmpty, "cancelled hold never ends or focuses on release")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            event(true, eligible: true); clock.advance(450); _ = take()
+            var captured = 0
+            engine.setOverlayCapture({ _ in captured += 1 })
+            expect(take() == [cancel], "modal capture cancels an active hold")
+            event(false)
+            expect(captured == 0 && take().isEmpty, "held voice release cannot leak into the new modal")
+            tap(eligible: true)
+            expect(captured == 2 && take().isEmpty, "modal receives its own physical voice press")
+            engine.setOverlayCapture(nil)
+            event(true, eligible: true); clock.advance(100); mouseActive = true
+            clock.advance(500); event(false)
+            expect(take().isEmpty, "mouse context revokes pending voice without fallback")
+            mouseActive = false
+            event(true, eligible: true); clock.advance(450); _ = take()
+            engine.setConfig(config)
+            expect(take() == [cancel], "reload cancels recognition and consumes its old release")
+            event(false)
+            event(true, eligible: true); clock.advance(450); _ = take()
+            engine.resetInputState(reason: "voice device removed")
+            expect(take() == [cancel], "lost-release reset cancels recognition")
+            tap(eligible: true)
+            expect(take() == [focus], "device reset permits a new physical press")
+            event(true, eligible: true); clock.advance(450); _ = take()
+            engine.toggleLayer(2)
+            expect(take() == [cancel], "layer transition cancels recognition")
+            event(false); engine.toggleLayer(2)
+            event(true, eligible: true); clock.advance(450); _ = take()
+            engine.setSuspended(true)
+            expect(take() == [cancel], "suspending cancels recognition")
+            event(false); engine.setSuspended(false)
+            event(false)
+            expect(take().isEmpty, "suspension cannot replay the old voice release")
+        }
+        if passed { print("[MappingEngine.douyinVoiceSelfCheck] all scenarios passed") }
+        return passed
+    }
+
+    static func douyinNavigationSelfCheck() -> Bool {
+        var passed = true
+        func expect(_ condition: Bool, _ message: String) {
+            if !condition { passed = false; print("[MappingEngine.douyinNavigationSelfCheck] FAIL: \(message)") }
+        }
+        for independentMode in [false, true] {
+            let clock = ManualClock()
+            let runner = RecordingRunner()
+            var config = MappingConfig()
+            config.settings.holdMs = 600
+            config.settings.doubleMs = 250
+            let bindings: [String: KeyBinding] = [:]
+            config.profiles["global"] = bindings
+            config.globalShortcuts = independentMode ? bindings : nil
+            var mainWork: [() -> Void] = []
+            var mouseActive = false
+            let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) },
+                mainDispatch: { mainWork.append($0) }, reservedMouseIsActive: { mouseActive })
+            var taps: [RemoteKey] = []
+            var accepts = true
+            engine.onDouyinNavigationTap = { taps.append($0); return accepts }
+            func drainMain() { while !mainWork.isEmpty { mainWork.removeFirst()() } }
+            func event(_ key: RemoteKey, _ down: Bool) {
+                engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
+            }
+            func tap(_ key: RemoteKey) { event(key, true); event(key, false) }
+            func settle() { clock.advance(700); drainMain() }
+            let keys: [RemoteKey] = [.up, .down, .ok]
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            expect(engine.tapRoute.nativeDirections == [.left, .right], "Douyin captures only vertical directions")
+            expect(KeyRemapper.directionVerdict(key: .left, isRepeat: false, route: engine.tapRoute) == .rewrite(123)
+                && KeyRemapper.directionVerdict(key: .right, isRepeat: true, route: engine.tapRoute) == .rewrite(124),
+                "horizontal taps and autorepeat stay native in foreground Douyin")
+            tap(.left); tap(.right); settle()
+            expect(taps.isEmpty && runner.actions == ["left_arrow", "right_arrow"].map { .keyStroke(key: $0, mods: []) },
+                "horizontal events never enter the Douyin navigation callback")
+            runner.actions.removeAll()
+            for key in keys { tap(key); settle() }
+            expect(taps == keys && runner.actions.isEmpty, "all navigation taps reach the separate hook")
+            taps.removeAll(); accepts = false
+            for key in keys { tap(key); settle() }
+            expect(taps == keys && runner.actions == ["up_arrow", "down_arrow", "return"]
+                .map { .keyStroke(key: $0, mods: []) }, "declined taps retain native fallback")
+            taps.removeAll(); runner.actions.removeAll(); accepts = true
+            if independentMode {
+                var reservedConfig = config
+                reservedConfig.globalShortcuts = [
+                    "left": KeyBinding(hold: .system("volume_up")),
+                    "right": KeyBinding(hold: .system("volume_down")),
+                ]
+                engine.setConfig(reservedConfig)
+                for key in [RemoteKey.left, .right] {
+                    tap(key); settle()
+                    event(key, true); clock.advance(700); event(key, false); settle()
+                }
+                expect(taps.isEmpty && runner.actions == [.keyStroke(key: "left_arrow", mods: []), .system("volume_up"),
+                    .keyStroke(key: "right_arrow", mods: []), .system("volume_down")],
+                    "existing horizontal native taps and global holds win in Douyin")
+                runner.actions.removeAll()
+                reservedConfig.globalShortcuts = ["left": KeyBinding(double: .system("mute"))]
+                engine.setConfig(reservedConfig)
+                tap(.left); clock.advance(40); tap(.left); settle()
+                expect(taps.isEmpty && runner.actions == [.system("mute")], "existing horizontal global double stays configured")
+                runner.actions.removeAll()
+                engine.setConfig(config)
+            }
+            event(.ok, true); event(.ok, true); clock.advance(1500); drainMain()
+            expect(taps.isEmpty && runner.actions.isEmpty, "held/repeated OK never auto-confirms")
+            event(.ok, false); settle()
+            expect(taps == [.ok], "OK commits once on release")
+            taps.removeAll()
+            tap(.up); engine.setActiveProfile("com.example.other"); drainMain()
+            expect(taps.isEmpty && runner.actions.isEmpty, "foreground switch revokes queued main callback")
+            expect(engine.tapRoute.nativeDirections.contains(.up), "other apps restore native direction routing")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            event(.up, true); engine.setActiveProfile("com.example.other")
+            clock.advance(700); event(.up, false); settle()
+            expect(taps.isEmpty && runner.actions.isEmpty, "old held vertical direction is consumed through release")
+            engine.setActiveProfile("com.bytedance.douyin.desktop")
+            event(.ok, true); engine.resetInputState(reason: "navigation reset")
+            event(.ok, false); settle()
+            expect(taps.isEmpty && runner.actions.isEmpty, "reset discards pending navigation and orphan release")
+            tap(.down); mouseActive = true; drainMain()
+            expect(taps.isEmpty && runner.actions.isEmpty, "mouse mode change revokes queued navigation")
+            mouseActive = false
+            var captured: [RemoteKey] = []
+            engine.setOverlayCapture({ if $0.isDown { captured.append($0.key) } }, immediateDirections: true)
+            let overlayKeys: [RemoteKey] = [.left, .right, .up, .down, .ok]
+            for key in overlayKeys { tap(key); settle() }
+            expect(captured == overlayKeys && taps.isEmpty && runner.actions.isEmpty,
+                "modal overlay keeps all arrows and takes precedence")
+            engine.setOverlayCapture(nil)
+            engine.onDouyinNavigationTap = { key in
+                taps.append(key); engine.setActiveProfile("com.example.other"); return false
+            }
+            tap(.ok); settle()
+            expect(taps == [.ok] && runner.actions.isEmpty, "declined navigation never falls back into a new app")
+        }
+        if passed { print("[MappingEngine.douyinNavigationSelfCheck] all scenarios passed") }
+        return passed
     }
 
     /// M3 分流快照 + TapEngine 判定的纯逻辑自测（同步 dispatch + 虚拟时钟）。

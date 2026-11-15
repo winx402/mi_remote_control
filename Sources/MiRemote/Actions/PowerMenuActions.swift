@@ -34,9 +34,20 @@ enum PowerMenuCatalog {
         for item in SystemMenuCatalog.items where !item.dangerous {
             switch item.action {
             case .system(let name):
-                let media = name == "play_pause" || name == "mute"
-                result.append(Item(id: "system.\(name)", title: name == "mute" ? "Mac 静音" : item.title,
-                    symbol: item.symbol, section: media ? "媒体" : "工作区", command: .systemAction(name)))
+                switch name {
+                case "play_pause":
+                    result.append(Item(id: "system.play_pause", title: "暂停 / 继续", symbol: item.symbol,
+                        section: "媒体", detail: "控制 macOS 当前的“正在播放”会话。", command: .systemAction(name)))
+                case "mute":
+                    result.append(Item(id: "system.mute", title: "Mac 静音", symbol: item.symbol,
+                        section: "媒体", detail: "切换 Mac 输出静音。通过 HDMI 用电视发声时，请选“电视静音”。", command: .systemAction(name)))
+                    result.append(Item(id: "tv.mute", title: "电视静音", symbol: "tv",
+                        section: "媒体", detail: unavailable ?? "切换小米电视静音，再按一次恢复声音。",
+                        command: .tvMute, disabled: !televisionConfigured))
+                default:
+                    result.append(Item(id: "system.\(name)", title: item.title, symbol: item.symbol,
+                        section: "工作区", command: .systemAction(name)))
+                }
             case .focusInput:
                 result.append(Item(id: "system.focusInput", title: item.title, symbol: item.symbol,
                     section: "工作区", command: .focusInput))
@@ -84,6 +95,9 @@ enum PowerMenuCatalog {
             && configured.contains { $0.command == .tvStandby && !$0.disabled }
             && configured.contains { $0.command == .tvWake && !$0.disabled }
             && configured.contains { $0.command == .tvOff && !$0.disabled }
+            && configured.filter { $0.section == "媒体" }.compactMap(\.command) == [.systemAction("play_pause"), .systemAction("mute"), .tvMute]
+            && configured.filter { $0.section == "媒体" }.allSatisfy { !$0.disabled && $0.command?.keepsMenuOpen == true }
+            && unavailable.contains { $0.command == .tvMute && $0.disabled }
             && configured.contains { $0.command == .openSettings }
             && configured.contains { $0.command == .systemAction("mission_control") }
     }
@@ -106,9 +120,10 @@ enum PowerMenuActions {
         case .tvStandby: television(.sleep, completion: completion)
         case .tvOff: television(.powerMenu, completion: completion)
         case .tvVolumeUp: television(.volumeUp, completion: completion)
+        case .tvMute: television(.mute, completion: completion)
         case .tvVolumeDown: television(.volumeDown, completion: completion)
         case .quitCurrentApp: quit(currentApplication, completion: completion)
-        case .quitApp(let bundleID):
+        case .quitApp(let bundleID), .quitAppFromOptions(let bundleID):
             let target = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
                 .first { !$0.isTerminated && $0.activationPolicy == .regular }
             quit(target, completion: completion)

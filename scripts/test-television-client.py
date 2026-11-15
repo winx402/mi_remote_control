@@ -153,6 +153,7 @@ def main():
         root = Path(directory)
         scenario(args.binary, root, base_config, "status")
         scenario(args.binary, root, base_config, "volume-down", 25)
+        scenario(args.binary, root, base_config, "mute", 164)
         scenario(args.binary, root, base_config, "standby", 223)
         scenario(args.binary, root, base_config, "wake", 224)
         scenario(args.binary, root, base_config, "volume-down", 25, partial=True)

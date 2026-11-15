@@ -265,6 +265,7 @@ enum SelfTest {
         expect(AudioBridge.selfTest(), "长音频按源采样率完整排空并核对样本数（无设备 I/O）")
         expect(VoiceDeliveryGate.selfCheck(), "语音关闭总门、旧会话隔离与清理代次（无音频输出）")
         expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
+        expect(DouyinMenuLayout.wrapSelfCheck(), "抖音直播菜单四向穿越、短行与单列边界")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")
         expect(VoicePressGate.selfCheck(), "语音短按不启动音频、长按预录音与结束清理")
         expect(MouseMode.selfCheck(), "鼠标快慢档、滚动、锁定拖拽及闲置释放")

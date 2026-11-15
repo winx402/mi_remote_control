@@ -7,9 +7,9 @@ enum TelevisionCLI {
 
     static func run(_ arguments: [String]) -> Int32 {
         guard let verb = arguments.first,
-              ["status", "volume-up", "volume-down", "standby", "wake", "off", "power-menu", "up", "down", "left", "right", "ok", "back"].contains(verb),
+              ["status", "volume-up", "volume-down", "mute", "standby", "wake", "off", "power-menu", "up", "down", "left", "right", "ok", "back"].contains(verb),
               arguments.count == 1 || (arguments.count == 3 && arguments[1] == "--config") else {
-            print("用法：miremote --tv status|volume-up|volume-down|standby|wake|off|power-menu|up|down|left|right|ok|back [--config 路径]")
+            print("用法：miremote --tv status|volume-up|volume-down|mute|standby|wake|off|power-menu|up|down|left|right|ok|back [--config 路径]")
             return 2
         }
         let path = arguments.count == 3 ? arguments[2] : nil
@@ -23,7 +23,7 @@ enum TelevisionCLI {
         if verb == "status" {
             client.checkConnection { completion.result = $0 }
         } else {
-            let commands: [String: XiaomiTVCommand] = ["volume-up": .volumeUp, "volume-down": .volumeDown,
+            let commands: [String: XiaomiTVCommand] = ["volume-up": .volumeUp, "volume-down": .volumeDown, "mute": .mute,
                 "standby": .sleep, "wake": .wake, "off": .powerMenu, "power-menu": .powerMenu,
                 "up": .up, "down": .down, "left": .left, "right": .right, "ok": .ok, "back": .back]
             guard let command = commands[verb] else { return 2 }

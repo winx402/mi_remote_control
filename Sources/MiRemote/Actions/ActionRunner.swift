@@ -269,6 +269,25 @@ final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sen
 
     private func system(_ name: String) {
         switch name {
+        case "douyin_live_voice_focus", "douyin_live_voice_start":
+            let inputGeneration = codexInputGeneration
+            let token = inputGeneration?()
+            guard inputGeneration == nil || token != nil else { return }
+            DispatchQueue.main.async {
+                guard inputGeneration?() == token, DouyinLiveDictation.canHandleVoice() else { return }
+                if name == "douyin_live_voice_start" {
+                    DouyinLiveDictation.beginPhysicalHold()
+                } else if !DouyinLiveDictation.focusForDictation() {
+                    CodexNavigation.showVoiceIssue("没有找到可输入的直播发言框。")
+                }
+            }
+            return
+        case "douyin_live_voice_end":
+            DispatchQueue.main.async { DouyinLiveDictation.endPhysicalHold() }
+            return
+        case "douyin_live_voice_cancel":
+            DispatchQueue.main.async { DouyinLiveDictation.cancel() }
+            return
         case "codex_context_voice_cancel":
             DispatchQueue.main.async { CodexDictation.shutdown() }
             return
@@ -295,7 +314,8 @@ final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sen
         case "volume_up":   aux(NX_KEYTYPE_SOUND_UP)
         case "volume_down": aux(NX_KEYTYPE_SOUND_DOWN)
         case "mute":        aux(NX_KEYTYPE_MUTE)
-        case "play_pause":  aux(NX_KEYTYPE_PLAY)
+        case "play_pause":
+            if !Self.toggleNowPlaying() { aux(NX_KEYTYPE_PLAY) }
         case "next":        aux(NX_KEYTYPE_NEXT)
         case "prev", "previous": aux(NX_KEYTYPE_PREVIOUS)
         case "mission_control":
@@ -359,6 +379,25 @@ final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sen
               let up   = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else { return }
         down.flags = flags; up.flags = flags
         down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+    }
+
+    // MediaRemote is optional and private. Resolve it at runtime so an OS change
+    // can fall back to the hardware media key without preventing app launch.
+    private typealias SendMediaCommand = @convention(c) (Int32, UnsafeRawPointer?) -> UInt8
+    private static let sendMediaCommand: SendMediaCommand? = {
+        let path = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote"
+        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL) else { return nil }
+        guard let symbol = dlsym(handle, "MRMediaRemoteSendCommand") else {
+            dlclose(handle)
+            return nil
+        }
+        // Keep the framework loaded for the lifetime of the function pointer.
+        return unsafeBitCast(symbol, to: SendMediaCommand.self)
+    }()
+
+    private static func toggleNowPlaying() -> Bool {
+        let togglePlayPause: Int32 = 2
+        return (sendMediaCommand?(togglePlayPause, nil) ?? 0) != 0
     }
 
     /// 发送一个媒体/音量 aux 按键（NSEvent systemDefined，subtype 8）。

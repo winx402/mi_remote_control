@@ -83,8 +83,10 @@ struct PowerMenuState {
         case tvOff
         case tvVolumeUp
         case tvVolumeDown
+        case tvMute
         case quitCurrentApp
         case quitApp(bundleID: String)
+        case quitAppFromOptions(bundleID: String)
         case launchApp(bundleID: String)
         case systemAction(String)
         case focusInput
@@ -107,6 +109,8 @@ struct PowerMenuState {
 
         var keepsMenuOpen: Bool {
             switch self {
+            case .quitCurrentApp, .quitApp, .quitAppFromOptions: return true
+            case .tvMute, .systemAction("play_pause"), .systemAction("mute"): return true
             case .tvVolumeUp, .tvVolumeDown: return true
             default: return false
             }
@@ -190,7 +194,7 @@ struct PowerMenuState {
 
     var selectedCommand: Command? {
         if appOption == .quit, case .launchApp(let id) = selection.command {
-            return .quitApp(bundleID: id)
+            return .quitAppFromOptions(bundleID: id)
         }
         return selection.command
     }
@@ -230,6 +234,24 @@ struct PowerMenuState {
         if let first = self.choices.first(where: { !$0.disabled && $0.command?.isAppLaunch == true })
             ?? sections.flatMap(\.choices).first(where: { !$0.disabled }) {
             updateSelection(first)
+        }
+    }
+
+    /// App 生命周期变化只更新当前面板，不重新打开、执行或安装输入捕获。
+    /// 尽量保留当前焦点；目标消失时选同位置的下一项。
+    mutating func refreshChoices(_ choices: [Choice]) {
+        guard isOpen, !isExecuting else { return }
+        let selectedID = selection.id
+        let oldIndex = self.choices.firstIndex { $0.id == selectedID } ?? 0
+        var ids: Set<String> = [Choice.cancel.id]
+        self.choices = choices.filter { ids.insert($0.id).inserted } + [.cancel]
+        let replacement = self.choices.first { $0.id == selectedID && !$0.disabled }
+            ?? self.choices.dropFirst(min(oldIndex, self.choices.count - 1)).first { !$0.disabled }
+            ?? .cancel
+        if replacement != selection {
+            updateSelection(replacement)
+        } else {
+            updatePreferredPosition(for: replacement)
         }
     }
 
@@ -302,6 +324,10 @@ struct PowerMenuState {
         appOption = nil
         selection = choice
         error = nil
+        updatePreferredPosition(for: choice)
+    }
+
+    private mutating func updatePreferredPosition(for choice: Choice) {
         if let row = visualRows.first(where: { $0.choices.contains { $0.id == choice.id } }),
            let column = row.choices.firstIndex(where: { $0.id == choice.id }) {
             preferredPosition = (Double(column) + 0.5) / Double(row.columnCount)
@@ -392,12 +418,35 @@ struct PowerMenuState {
         guard options.handle(.down) == .none, options.appOption == .open,
               options.handle(.back) == .none, options.selection == target, options.isOpen else { return false }
         options.showAppOptions(running: true)
-        guard options.handle(.down) == .none, options.selectedCommand == .quitApp(bundleID: "one"),
-              options.handle(.ok) == .execute(.quitApp(bundleID: "one")) else { return false }
+        guard options.handle(.down) == .none, options.selectedCommand == .quitAppFromOptions(bundleID: "one"),
+              options.selectedCommand?.requiresHoldConfirmation == false,
+              options.handle(.ok) == .execute(.quitAppFromOptions(bundleID: "one")),
+              options.appOption == nil, options.isExecuting,
+              options.handle(.ok) == .none,
+              options.complete(.success(())) == .none,
+              options.isOpen, !options.isExecuting,
+              options.selection == target, options.selectedCommand == .launchApp(bundleID: "one") else { return false }
+        // 完成回调不关闭面板，后续方向、OK 和返回仍可用；关闭后刷新不复活。
+        let nextTarget = Choice(id: "two", title: "Two", symbol: "app", section: "Apps", command: .launchApp(bundleID: "two"))
+        options.refreshChoices([target, nextTarget])
+        guard options.handle(.right) == .none, options.selection == nextTarget,
+              options.handle(.ok) == .execute(.launchApp(bundleID: "two")) else { return false }
+        options.open(choices: [target, nextTarget])
+        options.refreshChoices([nextTarget])
+        guard options.selection == nextTarget, options.isOpen, !options.isExecuting,
+              options.handle(.back) == .dismiss else { return false }
+        options.refreshChoices([target])
+        guard !options.isOpen else { return false }
         let apps = (0..<13).map {
             Choice(id: "app.\($0)", title: "App \($0)", symbol: "app", section: "软件",
                    command: .launchApp(bundleID: "app.\($0)"), disabled: $0 == 1)
         }
+        // 前方软件退出导致折行改变时，保留软件焦点并按新的视觉列上下导航。
+        options.open(choices: apps)
+        options.focus(apps[10])
+        options.refreshChoices(Array(apps.dropFirst()))
+        guard options.selection == apps[10], options.handle(.down) == .none,
+              options.selection == apps[12] else { return false }
         let actions = (0..<14).map { item($0, disabled: $0 == 7) }
         let unavailable = (0..<7).map { item($0, section: "不可用", disabled: true) }
         let volume = Choice(id: "volume", title: "音量", symbol: "speaker", section: "电视", command: .tvVolumeUp)
@@ -505,11 +554,12 @@ struct PowerMenuState {
                   state.handle(key) == .dismiss, !state.isOpen,
                   state.complete(.success(())) == .none else { return false }
         }
-        // 0.6 秒确认继续由入口计时，共享命令元数据保持不变。
+        // 独立退出卡片保留长按；常用软件子菜单明确选择退出后单按执行。
         let requiresHold: [Command] = [.computer(.sleep), .computer(.shutDown),
                                       .quitCurrentApp, .quitApp(bundleID: "example.app"),
                                       .systemAction("lock_screen"), .systemAction("display_sleep")]
         let immediate: [Command] = [.tvWake, .tvStandby, .tvOff, .tvVolumeUp, .tvVolumeDown,
+                                   .quitAppFromOptions(bundleID: "example.app"),
                                    .launchApp(bundleID: "example.app"), .focusInput, .openSettings,
                                    .systemAction("mission_control"), .systemAction("mute")]
         guard requiresHold.allSatisfy(\.requiresHoldConfirmation),

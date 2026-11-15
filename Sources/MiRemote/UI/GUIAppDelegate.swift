@@ -226,6 +226,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     private func openOverlay(_ name: String, wakeTelevision: Bool = false) {
+        DouyinFeedNavigation.resetSelection()
         CodexDictation.cancel(reason: "打开遥控面板")
         if name == "dock_picker" {
             overlayCenter?.close()
@@ -456,7 +457,23 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                 MainActor.assumeIsolated {
                     if CodexDictation.isActive { CodexDictation.shutdown() }
                     CodexConversationControls.resetInputTarget()
+                    DouyinFeedNavigation.resetSelection()
                     self?.overlayCenter?.invalidateInputConfirmation()
+                }
+            }
+            km.engine.onDouyinNavigationTap = { key in
+                MainActor.assumeIsolated {
+                    // Drop a delayed tap if the user has just switched to another app.
+                    guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.bytedance.douyin.desktop" else { return true }
+                    return DouyinFeedNavigation.handle(key)
+                }
+            }
+            km.engine.onDouyinShortTap = { [weak self] key in
+                MainActor.assumeIsolated {
+                    guard let self, let overlayCenter = self.overlayCenter else { return false }
+                    return overlayCenter.handleDouyinShortcut(key) { name in
+                        self.openOverlay(name)
+                    }
                 }
             }
             km.engine.onApplicationNavigation = { [weak self] key, down in
@@ -569,8 +586,12 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             let previousActiveApp = km.onActiveApplication
             km.onActiveApplication = { [weak self] bundleID in
                 previousActiveApp?(bundleID)
-                if bundleID != "com.openai.codex" { CodexDictation.cancel(reason: "切换应用") }
-                DispatchQueue.main.async { self?.overlayCenter?.noteProfileSwitch(bundleID) }
+                DispatchQueue.main.async {
+                    if CodexDictation.isActive, bundleID != CodexDictation.activeBundleID {
+                        CodexDictation.cancelCurrent(reason: "切换应用")
+                    }
+                    self?.overlayCenter?.noteProfileSwitch(bundleID)
+                }
             }
             km.onButtonEvent = { [weak self] ev in
                 DispatchQueue.main.async { self?.model.noteButton(ev) }

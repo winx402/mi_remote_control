@@ -5,7 +5,8 @@ import Carbon
 import CoreAudio
 
 /// Codex 听写：新预设按住遥控器说话、松手结束；旧两按动作保留兼容。
-/// 遥控器 PCM 直接本机识别，识别结果只写回原输入框，绝不发送 Return。
+/// 微信输入法通过 BlackHole 接收遥控器 PCM；系统本机识别为可选回退。
+/// 两条路径均锁存原输入框，绝不发送 Return。
 enum CodexDictation {
     static let actionName = "codex_context_dictate"
     @MainActor static var onNotice: ((String) -> Void)?
@@ -14,6 +15,23 @@ enum CodexDictation {
     @MainActor private static var triggerConfig = VoiceTriggerConfig()
     /// 服务容器同步打开／关闭遥控器 PCM 交付；映射引擎是长按判定的唯一来源。
     @MainActor static var onPhysicalHoldState: ((Bool) -> Void)?
+    @MainActor private static var voiceEngine: CodexVoiceEngine = .wechat
+    @MainActor private static var bridgeDeviceName = "BlackHole 2ch"
+    @MainActor private static var remoteIME: RemoteInputMethodSession?
+    @MainActor private static var remoteIMEFinishing: RemoteInputMethodSession?
+    @MainActor private static var remoteIMEFinishingTimer: Timer?
+    @MainActor private static var remoteIMETransportToken: UInt64?
+    @MainActor private static var remoteIMEStopID: UUID?
+    @MainActor private static var remoteIMEStartTask: Task<Void, Never>?
+    @MainActor private static var bridgeRestoreTask: Task<Void, Never>?
+    @MainActor private static var bridgePreviousInput: AudioDeviceID?
+    @MainActor private static var bridgeInput: AudioDeviceID?
+    private struct RemoteInputMethodSession {
+        let target: RemoteTarget
+        let config: VoiceTriggerConfig
+        let sink: AudioBridge
+        var keyDown = false
+    }
     @MainActor private static var useRemoteMicrophone = true
     @MainActor private static var inputEnabled = true
     @MainActor private static var physicalHoldActive = false
@@ -72,18 +90,23 @@ enum CodexDictation {
     @MainActor private static var restoreTask: Task<Void, Never>?
     @MainActor private static var contextTimer: Timer?
     @MainActor static var remotePCMToken: UInt64 { remoteGeneration }
-    @MainActor static var isActive: Bool { preparing || session != nil || physicalHoldActive || remoteSession != nil }
+    @MainActor static var isActive: Bool { preparing || session != nil || physicalHoldActive || remoteSession != nil || remoteIME != nil || remoteIMEFinishing != nil }
 
     @MainActor static func configure(triggerConfig: VoiceTriggerConfig) {
         self.triggerConfig = triggerConfig
     }
 
-    @MainActor static func configureInput(remoteMicrophone: Bool, enabled: Bool) {
-        if useRemoteMicrophone != remoteMicrophone || inputEnabled != enabled {
-            stop(reason: "音源设置改变", restoreImmediately: true)
+    @MainActor static func configureInput(remoteMicrophone: Bool, enabled: Bool,
+                                              engine: CodexVoiceEngine = .wechat,
+                                              bridgeDeviceName: String = "BlackHole 2ch") {
+        if useRemoteMicrophone != remoteMicrophone || inputEnabled != enabled
+            || voiceEngine != engine || self.bridgeDeviceName != bridgeDeviceName {
+            stop(reason: "音源设置改变", restoreImmediately: true, showError: false)
         }
         useRemoteMicrophone = remoteMicrophone
         inputEnabled = enabled
+        voiceEngine = engine
+        self.bridgeDeviceName = bridgeDeviceName
     }
 
     /// 仅由映射引擎确认长按后调用；短按不会请求识别、切换输入法或写入文本。
@@ -92,14 +115,22 @@ enum CodexDictation {
         guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.openai.codex" else { return }
         // 新一次按住不能把上次尚在等待的识别结果写进新上下文。
         stop(reason: nil, restoreImmediately: true)
+        guard remoteIMEFinishing == nil else { return }
         guard useRemoteMicrophone else {
             physicalHoldActive = true
             toggle()
             return
         }
-        guard AXIsProcessTrusted(), CodexConversationControls.focusForDictation(),
-              let target = captureRemoteTarget() else {
-            notice("无法确认 Codex 当前可编辑的输入框或辅助功能权限，本次未开始听写。")
+        guard AXIsProcessTrusted() else {
+            notice("需要辅助功能权限，Codex 听写未开始。")
+            return
+        }
+        guard CodexConversationControls.focusForDictation(), let target = captureRemoteTarget() else {
+            notice("请点一下要输入的位置，再按住说话。")
+            return
+        }
+        if voiceEngine == .wechat {
+            beginRemoteInputMethod(target: target)
             return
         }
         guard let unavailable = RemoteSpeechTranscriber.availabilityNotice() else {
@@ -115,12 +146,12 @@ enum CodexDictation {
             physicalHoldActive = true
             onPhysicalHoldState?(true)
             onStateChanged?(true)
-            notice("遥控器听写中；松开语音键结束，文字不会自动发送。")
+            status("引擎开始 engine=system source=remote；松开语音键结束，文字不会自动发送。")
             remoteTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
                 Task { @MainActor in
                     guard let remoteSession else { return }
                     guard remoteTargetIsCurrent(remoteSession.target) else {
-                        stop(reason: "应用、窗口或输入焦点改变", restoreImmediately: true)
+                        stop(reason: "应用、窗口或输入焦点改变", restoreImmediately: true, showError: false)
                         return
                     }
                 }
@@ -134,6 +165,10 @@ enum CodexDictation {
         guard physicalHoldActive else { return }
         physicalHoldActive = false
         onPhysicalHoldState?(false) // 立即拒绝松手后的 PCM，再等待已采集音频的最终结果。
+        if remoteIME != nil {
+            stop(reason: nil, restoreImmediately: false)
+            return
+        }
         guard var current = remoteSession else {
             stop(reason: nil, restoreImmediately: false)
             return
@@ -145,7 +180,7 @@ enum CodexDictation {
             finishRemote(text: text)
             return
         }
-        notice("已停止收音，正在整理文字；不会自动发送。")
+        status("引擎结束 engine=system reason=release；正在等待最终识别结果，不会自动发送。")
         let token = remoteGeneration
         finalTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(5))
@@ -154,10 +189,202 @@ enum CodexDictation {
         }
     }
 
+    // MARK: - 微信输入法遥控器音频桥
+
+    @MainActor private static func beginRemoteInputMethod(target: RemoteTarget) {
+        let prefix = "com.tencent.inputmethod.wetype"
+        let cfg = VoiceTriggerConfig(keyName: triggerConfig.keyName, mode: .hold, imeBundlePrefix: prefix)
+        guard triggerConfig.mode == .hold, VoiceTriggerConfig.keyTable[cfg.keyName] != nil else {
+            notice("请将 Codex 语音快捷键设为与微信输入法一致的“按住说话”键。")
+            return
+        }
+        guard let source = enabledInputSource(prefix: prefix) else {
+            notice("未找到已启用的微信输入法，请先在系统键盘设置中添加微信输入法。")
+            return
+        }
+        guard let input = DefaultInput.findInputDevice(named: bridgeDeviceName),
+              AudioBridge.listOutputDevices().contains(where: { $0.hasPrefix(bridgeDeviceName) }),
+              let previousInput = DefaultInput.currentDefault() else {
+            notice("未检测到可用的 \(bridgeDeviceName) 输入／输出设备，请确认 BlackHole 已安装并可用。")
+            return
+        }
+        guard DefaultInput.setDefault(input) else {
+            notice("无法将默认麦克风切换到 \(bridgeDeviceName)，微信听写未开始。")
+            return
+        }
+        bridgePreviousInput = previousInput
+        bridgeInput = input
+        savedInputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
+        selectedInputPrefix = prefix
+        guard TISSelectInputSource(source) == noErr else {
+            restoreBridgeInput()
+            restoreIME()
+            notice("无法切换到微信输入法，本次听写未开始。")
+            return
+        }
+        remoteGeneration &+= 1
+        let token = remoteGeneration
+        remoteIMETransportToken = token
+        let sink = AudioBridge(deviceName: bridgeDeviceName, requiresNamedDevice: true)
+        remoteIME = RemoteInputMethodSession(target: target, config: cfg, sink: sink)
+        physicalHoldActive = true
+        onStateChanged?(true)
+        status("引擎准备 engine=wechat source=remote bridge=\(bridgeDeviceName)")
+        sink.streamStarted(sampleRate: 16_000) { ready in
+            Task { @MainActor in
+                guard token == remoteGeneration, physicalHoldActive, remoteIME != nil else { return }
+                guard ready else {
+                    stop(reason: "BlackHole 音频输出引擎启动失败", restoreImmediately: true)
+                    return
+                }
+                remoteIMEStartTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(180))
+                    guard !Task.isCancelled, token == remoteGeneration, physicalHoldActive,
+                          var current = remoteIME else { return }
+                    guard remoteTargetIsCurrent(current.target), currentInputSourceMatches(prefix: prefix),
+                          DefaultInput.currentDefault() == input else {
+                        stop(reason: "输入框、输入法或音源改变，微信听写未开始", restoreImmediately: true)
+                        return
+                    }
+                    guard startHotkey(current.config) else {
+                        stop(reason: "无法发送微信输入法开始快捷键", restoreImmediately: true)
+                        return
+                    }
+                    current.keyDown = true
+                    remoteIME = current
+                    remoteIMEStartTask = nil
+                    // ready 后才交付长按前缓存，未启动输入法时不会丢弃开头的音频。
+                    onPhysicalHoldState?(true)
+                    status("引擎开始 engine=wechat source=remote trigger=\(cfg.keyName) hold；未验证第三方识别结果")
+                    remoteTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                        Task { @MainActor in
+                            guard let current = remoteIME else { return }
+                            guard remoteTargetHasFocus(current.target), currentInputSourceMatches(prefix: prefix),
+                                  DefaultInput.currentDefault() == input else {
+                                stop(reason: "输入框、输入法或音源改变", restoreImmediately: true, showError: false)
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor private static func endRemoteInputMethod(restoreImmediately: Bool) {
+        remoteIMEStartTask?.cancel()
+        remoteIMEStartTask = nil
+        bridgeRestoreTask?.cancel()
+        bridgeRestoreTask = nil
+        if restoreImmediately {
+            remoteIMETransportToken = nil
+            remoteIMEFinishingTimer?.invalidate()
+            remoteIMEFinishingTimer = nil
+            remoteIMEStopID = nil
+            if let pending = remoteIMEFinishing {
+                let released = releaseRemoteInputMethodKey(pending)
+                pending.sink.cancelStream()
+                remoteIMEFinishing = released ? nil : pending
+                if released { status("引擎结束 engine=wechat reason=cancel；已发送原触发键释放") }
+            }
+        }
+        guard let current = remoteIME else {
+            if restoreImmediately { restoreBridgeInput() }
+            return
+        }
+        remoteIME = nil
+        if restoreImmediately || !current.keyDown {
+            let released = releaseRemoteInputMethodKey(current)
+            if !released { remoteIMEFinishing = current }
+            current.sink.cancelStream()
+            remoteIMETransportToken = nil
+            restoreBridgeInput()
+            status("引擎结束 engine=wechat reason=\(current.keyDown ? "cancel" : "released-before-ready")")
+            return
+        }
+        // 松手立即拒绝新 PCM，只把已经采集的缓冲排空，避免截断最后几个字。
+        remoteIMEFinishing = current
+        let stopID = UUID()
+        remoteIMEStopID = stopID
+        remoteIMEFinishingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            Task { @MainActor in
+                guard remoteIMEStopID == stopID else { return }
+                guard remoteTargetHasFocus(current.target),
+                      currentInputSourceMatches(prefix: "com.tencent.inputmethod.wetype"),
+                      DefaultInput.currentDefault() == bridgeInput else {
+                    stop(reason: "输入上下文改变，已取消微信收尾", restoreImmediately: true, showError: false)
+                    return
+                }
+            }
+        }
+        status("收音结束 engine=wechat；正在排空已采集音频")
+        current.sink.streamStopped {
+            Task { @MainActor in
+                guard remoteIMEStopID == stopID, var pending = remoteIMEFinishing else { return }
+                guard releaseRemoteInputMethodKey(pending) else {
+                    restoreBridgeInput()
+                    return
+                }
+                pending.keyDown = false
+                remoteIMEFinishing = pending
+                remoteIMEStopID = nil
+                remoteIMEFinishingTimer?.invalidate()
+                remoteIMEFinishingTimer = nil
+                status("引擎结束 engine=wechat reason=release；已发送原触发键释放，未自动发送")
+                onStateChanged?(isActive)
+                bridgeRestoreTask = Task { @MainActor in
+                    // 输入法仍可能整理最终文字；这段时间不重新聚焦，焦点改变便提前收尾。
+                    for _ in 0..<24 {
+                        try? await Task.sleep(for: .milliseconds(50))
+                        guard !Task.isCancelled else { return }
+                        if !remoteTargetHasFocus(pending.target) { break }
+                    }
+                    remoteIMEFinishingTimer?.invalidate()
+                    remoteIMEFinishingTimer = nil
+                    restoreBridgeInput()
+                    restoreIME()
+                    remoteIMETransportToken = nil
+                    remoteIMEFinishing = nil
+                    onStateChanged?(isActive)
+                    bridgeRestoreTask = nil
+                }
+            }
+        }
+    }
+
+    @MainActor private static func releaseRemoteInputMethodKey(_ current: RemoteInputMethodSession) -> Bool {
+        guard current.keyDown else { return true }
+        guard post(down: false, config: current.config) else {
+            notice("无法发送微信输入法结束快捷键，请手动结束微信语音输入。")
+            return false
+        }
+        return true
+    }
+
+    @MainActor private static func restoreBridgeInput() {
+        // 用户在会话中主动更换音源时保留其选择。
+        if let previous = bridgePreviousInput, let owned = bridgeInput,
+           DefaultInput.currentDefault() == owned {
+            _ = DefaultInput.setDefault(previous)
+        }
+        bridgePreviousInput = nil
+        bridgeInput = nil
+    }
+
     /// AppServices 在主线程按 ATVV 顺序投递；松手及取消后不再接收。
     @MainActor static func receiveRemotePCM(_ samples: [Int16], token: UInt64) {
-        guard token == remoteGeneration, physicalHoldActive, let current = remoteSession else { return }
-        current.recognizer.append(samples)
+        guard token == remoteGeneration, physicalHoldActive else { return }
+        if let current = remoteIME {
+            guard current.keyDown, remoteTargetHasFocus(current.target),
+                  currentInputSourceMatches(prefix: "com.tencent.inputmethod.wetype"),
+                  DefaultInput.currentDefault() == bridgeInput else {
+                stop(reason: "输入框、输入法或音源改变", restoreImmediately: true, showError: false)
+                return
+            }
+            current.sink.write(samples)
+            return
+        }
+        remoteSession?.recognizer.append(samples)
     }
 
     @MainActor static func endRemoteTransport(token: UInt64) {
@@ -166,13 +393,14 @@ enum CodexDictation {
     }
 
     @MainActor static func cancelRemoteTransport(token: UInt64) {
-        guard token == remoteGeneration else { return }
+        // 正常松手隔离了 PCM 代次，BlackHole 排空／输入法整理期间仍须响应断连取消。
+        guard token == remoteGeneration || token == remoteIMETransportToken else { return }
         stop(reason: "遥控器音频链路停止", restoreImmediately: true)
     }
 
     @MainActor static func reportPermissionResult(approved: Bool) {
-        notice(approved ? "语音识别已获允许；请重新按住语音键说话。"
-               : "未获得语音识别权限；可在系统设置 → 隐私与安全性 → 语音识别中开启。")
+        if approved { status("语音识别已获允许；请重新按住语音键说话。") }
+        else { notice("未获得语音识别权限；可在系统设置 → 隐私与安全性 → 语音识别中开启。") }
     }
 
     @MainActor private static func receiveRecognition(text: String?, failure: String?, token: UInt64) {
@@ -232,9 +460,9 @@ enum CodexDictation {
             onStateChanged?(false)
             switch evidence {
             case .textVerified:
-                notice("已核实文字进入 Codex 原输入框，尚未发送。")
+                status("已核实文字进入 Codex 原输入框，尚未发送。")
             case .changeVerified:
-                notice("已核实原输入框的选区／字数按预期变化，但无法读取插入文字核对；尚未发送，请检查内容。")
+                status("已核实原输入框的选区／字数按预期变化，但无法读取插入文字核对；尚未发送。")
             case .unconfirmed:
                 notice("已尝试一次粘贴，但无法确认文字进入原输入框；未自动重试或发送，请检查输入框。")
             }
@@ -577,11 +805,11 @@ enum CodexDictation {
     }
 
     static func cancel(reason: String = "上下文改变") {
-        Task { @MainActor in stop(reason: reason, restoreImmediately: true) }
+        Task { @MainActor in stop(reason: reason, restoreImmediately: true, showError: false) }
     }
 
     /// 生命周期主线程可同步清理，防止退出前 Task 尚未运行。
-    @MainActor static func shutdown() { stop(reason: "服务停止", restoreImmediately: true) }
+    @MainActor static func shutdown() { stop(reason: "服务停止", restoreImmediately: true, showError: false) }
 
     @MainActor private static func toggle() {
         if preparing || session != nil {
@@ -666,7 +894,7 @@ enum CodexDictation {
 
     @MainActor private static func didStart(inputName: String, method: String) {
         onStateChanged?(true)
-        notice("\(method) · 音源：\(inputName)。松开语音键结束；旧版两按动作可再按结束，不会发送消息。")
+        status("引擎开始 source=mac · \(method) · 音源：\(inputName)；不会发送消息。")
         contextTimer?.invalidate()
         contextTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
             Task { @MainActor in
@@ -683,12 +911,17 @@ enum CodexDictation {
         }
     }
 
-    @MainActor private static func stop(reason: String?, restoreImmediately: Bool) {
+    @MainActor private static func stop(reason: String?, restoreImmediately: Bool, showError: Bool = true) {
         let hadRemote = remoteSession != nil
+        let hadRemoteIME = remoteIME != nil
+        endRemoteInputMethod(restoreImmediately: restoreImmediately)
         let hadPhysical = physicalHoldActive
         clearRemote()
-        if hadRemote, let reason { notice("\(reason)；没有发送消息。") }
-        if hadRemote || hadPhysical { onStateChanged?(false) }
+        if hadRemote || hadRemoteIME, let reason {
+            if showError { notice("\(reason)；没有发送消息。") }
+            else { status("\(reason)；没有发送消息。") }
+        }
+        if hadRemote || hadRemoteIME || hadPhysical { onStateChanged?(isActive) }
         let wasPreparing = preparing
         let old = session
         preparing = false
@@ -724,7 +957,7 @@ enum CodexDictation {
         restoreTask?.cancel()
         restoreTask = nil
         if restoreImmediately { restoreIME() }
-        else if savedInputSource != nil {
+        else if savedInputSource != nil, !hadRemoteIME {
             restoreTask = Task { @MainActor in
                 try? await Task.sleep(for: .seconds(2))
                 guard generation == token, session == nil, !preparing else { return }
@@ -736,9 +969,10 @@ enum CodexDictation {
         if !confirmedStop {
             notice("无法确认语音工具已停止，请在语音工具／系统听写浮层手动结束。本次没有发送消息。")
         } else if let reason {
-            notice("\(reason)，已请求结束听写；没有发送消息。")
+            if showError { notice("\(reason)，已请求结束听写；没有发送消息。") }
+            else { status("\(reason)，已请求结束听写；没有发送消息。") }
         } else {
-            notice(wasPreparing ? "已取消听写开始；没有发送消息。" : "已发送结束听写动作；没有发送消息。")
+            status(wasPreparing ? "已取消听写开始；没有发送消息。" : "引擎结束 source=mac；已发送结束听写动作，没有发送消息。")
         }
     }
 
@@ -811,9 +1045,14 @@ enum CodexDictation {
     }
 
     @MainActor private static func notice(_ message: String) {
+        status("错误：\(message)")
+        onNotice?(message)
+    }
+
+    /// 常规状态仅日志；内容来自固定状态字符串，不包含音频／听写正文。
+    @MainActor private static func status(_ message: String) {
         Logger(subsystem: "com.miremote.controller", category: "RemoteSpeech").notice("\(message, privacy: .public)")
         log("Codex 听写：\(message)")
-        onNotice?(message)
     }
 
     // MARK: - 明确的系统菜单动作（不读取消息正文）

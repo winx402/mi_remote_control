@@ -358,7 +358,7 @@ enum CodexConversationControls {
         return nil
     }
 
-    @MainActor @discardableResult static func perform(_ name: String, isCurrent: () -> Bool = { true }) -> Bool {
+    @MainActor @discardableResult static func perform(_ name: String, isCurrent: @escaping () -> Bool = { true }) -> Bool {
         guard let action = Action(rawValue: name) else { return false }
         trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
@@ -413,20 +413,10 @@ enum CodexConversationControls {
             case .submit:
                 if let pending = lastOption {
                     let root = lastFormRoot
-                    clearAnswer()
                     guard let root, CFEqual(root, snapshot.elements[form.root]),
                           let index = form.options.first(where: { CFEqual(snapshot.elements[$0], pending) }) else { return true }
-                    if !snapshot.nodes[index].selected {
-                        guard select(index, in: snapshot, isCurrent: isCurrent) else { return true }
-                        // Some option rows immediately send. Only press a separate Send
-                        // if the very same question and its original options still exist.
-                        guard let verified = self.snapshot(), verified.complete, sameWindow(snapshot), isCurrent(),
-                              let remaining = activeForm(verified.nodes), CFEqual(root, verified.elements[remaining.root]),
-                              remaining.options.count == form.options.count,
-                              zip(remaining.options, form.options).allSatisfy({ CFEqual(verified.elements[$0.0], snapshot.elements[$0.1]) }) else { return true }
-                        press(remaining.submit, in: verified, isCurrent: isCurrent)
-                        return true
-                    }
+                    commitOption(index, form: form, snapshot: snapshot, isCurrent: isCurrent)
+                    return true
                 }
                 press(form.submit, in: snapshot, isCurrent: isCurrent)
             }
@@ -457,6 +447,108 @@ enum CodexConversationControls {
         return true
     }
 
+    /// Codex can give free text precedence over a button selection. Clear it through
+    /// the editor's normal editing path only once the user commits an enumerated answer.
+    @MainActor private static var committingOption = false
+
+    private static func postEditingKey(_ code: CGKeyCode, flags: CGEventFlags) {
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    private static func draftLength(_ field: AXUIElement) -> Int? {
+        if let length = attribute(field, kAXNumberOfCharactersAttribute as CFString) as? NSNumber {
+            return length.intValue
+        }
+        return string(field, kAXValueAttribute as CFString)?.utf16.count
+    }
+
+    @MainActor private static func commitOption(_ index: Int, form: Form, snapshot original: Snapshot,
+                                                isCurrent: @escaping () -> Bool) {
+        guard !committingOption, isCurrent(), sameWindow(original) else { return }
+        let root = original.elements[form.root]
+        let option = original.elements[index]
+        @MainActor func eligible() -> Bool {
+            guard isCurrent(), sameWindow(original), let lastOption, let lastFormRoot else { return false }
+            return CFEqual(option, lastOption) && CFEqual(root, lastFormRoot)
+        }
+        @MainActor func checkedForm() -> (Snapshot, Form, Int)? {
+            guard eligible(), let live = self.snapshot(), live.complete, eligible(),
+                  let card = activeForm(live.nodes), CFEqual(root, live.elements[card.root]),
+                  let target = card.options.first(where: { CFEqual(option, live.elements[$0]) }) else { return nil }
+            return (live, card, target)
+        }
+        committingOption = true
+        Task { @MainActor in
+            defer { committingOption = false }
+            guard eligible(), form.fields.count <= 1 else { return }
+            if let field = form.fields.first {
+                let editor = original.elements[field]
+                guard let count = draftLength(editor), count >= 0 else {
+                    unavailable("无法确认自定义回复是否为空，已保留草稿。")
+                    return
+                }
+                if count > 0 {
+                    guard focus(field, in: original), eligible() else { return }
+                    var all = CFRange(location: 0, length: count)
+                    @MainActor func editorIsCurrent() -> Bool {
+                        guard eligible(), let focused = element(original.app, kAXFocusedUIElementAttribute as CFString) else { return false }
+                        return CFEqual(focused, editor)
+                    }
+                    @MainActor func allSelected() -> Bool {
+                        var selection = CFRange()
+                        guard let value = attribute(editor, kAXSelectedTextRangeAttribute as CFString),
+                              CFGetTypeID(value) == AXValueGetTypeID(),
+                              AXValueGetValue(value as! AXValue, .cfRange, &selection) else { return false }
+                        return selection.location == 0 && selection.length == count
+                    }
+                    if let range = AXValueCreate(.cfRange, &all), editorIsCurrent() {
+                        _ = AXUIElementSetAttributeValue(editor, kAXSelectedTextRangeAttribute as CFString, range)
+                    }
+                    if !allSelected(), editorIsCurrent() {
+                        postEditingKey(0, flags: .maskCommand) // Command-A, scoped to the focused custom answer
+                        for _ in 0..<5 {
+                            try? await Task.sleep(for: .milliseconds(30))
+                            guard editorIsCurrent() else { return }
+                            if allSelected() { break }
+                        }
+                    }
+                    guard allSelected(), draftLength(editor) == count, editorIsCurrent() else {
+                        unavailable("无法安全清除本题的自定义回复，请手动清空后再提交选项。")
+                        return
+                    }
+                    postEditingKey(51, flags: [])
+                    for _ in 0..<8 {
+                        try? await Task.sleep(for: .milliseconds(40))
+                        guard eligible() else { return }
+                        if draftLength(editor) == 0 { break }
+                    }
+                }
+            }
+            guard let (live, card, target) = checkedForm() else { return }
+            @MainActor func empty(_ card: Form, _ snap: Snapshot) -> Bool {
+                card.fields.allSatisfy { draftLength(snap.elements[$0]) == 0 }
+            }
+            guard empty(card, live) else {
+                unavailable("自定义回复尚未清空，本次没有提交。")
+                return
+            }
+            if !live.nodes[target].selected {
+                guard select(target, in: live, isCurrent: eligible) else { return }
+                try? await Task.sleep(for: .milliseconds(120))
+            }
+            // A click may already have completed this card. Never chase a new one.
+            guard let (after, sameCard, _) = checkedForm(), empty(sameCard, after),
+                  let send = sameCard.submit else { return }
+            press(send, in: after, isCurrent: eligible)
+            clearAnswer()
+        }
+    }
+
     private static func preferredField(_ form: Form, nodes: [Node]) -> Int? {
         let focused = form.fields.filter { nodes[$0].focused }
         if focused.count == 1 { return focused[0] }
@@ -473,7 +565,7 @@ enum CodexConversationControls {
         if switchingToComposer { resetInputTarget() }
         guard let first = snapshot(preferForm: !switchingToComposer), first.complete,
               sameWindow(first), isCurrent(), let window = first.elements.first else {
-            if isCurrent() { unavailable("输入位置尚未切换成功，请点一下会话输入框。") }
+            if isCurrent(), switchingToComposer { _ = focusBottomComposer(isCurrent: isCurrent) }
             return
         }
         let form = activeForm(first.nodes)
@@ -493,18 +585,12 @@ enum CodexConversationControls {
         }
         guard let field = composer(first.nodes, window: first.window, outside: form),
               isCurrent(), focus(field, in: first), isCurrent() else {
-            unavailable("未找到可聚焦的对话输入框。")
+            if isCurrent() { _ = focusBottomComposer(isCurrent: isCurrent) }
             return
         }
         resetInputTarget()
         targetWindow = window
         composerTarget = first.elements[field]
-        answerHighlight.showTarget(first.nodes[field].rect, title: "会话输入框")
-        highlightMonitor = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { _ in
-            MainActor.assumeIsolated {
-                if questionRoot == nil { answerHighlight.hide() }
-            }
-        }
         trace.notice("input selected=composer")
     }
 
@@ -525,14 +611,15 @@ enum CodexConversationControls {
             }
         }
         guard let snap = snapshot(preferForm: savedQuestion != nil && savedComposer == nil),
-              snap.complete, let window = snap.elements.first, sameWindow(snap),
-              targetWindow.map({ CFEqual($0, window) }) != false else { return false }
+              snap.complete, let window = snap.elements.first, sameWindow(snap) else {
+            return savedQuestion == nil && focusBottomComposer()
+        }
+        if let targetWindow, !CFEqual(targetWindow, window) { resetInputTarget(); return false }
         let form = activeForm(snap.nodes)
         let field: Int
-        if let savedComposer {
-            // Never substitute the card editor for a previously chosen composer.
-            guard let candidate = composer(snap.nodes, window: snap.window, outside: form),
-                  CFEqual(snap.elements[candidate], savedComposer) else { return false }
+        if savedComposer != nil {
+            // The React editor may have been replaced since the previous tap.
+            guard let candidate = composer(snap.nodes, window: snap.window, outside: form) else { return focusBottomComposer() }
             field = candidate
         } else if let savedQuestion {
             guard let form, CFEqual(savedQuestion, snap.elements[form.root]),
@@ -540,12 +627,11 @@ enum CodexConversationControls {
             field = candidate
             clearAnswer()
         } else {
-            guard let candidate = composer(snap.nodes, window: snap.window, outside: form) else { return false }
+            guard let candidate = composer(snap.nodes, window: snap.window, outside: form) else { return focusBottomComposer() }
             field = candidate
         }
         guard focus(field, in: snap), sameWindow(snap),
-              let focused = element(snap.app, kAXFocusedUIElementAttribute as CFString),
-              CFEqual(focused, snap.elements[field]) else { return false }
+              let focused = focusedEditor(for: snap.elements[field], app: snap.app) else { return false }
         verifiedDictationField = focused
         if savedQuestion == nil { targetWindow = window; composerTarget = focused }
         trace.notice("dictation target=\(savedQuestion == nil ? "composer" : "question", privacy: .public)")
@@ -602,11 +688,94 @@ enum CodexConversationControls {
         } else { _ = focus(index, in: snapshot) }
         return true
     }
+    private static func focusedEditor(for target: AXUIElement, app: AXUIElement) -> AXUIElement? {
+        guard let focused = element(app, kAXFocusedUIElementAttribute as CFString) else { return nil }
+        if CFEqual(target, focused) { return focused }
+        guard inputRoles.contains(string(focused, kAXRoleAttribute as CFString) ?? "") else { return nil }
+        var node = focused
+        for _ in 0..<8 {
+            guard let parent = element(node, kAXParentAttribute as CFString) else { break }
+            if CFEqual(target, parent) { return focused }
+            node = parent
+        }
+        return nil
+    }
+
     @MainActor private static func focus(_ index: Int, in snapshot: Snapshot) -> Bool {
         guard sameWindow(snapshot), snapshot.nodes[index].enabled else { return false }
         let target = snapshot.elements[index]
-        guard AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else { return false }
-        return stillFrontmost(snapshot.pid) && bool(target, kAXFocusedAttribute as CFString) == true
+        func confirmed() -> Bool {
+            focusedEditor(for: target, app: snapshot.app) != nil && sameWindow(snapshot)
+        }
+        if confirmed() { return true }
+        _ = AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        for _ in 0..<4 {
+            if confirmed() { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard inputRoles.contains(snapshot.nodes[index].role), let bounds = frame(target) else { return false }
+        let point = CGPoint(x: bounds.minX + min(20, bounds.width / 2), y: bounds.midY)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
+              var node = hit else { return false }
+        for _ in 0..<12 {
+            if CFEqual(node, target) {
+                if confirmed() { return true }
+                guard sameWindow(snapshot),
+                      let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+                      let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else { return false }
+                down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+                break
+            }
+            guard let parent = element(node, kAXParentAttribute as CFString) else { break }
+            node = parent
+        }
+        for _ in 0..<8 {
+            if confirmed() { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return confirmed()
+    }
+
+    /// Recover the composer when a long thread exceeds the full-tree scan budget.
+    /// Only a verified editable hit below the card is eligible, never a toolbar button.
+    @MainActor private static func focusBottomComposer(isCurrent: () -> Bool = { true }) -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex",
+              AXIsProcessTrusted(), isCurrent() else { return false }
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(ax, 0.025)
+        guard let win = element(ax, kAXFocusedWindowAttribute as CFString), let rect = frame(win) else { return false }
+        let system = AXUIElementCreateSystemWide()
+        for y in [0.91, 0.89, 0.93, 0.87] {
+            let point = CGPoint(x: rect.minX + rect.width * 0.59, y: rect.minY + rect.height * y)
+            var hit: AXUIElement?
+            guard isCurrent(), AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+                  var node = hit else { continue }
+            var owner: pid_t = 0
+            guard AXUIElementGetPid(node, &owner) == .success, owner == app.processIdentifier else { continue }
+            for _ in 0..<10 {
+                let role = string(node, kAXRoleAttribute as CFString) ?? ""
+                if inputRoles.contains(role), let bounds = frame(node) {
+                    let label = metadata(node)
+                    guard bounds.minY > rect.minY + rect.height * 0.78, bounds.width >= rect.width * 0.25,
+                          !matches(Node(parent: nil, role: role, label: label), customReplyTitles),
+                          !contains(label, ["search", "terminal", "自定义", "自行", "搜索", "终端"]),
+                          let window = element(node, kAXWindowAttribute as CFString), CFEqual(window, win) else { break }
+                    let snap = Snapshot(pid: owner, app: ax, elements: [win, node], nodes: [
+                        Node(parent: nil, role: "AXWindow", rect: rect), Node(parent: 0, role: role, label: label, rect: bounds, editable: true)
+                    ], window: rect, complete: false)
+                    guard isCurrent(), focus(1, in: snap), isCurrent(),
+                          let focused = focusedEditor(for: node, app: ax) else { break }
+                    resetInputTarget()
+                    verifiedDictationField = focused; composerTarget = node; targetWindow = win
+                    return true
+                }
+                guard !["AXWindow", "AXButton", "AXToolbar"].contains(role),
+                      let parent = element(node, kAXParentAttribute as CFString) else { break }
+                node = parent
+            }
+        }
+        return false
     }
 
     // MARK: - Bounded AX snapshot, with no text values

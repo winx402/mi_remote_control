@@ -164,6 +164,7 @@ private final class RingBuffer: @unchecked Sendable {
 final class AudioBridge: PCMSink, @unchecked Sendable {
 
     private let deviceName: String?
+    private let requiresNamedDevice: Bool
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private let ring: RingBuffer
@@ -178,8 +179,9 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
     private var generation = 0
 
     /// - Parameter deviceName: 目标输出设备名前缀（如 "BlackHole 2ch"）；nil = 系统默认输出。
-    init(deviceName: String?) {
+    init(deviceName: String?, requiresNamedDevice: Bool = false) {
         self.deviceName = deviceName
+        self.requiresNamedDevice = requiresNamedDevice
         // 几秒容量（按 16k 源速率算，实际以 float 存，容量给足）：4 秒
         self.ring = RingBuffer(capacity: 16000 * 4)
     }
@@ -187,23 +189,31 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
     // MARK: PCMSink
 
     func streamStarted(sampleRate: Double) {
+        streamStarted(sampleRate: sampleRate, onReady: nil)
+    }
+
+    /// 回调只确认音频输出引擎可运行，不代表输入法已经开始收音。
+    func streamStarted(sampleRate: Double, onReady: (@Sendable (Bool) -> Void)?) {
         stateQueue.async { [self] in
             // S12：新的 start 使任何在途的停机失效（下方 stopped 的后台任务会据 generation 放弃）。
             generation += 1
-            guard !isRunning else { return }
+            guard !isRunning else { onReady?(true); return }
             sourceSampleRate = sampleRate
             ring.clear()
             // 若上一次 stop 的后台排空尚未真正停机，引擎仍在运行——直接复用，不重复 attach。
             if engine.isRunning, sourceNode != nil {
                 isRunning = true
                 NSLog("[AudioBridge] 复用运行中的引擎（取消上一次停机）")
+                onReady?(true)
                 return
             }
             do {
                 try start()
                 isRunning = true
+                onReady?(true)
             } catch {
                 NSLog("[AudioBridge] 启动失败: \(error)")
+                onReady?(false)
             }
         }
     }
@@ -217,10 +227,13 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
         ring.write(floats)
     }
 
-    func streamStopped() {
+    func streamStopped() { streamStopped(onDrained: nil) }
+
+    /// 停止接收后排空已采集音频，再结束输入法，避免截掉长按门缓存的末尾。
+    func streamStopped(onDrained: (@Sendable () -> Void)?) {
         // C4：调用线程只做一次非阻塞派发；排空+停引擎全部在后台执行。
         stateQueue.async { [self] in
-            guard isRunning else { return }
+            guard isRunning else { onDrained?(); return }
             isRunning = false
             generation += 1
             let gen = generation
@@ -238,6 +251,7 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
                 stateQueue.async { [self] in
                     guard gen == generation else {
                         NSLog("[AudioBridge] 停机被新的 start 取消")
+                        onDrained?()
                         return
                     }
                     engine.stop()
@@ -245,9 +259,15 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
                         engine.detach(node)
                         sourceNode = nil
                     }
+                    onDrained?()
                 }
             }
         }
+    }
+
+    func cancelStream() {
+        ring.clear()
+        streamStopped()
     }
 
     // MARK: 引擎搭建
@@ -258,6 +278,9 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
         if let name = deviceName {
             if let deviceID = CoreAudioDevices.findOutputDevice(namePrefix: name) {
                 try bindOutputDevice(deviceID)
+            } else if requiresNamedDevice {
+                throw NSError(domain: "AudioBridge", code: -3,
+                              userInfo: [NSLocalizedDescriptionKey: "未找到指定的音频桥接设备"])
             } else {
                 NSLog("[AudioBridge] 未找到输出设备 \"\(name)\"，回退系统默认输出")
             }

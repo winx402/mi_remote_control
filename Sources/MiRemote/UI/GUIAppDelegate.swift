@@ -86,8 +86,8 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 CodexNavigation.showNotice(message)
             }
         }
-        CodexConversationControls.onUnavailable = { message in CodexNavigation.showNotice(message) }
-        CodexDictation.onNotice = { message in CodexNavigation.showNotice(message) }
+        CodexConversationControls.onUnavailable = { message in CodexNavigation.showVoiceIssue(message) }
+        CodexDictation.onNotice = { message in CodexNavigation.showVoiceIssue(message) }
         CodexDictation.configure(triggerConfig: VoiceTriggerRouting.resolve(model.config.voiceProfiles, bundleID: "com.openai.codex"))
         ActionRunner.onOverlay = { [weak self] name in
             // ActionRunner 已切主线程投递

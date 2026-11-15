@@ -45,7 +45,9 @@ struct VoicePage: View {
                            subtitle: "选择音频来源，并为不同 App 自动发送各自的语音输入快捷键。")
 
                 if model.voiceMode == .remoteMic && !blackHoleInstalled {
-                    Label("Codex 按住听写可直接使用遥控器；其他 App 通过输入法接收遥控器声音时需要 BlackHole。", systemImage: "exclamationmark.triangle.fill")
+                    Label(model.codexVoiceEngine == .wechat
+                          ? "微信输入法接收遥控器声音需要 BlackHole 2ch；安装后重新启动音频服务。"
+                          : "Codex 系统本机识别可直接接收遥控器声音；其他 App 的输入法仍需要 BlackHole。", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -59,6 +61,20 @@ struct VoicePage: View {
                     RowDivider()
                     modeRow(.off, title: "关闭",
                             subtitle: "语音键可另行映射为普通按键")
+                }
+
+                SettingsGroup(title: "Codex 遥控器识别引擎") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("识别引擎", selection: $model.codexVoiceEngine) {
+                            Text("微信输入法（默认）").tag(CodexVoiceEngine.wechat)
+                            Text("系统本机识别（回退）").tag(CodexVoiceEngine.system)
+                        }
+                        Text(model.codexVoiceEngine == .wechat
+                             ? "遥控器音频经 BlackHole 传给微信输入法。按住开始、松手停止收音，缓冲排空后结束识别；只在原输入框出字，不自动发送。请把微信语音快捷键设为下方相同的“按住说话”键。"
+                             : "直接在本机识别遥控器音频，需要系统中文语音识别资源与权限；松手后只向原输入框插入文字，不自动发送。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .padding(Spacing.cardPadding)
                 }
 
                 SettingsGroup(title: "按 App 的语音快捷键") {

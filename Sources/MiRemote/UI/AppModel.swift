@@ -24,8 +24,14 @@ enum VoiceMode: String, CaseIterable {
     case remoteMic, macMic, off
 }
 
+/// 微信输入法负责识别；系统本机识别保留为显式回退，不自动切换引擎。
+enum CodexVoiceEngine: String, CaseIterable {
+    case wechat, system
+}
+
 enum Prefs {
     static let voiceMode      = "com.miremote.pref.voiceMode"
+    static let codexVoiceEngine = "com.miremote.pref.codexVoiceEngine"
     static let voiceGainDb    = "com.miremote.pref.voiceGainDb"
     static let showStatusItem = "com.miremote.pref.showStatusItem"
     static let feedbackSound  = "com.miremote.pref.feedbackSound"
@@ -43,6 +49,7 @@ enum Prefs {
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             voiceMode: VoiceMode.remoteMic.rawValue,
+            codexVoiceEngine: CodexVoiceEngine.wechat.rawValue,
             voiceGainDb: 0.0,
             showStatusItem: true,
             feedbackSound: false,
@@ -262,6 +269,7 @@ final class AppModel: ObservableObject {
 
     // App 级偏好（UserDefaults）
     @Published var voiceMode: VoiceMode { didSet { prefsChanged() } }
+    @Published var codexVoiceEngine: CodexVoiceEngine { didSet { prefsChanged() } }
     @Published var voiceGainDb: Double { didSet { prefsChanged() } }
     @Published var showStatusItem: Bool { didSet { prefsChanged() } }
     @Published var feedbackSound: Bool { didSet { prefsChanged() } }
@@ -291,6 +299,7 @@ final class AppModel: ObservableObject {
         self.loginItems = loginItems
         let d = UserDefaults.standard
         self.voiceMode = VoiceMode(rawValue: d.string(forKey: Prefs.voiceMode) ?? "") ?? .remoteMic
+        self.codexVoiceEngine = CodexVoiceEngine(rawValue: d.string(forKey: Prefs.codexVoiceEngine) ?? "") ?? .wechat
         self.voiceGainDb = d.double(forKey: Prefs.voiceGainDb)
         self.showStatusItem = d.bool(forKey: Prefs.showStatusItem)
         self.feedbackSound = d.bool(forKey: Prefs.feedbackSound)
@@ -327,6 +336,7 @@ final class AppModel: ObservableObject {
     private func prefsChanged() {
         let d = UserDefaults.standard
         d.set(voiceMode.rawValue, forKey: Prefs.voiceMode)
+        d.set(codexVoiceEngine.rawValue, forKey: Prefs.codexVoiceEngine)
         d.set(voiceGainDb, forKey: Prefs.voiceGainDb)
         d.set(showStatusItem, forKey: Prefs.showStatusItem)
         d.set(feedbackSound, forKey: Prefs.feedbackSound)
@@ -341,7 +351,9 @@ final class AppModel: ObservableObject {
     /// 语音模式 → VoiceBridgeApp 开关（A=切BlackHole+豆包 / B=仅豆包 / off=全关）。
     func applyVoiceMode() {
         guard let voice = services?.voiceApp else { return }
-        CodexDictation.configureInput(remoteMicrophone: voiceMode != .macMic, enabled: true)
+        CodexDictation.configureInput(remoteMicrophone: voiceMode != .macMic, enabled: voiceMode != .off,
+                                       engine: codexVoiceEngine,
+                                       bridgeDeviceName: config.settings.voiceOutputDevice ?? "BlackHole 2ch")
         switch voiceMode {
         case .remoteMic: voice.switchInput = true; voice.doubao = true; voice.voiceEnabled = true
         case .macMic: voice.switchInput = false; voice.doubao = true; voice.voiceEnabled = true

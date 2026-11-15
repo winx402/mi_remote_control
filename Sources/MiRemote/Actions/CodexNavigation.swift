@@ -386,6 +386,52 @@ enum CodexNavigation {
         showNotice(message)
     }
 
+    /// Actionable dictation errors sit at the edge of the active display.
+    @MainActor static func showVoiceIssue(_ message: String) {
+        guard let screen = NSScreen.main else { return }
+        if lastVoiceIssue == message, Date().timeIntervalSince(lastVoiceIssueDate) < 4 { return }
+        lastVoiceIssue = message
+        lastVoiceIssueDate = Date()
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.preferredMaxLayoutWidth = 326
+        let height = max(22, ceil(label.fittingSize.height))
+        let size = CGSize(width: 350, height: height + 16)
+        let panel = voiceIssuePanel ?? NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                                               backing: .buffered, defer: false)
+        voiceIssuePanel = panel
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.level = .floating
+        panel.backgroundColor = .clear
+        panel.ignoresMouseEvents = true
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let material = NSVisualEffectView(frame: CGRect(origin: .zero, size: size))
+        material.material = .popover
+        material.state = .active
+        material.wantsLayer = true
+        material.layer?.cornerRadius = 10
+        material.layer?.masksToBounds = true
+        label.frame = CGRect(x: 12, y: 8, width: 326, height: height)
+        material.addSubview(label)
+        panel.contentView = material
+        let area = screen.visibleFrame
+        panel.setFrame(CGRect(x: area.maxX - size.width - 18, y: area.minY + 18, width: size.width, height: size.height), display: true)
+        panel.orderFrontRegardless()
+        voiceIssueEpoch &+= 1
+        let epoch = voiceIssueEpoch
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            if epoch == voiceIssueEpoch { panel.orderOut(nil) }
+        }
+    }
+
+    @MainActor private static var voiceIssuePanel: NSPanel?
+    @MainActor private static var lastVoiceIssue = ""
+    @MainActor private static var lastVoiceIssueDate = Date.distantPast
+    @MainActor private static var voiceIssueEpoch: UInt64 = 0
+
     @MainActor static func showNotice(_ message: String) {
         let panel = noticePanel ?? NSPanel(contentRect: CGRect(x: 0, y: 0, width: 440, height: 88),
             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)

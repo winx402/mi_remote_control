@@ -55,9 +55,13 @@ final class NavigationFocusOverlay {
     }
 
     func showAnswer(_ bounds: CGRect, ordinal: Int) {
+        showTarget(bounds, title: "选项 \(ordinal) · 长按 OK 提交")
+    }
+
+    func showTarget(_ bounds: CGRect, title: String) {
         guard let primary = NSScreen.screens.first, bounds.width >= 3, bounds.height >= 3 else { hide(); return }
         let rect = NavigationFocusOverlayGeometry.appKitRect(bounds, primaryTop: primary.frame.maxY)
-        render(nodeRect: rect, regionRect: nil, target: rect, primary: primary, title: "选项 \(ordinal) · 长按 OK 提交")
+        render(nodeRect: rect, regionRect: nil, target: rect, primary: primary, title: title)
     }
 
     private func render(nodeRect: CGRect?, regionRect: CGRect?, target: CGRect, primary: NSScreen, title: String) {

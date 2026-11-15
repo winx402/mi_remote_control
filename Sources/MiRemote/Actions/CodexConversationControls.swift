@@ -77,10 +77,16 @@ enum CodexConversationControls {
 
     @MainActor private static var questionRoot: AXUIElement?
     @MainActor private static var composerTarget: AXUIElement?
+    @MainActor private static var targetWindow: AXUIElement?
+    @MainActor private static var verifiedDictationField: AXUIElement?
+
+    @MainActor static func resolvedDictationField() -> AXUIElement? { verifiedDictationField }
 
     @MainActor static func resetInputTarget() {
         questionRoot = nil
         composerTarget = nil
+        targetWindow = nil
+        verifiedDictationField = nil
         clearAnswer()
     }
 
@@ -322,6 +328,7 @@ enum CodexConversationControls {
         }
         let candidates = nodes.indices.filter { index in
             let n = nodes[index]
+            if matches(n, customReplyTitles) { return false }
             if let form, descendant(index, of: form.root, in: nodes) || n.rect.midY < (footerY ?? nodes[form.root].rect.maxY) { return false }
             guard inputRoles.contains(n.role), n.editable, n.enabled, !historicallyInactive(index, in: nodes),
                   n.rect.width >= window.width * 0.25, n.rect.midY >= window.minY + window.height * 0.50,
@@ -459,40 +466,89 @@ enum CodexConversationControls {
     /// The microphone tap cycles the remote target. Previewing a question never
     /// presses an answer. Only the existing long-OK path can submit it.
     @MainActor static func cycleInputTarget(isCurrent: () -> Bool) {
-        guard isCurrent(), let first = snapshot(preferForm: questionRoot == nil),
-              first.complete, sameWindow(first), isCurrent() else { return }
+        guard isCurrent() else { return }
+        let switchingToComposer = questionRoot != nil
+        // Commit the user's intent before looking up the composer. A failed or
+        // partial scan must never leave the old question field armed for dictation.
+        if switchingToComposer { resetInputTarget() }
+        guard let first = snapshot(preferForm: !switchingToComposer), first.complete,
+              sameWindow(first), isCurrent(), let window = first.elements.first else {
+            if isCurrent() { unavailable("输入位置尚未切换成功，请点一下会话输入框。") }
+            return
+        }
         let form = activeForm(first.nodes)
-        if let form, questionRoot.map({ CFEqual($0, first.elements[form.root]) }) != true {
-            composerTarget = nil
+        // A re-render may replace the AX group for the same card. Cycle by the
+        // user's selected mode, not by comparing old and new AX group handles.
+        if let form, !switchingToComposer {
+            resetInputTarget()
+            targetWindow = window
             questionRoot = first.elements[form.root]
             if let index = form.options.first {
                 previewAnswer(index, ordinal: 1, form: form, in: first)
             } else if let field = preferredField(form, nodes: first.nodes) {
                 _ = focus(field, in: first)
             }
+            trace.notice("input selected=question")
             return
         }
         guard let field = composer(first.nodes, window: first.window, outside: form),
-              isCurrent(), focus(field, in: first) else {
+              isCurrent(), focus(field, in: first), isCurrent() else {
             unavailable("未找到可聚焦的对话输入框。")
             return
         }
         resetInputTarget()
+        targetWindow = window
         composerTarget = first.elements[field]
+        answerHighlight.showTarget(first.nodes[field].rect, title: "会话输入框")
+        highlightMonitor = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                if questionRoot == nil { answerHighlight.hide() }
+            }
+        }
+        trace.notice("input selected=composer")
     }
 
     @MainActor static func focusForDictation() -> Bool {
-        guard let snapshot = snapshot(preferForm: questionRoot != nil), snapshot.complete else { return false }
-        let form = activeForm(snapshot.nodes)
-        if let target = questionRoot {
-            guard let form, CFEqual(target, snapshot.elements[form.root]),
-                  let field = preferredField(form, nodes: snapshot.nodes) else { return false }
-            clearAnswer()
-            return focus(field, in: snapshot)
+        verifiedDictationField = nil
+        let savedComposer = composerTarget
+        let savedQuestion = questionRoot
+        if let savedComposer, let targetWindow, let app = NSWorkspace.shared.frontmostApplication,
+           app.bundleIdentifier == "com.openai.codex", AXIsProcessTrusted() {
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(ax, 0.025)
+            if let win = element(ax, kAXFocusedWindowAttribute as CFString), CFEqual(win, targetWindow),
+               let focused = element(ax, kAXFocusedUIElementAttribute as CFString), CFEqual(focused, savedComposer),
+               bool(focused, kAXEnabledAttribute as CFString) != false {
+                verifiedDictationField = focused
+                trace.notice("dictation target=pinned composer")
+                return true
+            }
         }
-        guard let field = composer(snapshot.nodes, window: snapshot.window, outside: form),
-              focus(field, in: snapshot) else { return false }
-        composerTarget = snapshot.elements[field]
+        guard let snap = snapshot(preferForm: savedQuestion != nil && savedComposer == nil),
+              snap.complete, let window = snap.elements.first, sameWindow(snap),
+              targetWindow.map({ CFEqual($0, window) }) != false else { return false }
+        let form = activeForm(snap.nodes)
+        let field: Int
+        if let savedComposer {
+            // Never substitute the card editor for a previously chosen composer.
+            guard let candidate = composer(snap.nodes, window: snap.window, outside: form),
+                  CFEqual(snap.elements[candidate], savedComposer) else { return false }
+            field = candidate
+        } else if let savedQuestion {
+            guard let form, CFEqual(savedQuestion, snap.elements[form.root]),
+                  let candidate = preferredField(form, nodes: snap.nodes) else { return false }
+            field = candidate
+            clearAnswer()
+        } else {
+            guard let candidate = composer(snap.nodes, window: snap.window, outside: form) else { return false }
+            field = candidate
+        }
+        guard focus(field, in: snap), sameWindow(snap),
+              let focused = element(snap.app, kAXFocusedUIElementAttribute as CFString),
+              CFEqual(focused, snap.elements[field]) else { return false }
+        verifiedDictationField = focused
+        if savedQuestion == nil { targetWindow = window; composerTarget = focused }
+        trace.notice("dictation target=\(savedQuestion == nil ? "composer" : "question", privacy: .public)")
         return true
     }
 
@@ -775,6 +831,13 @@ enum CodexConversationControls {
         guard let screenshot = activeForm(card), screenshot.root == 2, screenshot.options == [6, 9],
               screenshot.fields == [11], screenshot.submit == nil, blocksChat(card),
               composer(card, window: window) == nil, composer(card, window: window, outside: screenshot) == 16 else { return false }
+        // A re-render can expose the custom field outside its old AX group.
+        // Even with no usable composer, it must never be selected as chat input.
+        var detached = card
+        detached[11].parent = 1
+        detached[11].rect = detached[16].rect
+        detached[16].enabled = false
+        guard composer(detached, window: window, outside: screenshot) == nil else { return false }
         // Ordinary option buttons must win over their number text descendants.
         card[5].role = "AXButton"; card[5].pressable = true
         card[8].role = "AXButton"; card[8].pressable = true

@@ -668,7 +668,8 @@ final class MappingEngine: @unchecked Sendable {
             doubleMs: max(0, config.settings.doubleMs),
             holdMs: max(1, reserved?.holdMs ?? config.settings.holdMs),
             hasDouble: reserved?.double != nil && !(key == .back && codexEditingBackPress),
-            hasHold: reserved?.hold != nil || localHold != nil || mouseHold))
+            hasHold: reserved?.hold != nil || localHold != nil || mouseHold
+                || (key == .back && activeBundleID == "com.openai.codex")))
     }
 
     private func reservedDirectionAction(_ key: RemoteKey) -> Action? {
@@ -738,6 +739,15 @@ final class MappingEngine: @unchecked Sendable {
         let backPress = key == .back ? codexBackPress : nil
         let editingBack = key == .back && codexEditingBackPress
         if key == .back { codexEditingBackPress = false; codexBackPress = nil }
+        // Codex Return hold always owns this slot, including old saved profiles,
+        // modal panels and mouse mode. A missing editor is a consumed hold.
+        if key == .back, gesture == .hold, activeBundleID == "com.openai.codex" {
+            guard context?.0 == contextGeneration, context?.1 == MouseMode.shared.isActive,
+                  overlayHandler == nil, !MouseMode.shared.isActive,
+                  !TransientSystemUI.isMissionControlActive() else { return }
+            backPress?.clear()
+            return
+        }
         if gesture == .tap, editingBack {
             guard context?.0 == contextGeneration, context?.1 == MouseMode.shared.isActive,
                   overlayHandler == nil, !MouseMode.shared.isActive,
@@ -810,12 +820,12 @@ final class MappingEngine: @unchecked Sendable {
         codexEditingBackPress = false
         guard activeBundleID == "com.openai.codex", effectiveLayer == 0,
               overlayHandler == nil, !MouseMode.shared.isActive,
-              !TransientSystemUI.isMissionControlActive(),
-              baseBackOverride?.tap == .system("codex_context_back") else { return }
+              !TransientSystemUI.isMissionControlActive() else { return }
         // A failed capture is a consumed press, never permission to retry later
         // against an editor that became focused after physical down.
         codexBackPress = prepareCodexBackspace() ?? .init(editorFocused: false, perform: {})
-        codexEditingBackPress = codexBackPress?.editorFocused == true
+        codexEditingBackPress = baseBackOverride?.tap == .system("codex_context_back")
+            && codexBackPress?.editorFocused == true
     }
 
     private func runIndependentLocal(_ action: Action?, backPress: CodexBackspace.Press? = nil) {
@@ -957,6 +967,15 @@ final class MappingEngine: @unchecked Sendable {
         guard var st = states[key], st.seq == token, st.phase == .down, !st.holdFired else { return }
         st.holdFired = true
         states[key] = st
+        if key == .back, activeBundleID == "com.openai.codex", effectiveLayer == 0 {
+            let press = codexBackPress
+            codexBackPress = nil
+            codexEditingBackPress = false
+            guard overlayHandler == nil, !MouseMode.shared.isActive,
+                  !TransientSystemUI.isMissionControlActive() else { return }
+            press?.clear()
+            return
+        }
         // 基础文字输入态保护删除键：Profile 的 hold 不能篡改它。用户明确打开开关时，
         // 长按执行“全选 + 删除”；默认关闭时仍只发送普通 Delete。
         if key == .back, effectiveLayer == 0 {
@@ -1692,8 +1711,11 @@ extension MappingEngine {
         guard captured.map(\.key) == [.back, .back] else { return false }
         var escaped = false
         engine.onEscapeHatch = { escaped = true }
+        // Remote reset remains a global hold outside Codex's editor slot.
+        engine.setActiveProfile("com.example.reset")
         event(.back, true); clock.advance(1210); event(.back, false)
         guard escaped, !engine.tapRoute.uiCapture else { return false }
+        engine.setActiveProfile("com.openai.codex")
         tap(.voice)
         guard equals([.focusInput]) else { return false }
         event(.voice, true); clock.advance(610); event(.voice, false)
@@ -1711,8 +1733,8 @@ extension MappingEngine {
         twice(.tv)
         guard equals([.system("app_mru_back")]) else { return false }
 
-        // Global Back hold must override App/panel bindings, fire once, and never
-        // replay a tap into the application focused by the quit operation.
+        // Codex panels consume Back hold without quit. Other apps retain the
+        // global quit slot and never replay a tap after foreground changes.
         var quitConfig = cfg
         quitConfig.globalShortcuts?["back"] = KeyBinding(hold: .system("quit_app"), holdMs: 1200)
         quitConfig.profiles["com.openai.codex"]?["back"] = KeyBinding(
@@ -1726,7 +1748,7 @@ extension MappingEngine {
         event(.back, true); clock.advance(1199)
         guard equals([]), captured.isEmpty else { return false }
         clock.advance(1)
-        guard equals([.system("quit_app")]), captured.isEmpty else { return false }
+        guard equals([]), captured.isEmpty else { return false }
         event(.back, true) // repeated raw down while still physically held
         engine.setActiveProfile("com.example.next")
         clock.advance(1800); event(.back, false)
@@ -1758,6 +1780,8 @@ extension MappingEngine {
             let editing = editorFocused
             return .init(editorFocused: editing, perform: {
                 runner.run(.system(editing ? "codex_delete_backward" : "codex_context_back"))
+            }, clear: {
+                runner.run(.system("codex_clear_editor"))
             })
         }
         tap(.back); tap(.back); tap(.back)
@@ -1765,7 +1789,7 @@ extension MappingEngine {
         clock.advance(500)
         guard equals([]) else { return false }
         event(.back, true); event(.back, true); clock.advance(1200)
-        guard equals([.system("quit_app")]) else { return false }
+        guard equals([.system("codex_clear_editor")]) else { return false }
         event(.back, true); event(.back, false); clock.advance(500)
         guard equals([]) else { return false }
         editorFocused = false
@@ -1879,6 +1903,100 @@ extension MappingEngine {
             focusedEditor = nil
             event(true); event(false); drain()
             guard expect(runner.actions == [.system("codex_context_back")], "non-editor Back preserves Escape behavior") else { return false }
+        }
+        return codexClearBackPressSelfCheck()
+    }
+
+    /// Old/new profiles and both gesture engines must consume Codex Return hold.
+    /// Fake editor identities and a queued sink keep this test free of real keys.
+    private static func codexClearBackPressSelfCheck() -> Bool {
+        for independentMode in [false, true] {
+            for hasCodexProfile in [false, true] {
+                let clock = ManualClock()
+                let runner = RecordingRunner()
+                var config = MappingConfig()
+                config.settings.holdMs = 600
+                config.profiles["com.openai.codex"] = hasCodexProfile ? Presets.codexDesktop.bindings : [:]
+                let quit = KeyBinding(tap: .keyStroke(key: "escape", mods: []),
+                                      hold: .system("quit_app"), overrideBase: true)
+                config.profiles["com.example.other"] = ["back": quit]
+                config.globalShortcuts = independentMode ? ["back": quit] : nil
+                let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                    dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) })
+                engine.setActiveProfile("com.openai.codex")
+                var focusedEditor: Int? = 1
+                var captures = 0
+                var captureAvailable = true
+                var cleared: [Int] = []
+                var queued: [() -> Void] = []
+                engine.prepareCodexBackspace = {
+                    captures += 1
+                    guard captureAvailable else { return nil }
+                    let editor = focusedEditor
+                    let generation = engine.inputGeneration
+                    return .init(editorFocused: editor != nil, perform: {}, clear: {
+                        queued.append {
+                            guard generation == engine.inputGeneration,
+                                  let editor, editor == focusedEditor else { return }
+                            cleared.append(editor)
+                        }
+                    })
+                }
+                func event(_ down: Bool) {
+                    engine.handle(ButtonEvent(key: .back, isDown: down, timeNs: 0))
+                }
+                func hold() { event(true); clock.advance(600); event(false) }
+                func drain() { while !queued.isEmpty { queued.removeFirst()() } }
+                func expect(_ condition: Bool, _ message: String) -> Bool {
+                    if !condition {
+                        print("[codexClearBackPress] FAIL independent=\(independentMode) profile=\(hasCodexProfile): \(message)")
+                    }
+                    return condition
+                }
+                hold(); drain()
+                guard expect(cleared == [1] && runner.actions.isEmpty, "hold clears once and overrides quit without profile migration") else { return false }
+                cleared.removeAll()
+
+                let before = captures
+                event(true); event(true); focusedEditor = 2
+                clock.advance(600); event(false); drain()
+                guard expect(captures == before + 1 && cleared.isEmpty && runner.actions.isEmpty,
+                             "repeated down cannot replace the original editor") else { return false }
+
+                focusedEditor = 1
+                hold(); focusedEditor = 2; drain()
+                guard expect(cleared.isEmpty, "focus change after hold revokes queued clearing") else { return false }
+                focusedEditor = nil
+                event(true); focusedEditor = 2; clock.advance(600); event(false); drain()
+                guard expect(cleared.isEmpty && runner.actions.isEmpty, "non-editor hold neither clears a later editor nor quits") else { return false }
+                captureAvailable = false
+                hold(); captureAvailable = true; drain()
+                guard expect(cleared.isEmpty && runner.actions.isEmpty, "capture failure never falls through to quit") else { return false }
+
+                hold(); engine.resetInputState(reason: "queued clear"); drain()
+                guard expect(cleared.isEmpty, "input reset revokes queued clearing") else { return false }
+                event(true); engine.setOverlayCapture({ _ in }); clock.advance(600); event(false); drain()
+                guard expect(cleared.isEmpty && runner.actions.isEmpty, "opening a panel revokes the press") else { return false }
+                let panelCaptures = captures
+                hold(); drain()
+                guard expect(captures == panelCaptures && cleared.isEmpty && runner.actions.isEmpty,
+                             "panel hold neither captures its editor nor quits") else { return false }
+                engine.setOverlayCapture(nil)
+
+                event(true); engine.setActiveProfile("com.example.other"); clock.advance(600); event(false); drain()
+                guard expect(cleared.isEmpty && runner.actions.isEmpty, "foreground change consumes the old hold") else { return false }
+                hold(); drain()
+                guard expect(runner.actions == [.system("quit_app")], "other app retains its configured quit hold") else { return false }
+                runner.actions.removeAll()
+
+                if independentMode {
+                    engine.setActiveProfile("com.openai.codex")
+                    MouseMode.shared.toggle()
+                    hold(); drain()
+                    MouseMode.shared.deactivate()
+                    guard expect(cleared.isEmpty && runner.actions.isEmpty, "Codex mouse-mode hold cannot clear or quit") else { return false }
+                }
+            }
         }
         return true
     }

@@ -48,29 +48,29 @@ enum CodexConversationControls {
 
     @MainActor private static let answerHighlight = NavigationFocusOverlay()
     @MainActor private static var highlightMonitor: Timer?
-    @MainActor private static func previewAnswer(_ index: Int, ordinal: Int, form: Form, in snapshot: Snapshot) {
+    @MainActor private static func previewAnswer(_ index: Int, form: Form, in snapshot: Snapshot) {
         let target = snapshot.elements[index]
         lastFormRoot = snapshot.elements[form.root]
-        lastOption = target
+        highlightedAnswer = target
         // Focus moves without AXPress. Clicking a mid-turn option would send it.
-        var candidate: Int? = index
+        var candidate: Int? = form.options.contains(index) ? index : nil
         while let item = candidate, descendant(item, of: form.root, in: snapshot.nodes) {
             let element = snapshot.elements[item]
             if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
                focusedEditor(for: element, app: snapshot.app).map({ CFEqual($0, element) }) == true { break }
             candidate = snapshot.nodes[item].parent
         }
-        answerHighlight.showAnswer(snapshot.nodes[index].rect, ordinal: ordinal)
+        answerHighlight.showTarget(snapshot.nodes[index].rect)
         highlightMonitor?.invalidate()
         highlightMonitor = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
             MainActor.assumeIsolated {
-                guard let lastOption, CFEqual(lastOption, target) else { return }
+                guard let highlightedAnswer, CFEqual(highlightedAnswer, target) else { return }
                 guard sameWindow(snapshot), let bounds = frame(target), bounds.intersects(snapshot.window) else {
                     resetInputTarget()
                     return
                 }
                 if bounds != snapshot.nodes[index].rect {
-                    answerHighlight.showAnswer(bounds, ordinal: ordinal)
+                    answerHighlight.showTarget(bounds)
                 }
             }
         }
@@ -79,7 +79,7 @@ enum CodexConversationControls {
     @MainActor static func clearAnswer() {
         highlightMonitor?.invalidate()
         highlightMonitor = nil
-        lastOption = nil
+        highlightedAnswer = nil
         lastFormRoot = nil
         answerHighlight.hide()
     }
@@ -101,7 +101,7 @@ enum CodexConversationControls {
         clearAnswer()
     }
 
-    @MainActor private static var lastOption: AXUIElement?
+    @MainActor private static var highlightedAnswer: AXUIElement?
     @MainActor private static var lastFormRoot: AXUIElement?
     @MainActor private static var accessibilityPID: pid_t?
 
@@ -513,28 +513,32 @@ enum CodexConversationControls {
         if let form = recognized, questionRoot != nil {
             switch action {
             case .up, .down:
-                let choices = form.options
-                guard !choices.isEmpty else { return true }
-                let current = choices.firstIndex {
-                    guard let lastFormRoot, let lastOption, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
-                    return CFEqual(lastOption, snapshot.elements[$0])
-                } ?? choices.firstIndex { snapshot.nodes[$0].selected || snapshot.nodes[$0].focused }
-                let next = current.map { min(choices.count - 1, max(0, $0 + (action == .up ? -1 : 1))) }
-                    ?? (action == .up ? choices.count - 1 : 0)
-                let index = choices[next]
-                previewAnswer(index, ordinal: next + 1, form: form, in: snapshot)
-                trace.notice("preview ordinal=\(next + 1)")
+                let saved: Int? = highlightedAnswer.flatMap { target in
+                    guard let lastFormRoot, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return nil }
+                    return snapshot.elements.firstIndex { CFEqual(target, $0) }
+                }
+                guard let index = nextAnswer(in: form, nodes: snapshot.nodes, from: saved, up: action == .up) else { return true }
+                previewAnswer(index, form: form, in: snapshot)
+                if let ordinal = form.options.firstIndex(of: index) {
+                    trace.notice("preview ordinal=\(ordinal + 1)")
+                } else {
+                    trace.notice("preview custom answer")
+                }
             case .left, .right:
                 guard let arrow = action == .left ? form.previous : form.next else { return true }
                 clearAnswer()
                 press(arrow, in: snapshot, isCurrent: isCurrent)
                 followQuestionChange(from: snapshot, form: form, isCurrent: isCurrent)
             case .ok:
-                if lastOption == nil, let field = preferredField(form, nodes: snapshot.nodes) {
-                    _ = focus(field, in: snapshot)
+                if let field = preferredField(form, nodes: snapshot.nodes),
+                   highlightedAnswer.map({ CFEqual($0, snapshot.elements[field]) }) ?? true,
+                   focus(field, in: snapshot) {
+                    clearAnswer()
+                    verifiedDictationField = focusedEditor(for: snapshot.elements[field], app: snapshot.app)
+                    trace.notice("editing custom answer")
                 }
             case .submit:
-                if let pending = lastOption {
+                if let pending = highlightedAnswer {
                     let root = lastFormRoot
                     guard let root, CFEqual(root, snapshot.elements[form.root]),
                           let index = form.options.first(where: { CFEqual(snapshot.elements[$0], pending) }) else { return true }
@@ -551,7 +555,7 @@ enum CodexConversationControls {
                 press(form.submit, in: snapshot, isCurrent: isCurrent)
                 if form.submit != nil { followQuestionChange(from: snapshot, form: form, isCurrent: isCurrent) }
             }
-        } else if lastOption != nil && action == .submit {
+        } else if highlightedAnswer != nil && action == .submit {
             clearAnswer()
             return true
         } else if let target = composerTarget, let field = composer(snapshot.nodes, window: snapshot.window, outside: recognized),
@@ -591,7 +595,7 @@ enum CodexConversationControls {
             for delay in [180, 180, 300] {
                 try? await Task.sleep(for: .milliseconds(delay))
                 guard !Task.isCancelled, isCurrent(), sameWindow(source),
-                      let current = questionRoot, CFEqual(root, current), lastOption == nil else { return }
+                      let current = questionRoot, CFEqual(root, current), highlightedAnswer == nil else { return }
                 if let live = snapshot(), live.complete, let card = activeForm(live.nodes),
                    !CFEqual(root, live.elements[card.root]) {
                     questionRoot = live.elements[card.root]
@@ -627,8 +631,8 @@ enum CodexConversationControls {
         let root = original.elements[form.root]
         let option = original.elements[index]
         @MainActor func eligible() -> Bool {
-            guard isCurrent(), sameWindow(original), let lastOption, let lastFormRoot else { return false }
-            return CFEqual(option, lastOption) && CFEqual(root, lastFormRoot)
+            guard isCurrent(), sameWindow(original), let highlightedAnswer, let lastFormRoot else { return false }
+            return CFEqual(option, highlightedAnswer) && CFEqual(root, lastFormRoot)
         }
         @MainActor func checkedForm() -> (Snapshot, Form, Int)? {
             guard eligible(), let live = self.snapshot(), live.complete, eligible(),
@@ -701,6 +705,25 @@ enum CodexConversationControls {
             press(send, in: after, isCurrent: eligible)
             clearAnswer()
         }
+    }
+
+    /// Keep the editable answer outside the option list that long OK can submit.
+    private static func nextAnswer(in form: Form, nodes: [Node], from preview: Int?, up: Bool) -> Int? {
+        let field = preferredField(form, nodes: nodes)
+        var rows = form.options
+        if let field { rows.append(field) }
+        guard !rows.isEmpty else { return nil }
+
+        var current = preview.flatMap { rows.firstIndex(of: $0) }
+        if current == nil, let field, nodes[field].focused {
+            // When editing, Up returns to the last option; Down starts at the first.
+            return up ? (form.options.last ?? field) : rows.first
+        }
+        if current == nil {
+            current = rows.firstIndex { nodes[$0].focused || nodes[$0].selected }
+        }
+        guard let current else { return up ? rows.last : rows.first }
+        return rows[min(rows.count - 1, max(0, current + (up ? -1 : 1)))]
     }
 
     private static func preferredField(_ form: Form, nodes: [Node]) -> Int? {
@@ -1106,6 +1129,9 @@ enum CodexConversationControls {
         ]
         guard let detected = activeForm(form), detected.options == [3, 4], detected.previous == 5,
               detected.next == 6, detected.submit == 7, preferredField(detected, nodes: form) == 8 else { return false }
+        guard nextAnswer(in: detected, nodes: form, from: 4, up: false) == 8,
+              nextAnswer(in: detected, nodes: form, from: 8, up: true) == 4,
+              nextAnswer(in: detected, nodes: form, from: 8, up: false) == 8 else { return false }
         form[7].label = "提交答案"
         guard activeForm(form)?.submit == 7 else { return false }
         form[1].label = "answered-questions"

@@ -217,6 +217,10 @@ final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sen
             DispatchQueue.main.async {
                 CodexBackspace.perform(request, isCurrent: current)
             }
+        }, clear: {
+            DispatchQueue.main.async {
+                CodexBackspace.clear(request, isCurrent: current)
+            }
         })
     }
 

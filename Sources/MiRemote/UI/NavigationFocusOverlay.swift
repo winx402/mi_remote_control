@@ -54,11 +54,7 @@ final class NavigationFocusOverlay {
         render(nodeRect: nodeRect, regionRect: regionRect, target: target, primary: primary, title: title)
     }
 
-    func showAnswer(_ bounds: CGRect, ordinal: Int) {
-        showTarget(bounds, title: "选项 \(ordinal) · 长按 OK 提交")
-    }
-
-    func showTarget(_ bounds: CGRect, title: String) {
+    func showTarget(_ bounds: CGRect, title: String = "") {
         guard let primary = NSScreen.screens.first, bounds.width >= 3, bounds.height >= 3 else { hide(); return }
         let rect = NavigationFocusOverlayGeometry.appKitRect(bounds, primaryTop: primary.frame.maxY)
         render(nodeRect: rect, regionRect: nil, target: rect, primary: primary, title: title)
@@ -78,7 +74,7 @@ final class NavigationFocusOverlay {
         let preferredY = target.maxY + 6
         let badgeY = preferredY + 36 <= safe.maxY ? preferredY : max(safe.minY, target.minY - 42)
         let badge = CGRect(x: badgeX, y: badgeY, width: min(badgeWidth, safe.width), height: 36)
-        var frame = (regionRect ?? target).union(target).union(badge).insetBy(dx: -8, dy: -8)
+        var frame = (regionRect ?? target).union(target).union(title.isEmpty ? .null : badge).insetBy(dx: -8, dy: -8)
         frame = frame.integral
         if panel == nil {
             let panel = NavigationHighlightPanel(contentRect: frame,
@@ -149,6 +145,7 @@ private final class NavigationHighlightView: NSView {
             path.lineWidth = 4
             path.stroke()
         }
+        guard !title.isEmpty else { return }
         NSColor(calibratedRed: 0.04, green: 0.18, blue: 0.44, alpha: 0.96).setFill()
         NSBezierPath(roundedRect: badgeRect, xRadius: 9, yRadius: 9).fill()
         let paragraph = NSMutableParagraphStyle()

@@ -13,6 +13,13 @@ enum CodexBackspace {
     struct Press {
         let editorFocused: Bool
         let perform: () -> Void
+        let clear: () -> Void
+
+        init(editorFocused: Bool, perform: @escaping () -> Void, clear: @escaping () -> Void = {}) {
+            self.editorFocused = editorFocused
+            self.perform = perform
+            self.clear = clear
+        }
     }
 
     struct Request: @unchecked Sendable {
@@ -82,6 +89,56 @@ enum CodexBackspace {
         down.postToPid(request.pid); up.postToPid(request.pid)
     }
 
+    /// Confirm a complete selection before deleting; posting Command-A followed
+    /// immediately by Delete races Chromium's asynchronous keyboard handling.
+    @MainActor static func clear(_ request: Request, isCurrent: @escaping () -> Bool) {
+        guard let editor = request.editor else { return }
+        @MainActor func current() -> Bool {
+            guard isCurrent(), let live = target(), matches(request, live) else { return false }
+            return isCurrent()
+        }
+        @MainActor func count() -> Int? {
+            (attribute(editor, kAXNumberOfCharactersAttribute) as? NSNumber)?.intValue
+        }
+        @MainActor func allSelected(_ length: Int) -> Bool {
+            var selection = CFRange()
+            guard let value = attribute(editor, kAXSelectedTextRangeAttribute),
+                  CFGetTypeID(value) == AXValueGetTypeID(),
+                  AXValueGetValue(value as! AXValue, .cfRange, &selection) else { return false }
+            return selectionCoversDraft(selection, length: length)
+        }
+        @MainActor func post(_ code: CGKeyCode, flags: CGEventFlags) {
+            guard current(),
+                  let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { return }
+            down.flags = flags; up.flags = flags
+            down.postToPid(request.pid); up.postToPid(request.pid)
+        }
+        Task { @MainActor in
+            // Only metadata is read. Draft text and remembered editors are never
+            // queried, and missing selection/count metadata leaves the draft intact.
+            guard current(), let length = count(), length > 0, current() else { return }
+            var all = CFRange(location: 0, length: length)
+            if let range = AXValueCreate(.cfRange, &all), current() {
+                _ = AXUIElementSetAttributeValue(editor, kAXSelectedTextRangeAttribute as CFString, range)
+            }
+            if !allSelected(length), current() {
+                post(0, flags: .maskCommand)
+                for _ in 0..<5 {
+                    try? await Task.sleep(for: .milliseconds(30))
+                    guard current() else { return }
+                    if allSelected(length) { break }
+                }
+            }
+            guard current(), allSelected(length), count() == length, current() else { return }
+            post(51, flags: [])
+        }
+    }
+
+    private static func selectionCoversDraft(_ selection: CFRange, length: Int) -> Bool {
+        length > 0 && selection.location == 0 && selection.length == length
+    }
+
     static func selfCheck() -> Bool {
         // Synthetic AX identities exercise the same comparison used after dispatch,
         // without querying permissions, changing focus, or posting real key events.
@@ -89,7 +146,11 @@ enum CodexBackspace {
         let second = AXUIElementCreateApplication(102)
         let edit = Request(pid: 100, editor: first, code: 51)
         let escape = Request(pid: 100, editor: nil, code: 53)
-        return matches(edit, Target(pid: 100, editor: first))
+        return selectionCoversDraft(CFRange(location: 0, length: 12), length: 12)
+            && !selectionCoversDraft(CFRange(location: 1, length: 11), length: 12)
+            && !selectionCoversDraft(CFRange(location: 0, length: 11), length: 12)
+            && !selectionCoversDraft(CFRange(location: 0, length: 0), length: 0)
+            && matches(edit, Target(pid: 100, editor: first))
             && matches(edit, Target(pid: 100, editor: AXUIElementCreateApplication(101)))
             && !matches(edit, Target(pid: 100, editor: second))
             && !matches(edit, Target(pid: 100, editor: nil))

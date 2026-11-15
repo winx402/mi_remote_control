@@ -186,7 +186,7 @@ enum Presets {
     static let codexDesktop = Preset(
         id: "ai_codex_desktop",
         displayName: "Codex 桌面版",
-        note: "上下按当前区域浏览，左右调整当前控件；OK=选择/进入输入，长按OK=发送一次；菜单=会话列表，语音短按=聚焦输入框，按住=说话、松手=结束，返回=输入中逐次退格，否则Esc。",
+        note: "上下按当前区域浏览，左右调整当前控件；OK=选择/进入输入，长按OK=发送一次；菜单=会话列表，语音短按=聚焦输入框，按住=说话、松手=结束，返回短按退格或返回，长按清空当前输入框。",
         bundleID: "com.openai.codex",
         bindings: [
             "up": KeyBinding(tap: .system("codex_context_up"), overrideBase: true),

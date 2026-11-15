@@ -2460,7 +2460,7 @@ extension MappingEngine {
         press(.back)
         guard expect(.keyStroke(key: "escape", mods: [])) else { return false }
         press(.back, duration: 110)
-        guard expect(.keyStroke(key: "escape", mods: [])) else { return false }
+        guard runner.actions.isEmpty else { return false }
         press(.tv)
         clock.advance(21_000)
         press(.back)

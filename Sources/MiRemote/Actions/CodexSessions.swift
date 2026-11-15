@@ -20,7 +20,7 @@ final class CodexSessions {
         var groupID: String { Self.key(hostID ?? "local", projectID ?? "") }
         var groupTitle: String { projectName ?? "未分组" }
         var hostTitle: String { hostName ?? (isRemote ? "远程电脑" : "本机") }
-        private static func key(_ host: String, _ item: String) -> String {
+        static func key(_ host: String, _ item: String) -> String {
             "\(host.utf8.count):\(host)\(item)"
         }
 
@@ -59,6 +59,7 @@ final class CodexSessions {
 
     struct Snapshot: Sendable {
         var entries: [Entry] = []
+        var sidebarProjects: [CodexSessionCatalog.Project] = []
         var currentID: String?
         var currentIdentityKey: String?
         var isLoading = false
@@ -112,6 +113,7 @@ final class CodexSessions {
                 result.entries.append(indexed)
             }
             result.entries = state.desktop.merge(result.entries)
+            result.sidebarProjects = state.desktop.sidebarProjects
             result.isLoading = result.isLoading || state.catalogLoading
             result.currentIdentityKey = identity?.resolveIdentityKey(in: result.entries,
                 complete: !result.isLoading && result.notice == nil && result.error == nil && state.desktop.isComplete)

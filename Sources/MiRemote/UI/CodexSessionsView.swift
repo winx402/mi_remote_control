@@ -49,7 +49,7 @@ struct CodexSessionsView: View {
                          : snapshot.error == nil ? "没有可打开的会话" : "无法读取会话")
                         .font(.body)
                 }
-                .frame(maxWidth: .infinity).frame(height: 150)
+                .frame(maxWidth: .infinity).frame(height: list.tabs.count > 1 ? 360 : 150)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: true) {
@@ -85,7 +85,7 @@ struct CodexSessionsView: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(Spacing.sheetPadding)
-        .frame(width: 660)
+        .frame(width: min(742, (NSScreen.main?.visibleFrame.width ?? 782) - 40))
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Radius.overlay))
         .overlay(RoundedRectangle(cornerRadius: Radius.overlay)
             .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
@@ -120,14 +120,12 @@ struct CodexSessionsView: View {
                         .lineLimit(1).truncationMode(.middle)
                     Text("\(tab.entries.count)").font(.caption).monospacedDigit()
                 }
-                if let hostTitle = tab.hostTitle {
-                    Text(tab.isRemote ? "远程 · \(hostTitle)" : hostTitle)
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.middle)
-                }
+                Text(subtitle(for: tab, recent: index == 0))
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
             }
-            .frame(maxWidth: 220, alignment: .leading)
-            .padding(.horizontal, 12).padding(.vertical, 9)
+            .padding(.horizontal, 12)
+            .frame(width: 130, height: 52, alignment: .leading)
             .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
             .background(isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08),
                         in: RoundedRectangle(cornerRadius: Radius.small))
@@ -138,6 +136,12 @@ struct CodexSessionsView: View {
         .help([tab.title, tab.isRemote ? "远程" : nil, tab.hostTitle].compactMap { $0 }.joined(separator: " · "))
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func subtitle(for tab: CodexSessionList.Tab, recent: Bool) -> String {
+        if recent { return "按更新时间" }
+        guard tab.isRemote else { return "本机" }
+        return tab.hostTitle.map { "远程 · " + $0 } ?? "远程"
     }
 
     private func scrollTab(_ proxy: ScrollViewProxy) {

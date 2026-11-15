@@ -424,7 +424,7 @@ final class OverlayCenter {
             showPanel()
             codexSessions.load(identity: identity) { [weak self] incoming in
                 guard let self, self.active == .codexSessions else { return }
-                let list = CodexSessionList(entries: incoming.entries)
+                let list = CodexSessionList(entries: incoming.entries, sidebarProjects: incoming.sidebarProjects)
                 self.codexSelection = list.selection(after: self.codexList, prior: self.codexSelection,
                                                      browsed: self.browsedSessions, currentKey: incoming.currentIdentityKey)
                 self.codexList = list
@@ -971,7 +971,7 @@ final class OverlayCenter {
     // MARK: Codex 项目会话列表
 
     private func codexStep(_ key: RemoteKey) {
-        guard !codexSnapshot.entries.isEmpty else { return }
+        guard !codexSnapshot.entries.isEmpty || codexList.tabs.count > 1 else { return }
         browsedSessions = true
         codexSelection = codexList.moved(codexSelection, key: key)
         restartOverlayIdleTimer()

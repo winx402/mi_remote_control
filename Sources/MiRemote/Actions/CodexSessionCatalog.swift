@@ -9,11 +9,15 @@ enum CodexSessionCatalog {
         let name: String
         let hostID: String?
         let roots: [String]
+        var hostName: String? = nil
+        var groupID: String { CodexSessions.Entry.key(hostID ?? "local", id) }
     }
 
     struct Result: Sendable {
         var entries: [CodexSessions.Entry] = []
         var projects: [Project] = []
+        var sidebarProjects: [Project] = []
+        var legacyIDsByServerID: [String: String] = [:]
         var assignments: [String: Assignment] = [:]
         var projectless: Set<String> = []
         var membershipHosts: [String: String] = [:]
@@ -36,7 +40,9 @@ enum CodexSessionCatalog {
             }
             let hasProjectlessOverride = projectless.contains(entry.id)
                 && normalizedHost(membershipHosts[entry.id]) == entry.hostID
-            let explicitID = entry.projectID ?? assignment?.projectId
+            let explicitID = (entry.projectID ?? assignment?.projectId).map {
+                entry.hostID == nil ? legacyIDsByServerID[$0] ?? $0 : $0
+            }
             var project: Project?
             if hasProjectlessOverride, assignment == nil {
                 project = nil
@@ -107,11 +113,15 @@ enum CodexSessionCatalog {
         let projectless: [String]?
         let membershipHosts: [String: String]?
         let hosts: [Host]?
+        let serverIDsByLegacyIDByHost: [String: [String: String]]?
+        let order: [String]?
         enum CodingKeys: String, CodingKey {
             case locals = "local-projects", remotes = "remote-projects"
             case assignments = "thread-project-assignments", projectless = "projectless-thread-ids"
             case hosts = "codex-managed-remote-connections"
             case membershipHosts = "thread-project-membership-host-ids"
+            case serverIDsByLegacyIDByHost = "app-server-project-id-by-legacy-project-id-by-host"
+            case order = "project-order"
         }
     }
 
@@ -123,14 +133,32 @@ enum CodexSessionCatalog {
 
     static func read() -> Result {
         var result = Result()
+        var projectOrder: [String] = []
+        var autoConnect: [String: Bool] = [:]
+        var registeredHosts = Set<String>()
+        var localProjectsMigrated = false
         let state = home.appendingPathComponent(".codex-global-state.json")
         if let attributes = try? FileManager.default.attributesOfItem(atPath: state.path),
            let bytes = attributes[.size] as? NSNumber, bytes.intValue <= 32 * 1024 * 1024,
            let data = try? Data(contentsOf: state), let global = try? JSONDecoder().decode(Global.self, from: data) {
-            result.projects = (global.locals ?? [:]).values.map {
+            projectOrder = global.order ?? []
+            if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // Remote preferences are account scoped in current Desktop builds.
+                let suffix = (raw["electron-renderer-content-owner"] as? String).map { ":" + $0 } ?? ""
+                autoConnect = raw["electron-account-remote-preference:remote-connection-auto-connect-by-host-id" + suffix]
+                    as? [String: Bool] ?? raw["remote-connection-auto-connect-by-host-id"] as? [String: Bool] ?? [:]
+                let migrations = raw["electron-owner-value:app-server-projects-migration-by-host" + suffix]
+                    as? [String: [String: Any]] ?? raw["app-server-projects-migration-by-host"] as? [String: [String: Any]] ?? [:]
+                localProjectsMigrated = migrations["local:" + home.path]?["projectsMigrated"] as? Bool
+                    ?? migrations["local"]?["projectsMigrated"] as? Bool ?? false
+            }
+            result.projects = (global.locals ?? [:]).values.sorted { $0.id < $1.id }.map {
                 Project(id: $0.id, name: $0.name, hostID: nil, roots: $0.rootPaths)
             } + (global.remotes ?? []).map {
                 Project(id: $0.id, name: $0.label, hostID: $0.hostId, roots: [$0.remotePath])
+            }
+            for (host, ids) in global.serverIDsByLegacyIDByHost ?? [:] where host == "local" || host == "local:" + home.path {
+                for (legacyID, serverID) in ids { result.legacyIDsByServerID[serverID] = legacyID }
             }
             result.assignments = global.assignments ?? [:]
             result.projectless = Set(global.projectless ?? [])
@@ -139,10 +167,15 @@ enum CodexSessionCatalog {
                 if let name = host.displayName, !name.isEmpty { result.hostNames[host.hostId] = name }
             }
         }
-        readLocalProjects(into: &result)
+        readLocalProjects(into: &result, authoritative: localProjectsMigrated)
         let database = home.appendingPathComponent("sqlite/codex.db")
         if FileManager.default.fileExists(atPath: database.path) {
             let success = withDatabase(database) { db in
+                // This is the client's registered host catalog, independent of thread count.
+                // Persisted remote-projects and auto-connect preferences can retain removed hosts.
+                guard rows(db, sql: "SELECT host_id FROM local_thread_catalog_hosts WHERE host_kind IN ('ssh','wsl','remote-control')", visit: { statement in
+                    if let host = string(statement, 0) { registeredHosts.insert(host) }
+                }) else { return false }
                 let sql = """
                     SELECT c.host_id,c.thread_id,c.display_title,c.source_updated_at,c.cwd,c.project_id,h.host_kind
                     FROM local_thread_catalog c JOIN local_thread_catalog_hosts h USING(host_id)
@@ -170,6 +203,8 @@ enum CodexSessionCatalog {
             }
             if result.entries.count >= 2000 { result.isComplete = false }
         }
+        result.sidebarProjects = sidebarProjects(result.projects, order: projectOrder,
+            registeredHosts: registeredHosts, autoConnect: autoConnect, hostNames: result.hostNames)
         if result.entries.contains(where: \.isRemote) {
             result.notice = [result.notice, "远程会话来自 Codex 桌面最近同步的索引；连接状态以 Codex 为准。"]
                 .compactMap { $0 }.joined(separator: "\n")
@@ -181,7 +216,33 @@ enum CodexSessionCatalog {
         return result
     }
 
-    private static func readLocalProjects(into result: inout Result) {
+    /// Desktop's Xqyo ordering prepends projects absent from project-order; it is not
+    /// an allowlist. The sidebar also excludes ChatGPT backing folders and remote
+    /// projects whose registered connection is disabled. No thread existence check.
+    private static func sidebarProjects(_ projects: [Project], order: [String],
+        registeredHosts: Set<String>, autoConnect: [String: Bool], hostNames: [String: String]) -> [Project] {
+        let visible = projects.filter { project in
+            if let host = project.hostID { return registeredHosts.contains(host) && autoConnect[host] != false }
+            return !(project.roots.count == 1 && project.roots[0].split(whereSeparator: { $0 == "/" || $0 == "\\" })
+                .dropLast().last == ".chatgpt-projects")
+        }
+        let visibleIDs = Set(visible.map(\.id))
+        var seenIDs = Set<String>()
+        let storedOrder = order.filter { visibleIDs.contains($0) && seenIDs.insert($0).inserted }
+        let storedIDs = Set(storedOrder)
+        let orderedIDs = visible.filter { !storedIDs.contains($0.id) }.map(\.id) + storedOrder
+        let rank = Dictionary(orderedIDs.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first })
+        var seen = Set<String>()
+        return visible.filter { seen.insert($0.groupID).inserted }.sorted {
+            rank[$0.id, default: Int.max] < rank[$1.id, default: Int.max]
+        }.map { project in
+            var project = project
+            project.hostName = project.hostID.flatMap { hostNames[$0] }
+            return project
+        }
+    }
+
+    private static func readLocalProjects(into result: inout Result, authoritative: Bool) {
         guard let files = try? FileManager.default.contentsOfDirectory(at: home, includingPropertiesForKeys: nil),
               let database = files.compactMap({ file -> (Int, URL)? in
                   let name = file.lastPathComponent
@@ -191,17 +252,21 @@ enum CodexSessionCatalog {
               }).max(by: { $0.0 < $1.0 })?.1 else { return }
         _ = withDatabase(database) { db in
             var projects: [String: (String, [String])] = [:]
-            let success = rows(db, sql: "SELECT p.id,p.name,r.path FROM projects p LEFT JOIN project_roots r ON r.project_id=p.id ORDER BY p.id,r.position LIMIT 2000") { statement in
-                guard let id = string(statement, 0), let name = string(statement, 1) else { return }
+            var orderedIDs: [String] = []
+            let success = rows(db, sql: "SELECT p.id,p.name,r.path FROM projects p LEFT JOIN project_roots r ON r.project_id=p.id ORDER BY p.position,p.id,r.position LIMIT 2000") { statement in
+                guard let serverID = string(statement, 0), let name = string(statement, 1) else { return }
+                let id = result.legacyIDsByServerID[serverID] ?? serverID
+                if projects[id] == nil { orderedIDs.append(id) }
                 var project = projects[id] ?? (name, [])
                 if let root = string(statement, 2) { project.1.append(root) }
                 projects[id] = project
             }
             if success {
-                for (id, value) in projects {
-                    result.projects.removeAll { $0.hostID == nil && $0.id == id }
-                    result.projects.append(Project(id: id, name: value.0, hostID: nil, roots: value.1))
-                }
+                let ids = Set(orderedIDs)
+                let remaining = result.projects.filter { $0.hostID != nil || (!authoritative && !ids.contains($0.id)) }
+                result.projects = orderedIDs.compactMap { id in
+                    projects[id].map { Project(id: id, name: $0.0, hostID: nil, roots: $0.1) }
+                } + remaining
             }
             return success
         }
@@ -250,6 +315,25 @@ enum CodexSessionCatalog {
             Project(id: "local", name: "Local", hostID: nil, roots: ["/repo/"]),
             Project(id: "remote", name: "Remote", hostID: remote.hostID, roots: ["/repo"])
         ])
+        let hidden = Project(id: "backing", name: "ChatGPT", hostID: nil, roots: ["/home/.codex/.chatgpt-projects/p"])
+        let empty = Project(id: "empty", name: "Empty", hostID: nil, roots: ["/empty"])
+        let removed = Project(id: "removed", name: "Remote", hostID: "removed-host", roots: ["/repo"])
+        let disabled = Project(id: "disabled", name: "Disabled", hostID: "disabled-host", roots: ["/repo"])
+        let sidebar = sidebarProjects(metadata.projects + [empty, hidden, removed, disabled],
+            order: ["remote", "stale", "local", "remote"],
+            registeredHosts: [remote.hostID!, "disabled-host"], autoConnect: ["disabled-host": false],
+            hostNames: [remote.hostID!: "Remote computer"])
+        guard sidebar.map(\.id) == ["empty", "remote", "local"],
+              sidebar[1].hostName == "Remote computer",
+              sidebar[1].groupID == remote.groupID else { return false }
+        var migrated = metadata
+        migrated.legacyIDsByServerID = ["server-local": "local"]
+        let normalized = migrated.merge([CodexSessions.Entry(id: "migrated", name: nil,
+            updatedAt: 1, projectID: "server-local", cwd: "/repo")])
+        let remoteCollision = migrated.merge([CodexSessions.Entry(id: "collision", name: nil,
+            updatedAt: 1, hostID: remote.hostID, projectID: "server-local")])
+        guard normalized.first(where: { $0.id == "migrated" })?.groupID == metadata.projects[0].groupID,
+              remoteCollision.first(where: { $0.id == "collision" })?.projectID == "server-local" else { return false }
         let merged = metadata.merge([local])
         let explicit = metadata.merge([CodexSessions.Entry(id: "explicit", name: nil, updatedAt: 4,
             projectID: "unavailable", cwd: "/repo/a")])

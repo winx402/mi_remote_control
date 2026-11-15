@@ -1,5 +1,6 @@
 import AVFoundation
 import Speech
+import os
 
 /// ATVV 已解码 PCM 的本机听写。不会打开系统麦克风、播放声音或上传音频。
 /// 所有识别状态及 append 均在主线程，取消后旧回调由调用方的会话 token 隔离。
@@ -7,7 +8,11 @@ import Speech
     private let request = SFSpeechAudioBufferRecognitionRequest()
     private var task: SFSpeechRecognitionTask?
     private let recognizer: SFSpeechRecognizer
+    private static let trace = Logger(subsystem: "com.miremote.controller", category: "RemoteSpeech")
     private var acceptsAudio = true
+    private var sampleCount = 0
+    private var peak = 0
+    private var squares = 0.0
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                       sampleRate: 16_000, channels: 1, interleaved: false)!
 
@@ -49,7 +54,13 @@ import Speech
         request.taskHint = .dictation
         task = recognizer.recognitionTask(with: request) { result, error in
             let final = result?.isFinal == true ? result?.bestTranscription.formattedString : nil
-            let failure = error == nil ? nil : "本机识别未完成，请检查中文听写资源后重试。"
+            let failure = error.map { error -> String in
+                let ns = error as NSError
+                Self.trace.notice("recognition error domain=\(ns.domain, privacy: .public) code=\(ns.code)")
+                if ns.domain == "kLSRErrorDomain", ns.code == 201 { return "请在系统设置 → 键盘中启用听写。" }
+                return "本机语音识别未完成（\(ns.domain) \(ns.code)）。"
+            }
+            if let final { Self.trace.notice("recognition final characters=\(final.count)") }
             guard final != nil || failure != nil else { return }
             Task { @MainActor in completion(final, failure) }
         }
@@ -60,13 +71,20 @@ import Speech
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
               let channel = buffer.floatChannelData?[0] else { return }
         buffer.frameLength = AVAudioFrameCount(samples.count)
-        for (index, sample) in samples.enumerated() { channel[index] = Float(sample) / 32768 }
+        sampleCount += samples.count
+        for (index, sample) in samples.enumerated() {
+            channel[index] = Float(sample) / 32768
+            peak = max(peak, abs(Int(sample)))
+            squares += Double(sample) * Double(sample)
+        }
         request.append(buffer)
     }
 
     func endAudio() {
         guard acceptsAudio else { return }
         acceptsAudio = false
+        let rms = Int(sqrt(squares / Double(max(1, sampleCount))))
+        Self.trace.notice("end audio samples=\(self.sampleCount) peak=\(self.peak) rms=\(rms)")
         request.endAudio()
     }
 

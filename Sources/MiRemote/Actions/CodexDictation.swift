@@ -1,4 +1,5 @@
 import AppKit
+import os
 import ApplicationServices
 import Carbon
 import CoreAudio
@@ -511,6 +512,7 @@ enum CodexDictation {
     }
 
     @MainActor private static func notice(_ message: String) {
+        Logger(subsystem: "com.miremote.controller", category: "RemoteSpeech").notice("\(message, privacy: .public)")
         log("Codex 听写：\(message)")
         onNotice?(message)
     }

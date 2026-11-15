@@ -5,7 +5,9 @@ struct CodexSessionsView: View {
     let snapshot: CodexSessions.Snapshot
     let list: CodexSessionList
     let tabIndex: Int
-    let selected: Int
+    let selected: Int?
+    var isCreating = false
+    let onNewChat: (String) -> Void
     let onTabSelected: (Int) -> Void
 
     private var currentTabIndex: Int? {
@@ -20,7 +22,7 @@ struct CodexSessionsView: View {
     private var entries: [CodexSessions.Entry] { currentTab?.entries ?? [] }
 
     private var selectedIndex: Int? {
-        guard !entries.isEmpty else { return nil }
+        guard let selected, !entries.isEmpty else { return nil }
         return min(max(selected, 0), entries.count - 1)
     }
 
@@ -40,6 +42,29 @@ struct CodexSessionsView: View {
             }
             if !list.tabs.isEmpty {
                 projectTabs
+                if let tab = currentTab {
+                    Button { onNewChat(tab.id) } label: {
+                        HStack(spacing: 8) {
+                            if isCreating {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "square.and.pencil")
+                            }
+                            Text("新建会话").fontWeight(.medium)
+                            Spacer()
+                            Text(tab.project == nil ? "无工作区" : tab.title)
+                                .foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        .padding(.horizontal, 12).frame(height: 38)
+                        .background(selected == nil ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.06),
+                                    in: RoundedRectangle(cornerRadius: Radius.small))
+                        .overlay(RoundedRectangle(cornerRadius: Radius.small)
+                            .stroke(selected == nil ? Color.accentColor : Color.clear, lineWidth: 2))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isCreating)
+                    .accessibilityAddTraits(selected == nil ? .isSelected : [])
+                }
             }
             if entries.isEmpty {
                 VStack(spacing: 10) {

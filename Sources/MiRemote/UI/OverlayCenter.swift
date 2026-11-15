@@ -144,6 +144,7 @@ final class OverlayUIState: ObservableObject {
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexList = CodexSessionList(entries: [])
+    @Published var isCreatingCodexChat = false
     @Published var codexSelection = CodexSessionList.Selection()
     @Published var powerMenu = PowerMenuState()
     @Published var televisionPowerStatus: String?
@@ -229,6 +230,7 @@ final class OverlayCenter {
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexList = CodexSessionList(entries: [])
     private var codexSelection = CodexSessionList.Selection()
+    private var creatingCodexChat: Task<Void, Never>?
     private var browsedSessions = false
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
@@ -468,6 +470,8 @@ final class OverlayCenter {
         powerOKHeld = false
         if dismissTV { XiaomiTVController.shared.dismissPowerMenu(matching: televisionConfiguration) }
         else if abandoningTV { XiaomiTVController.shared.abandonMenuNavigation(matching: televisionConfiguration) }
+        creatingCodexChat?.cancel()
+        creatingCodexChat = nil
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexList = CodexSessionList(entries: [])
@@ -971,7 +975,7 @@ final class OverlayCenter {
     // MARK: Codex 项目会话列表
 
     private func codexStep(_ key: RemoteKey) {
-        guard !codexSnapshot.entries.isEmpty || codexList.tabs.count > 1 else { return }
+        guard creatingCodexChat == nil, !codexSnapshot.entries.isEmpty || codexList.tabs.count > 1 else { return }
         browsedSessions = true
         codexSelection = codexList.moved(codexSelection, key: key)
         restartOverlayIdleTimer()
@@ -979,11 +983,34 @@ final class OverlayCenter {
     }
 
     private func selectCodexTab(_ index: Int) {
-        guard active == .codexSessions, codexList.tabs.indices.contains(index), index != codexSelection.tab else { return }
+        guard active == .codexSessions, creatingCodexChat == nil, codexList.tabs.indices.contains(index), index != codexSelection.tab else { return }
         browsedSessions = true
-        codexSelection = CodexSessionList.Selection(tab: index)
+        codexSelection = codexList.initialSelection(tab: index)
         restartOverlayIdleTimer()
         sync()
+    }
+
+    private func createCodexChat(tabID: String) {
+        guard active == .codexSessions, creatingCodexChat == nil,
+              codexList.tabs.indices.contains(codexSelection.tab) else { return }
+        let tab = codexList.tabs[codexSelection.tab]
+        guard tab.id == tabID else { return }
+        browsedSessions = true
+        codexSelection.row = nil
+        restartOverlayIdleTimer()
+        creatingCodexChat = Task { @MainActor [weak self] in
+            guard !Task.isCancelled else { return }
+            let opened = await CodexSessions.openNew(in: tab.project)
+            guard !Task.isCancelled, let self, self.active == .codexSessions else { return }
+            self.creatingCodexChat = nil
+            if opened {
+                self.close()
+            } else {
+                self.codexSnapshot.error = CodexSessions.newSessionFailure ?? "无法打开新会话，请重试。"
+                self.sync(animated: false)
+            }
+        }
+        sync(animated: false)
     }
 
     private func handleCodexKey(_ key: RemoteKey) {
@@ -992,7 +1019,11 @@ final class OverlayCenter {
             codexStep(key)
             startRepeat(key) { [weak self] in self?.codexStep(key) }
         case .ok:
-            guard let target = codexList.entry(at: codexSelection) else { return }
+            if codexSelection.row == nil {
+                createCodexChat(tabID: codexList.tabs[codexSelection.tab].id)
+                return
+            }
+            guard creatingCodexChat == nil, let target = codexList.entry(at: codexSelection) else { return }
             if CodexSessions.open(target) {
                 close()
             } else {
@@ -1030,6 +1061,7 @@ final class OverlayCenter {
             uiState.codexSnapshot = codexSnapshot
             uiState.codexList = codexList
             uiState.codexSelection = codexSelection
+            uiState.isCreatingCodexChat = creatingCodexChat != nil
             uiState.powerMenu = powerMenu
             uiState.televisionPowerStatus = televisionPowerStatus
             uiState.powerConfirmingID = powerConfirmingID
@@ -1059,6 +1091,7 @@ final class OverlayCenter {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.contentView = NSHostingView(rootView: OverlayRootView(state: uiState,
             onDismiss: { [weak self] in self?.close() },
+            onCodexNewChat: { [weak self] in self?.createCodexChat(tabID: $0) },
             onCodexTabSelected: { [weak self] in self?.selectCodexTab($0) },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
             onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) },
@@ -1450,6 +1483,7 @@ struct HintBarView: View {
 private struct OverlayRootView: View {
     @ObservedObject var state: OverlayUIState
     let onDismiss: () -> Void
+    let onCodexNewChat: (String) -> Void
     let onCodexTabSelected: (Int) -> Void
     let onMenuSelect: (Int) -> Void
     let onMenuActivate: (Int) -> Void
@@ -1480,7 +1514,7 @@ private struct OverlayRootView: View {
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, tabIndex: state.codexSelection.tab,
-                                      selected: state.codexSelection.row, onTabSelected: onCodexTabSelected)
+                                      selected: state.codexSelection.row, isCreating: state.isCreatingCodexChat, onNewChat: onCodexNewChat, onTabSelected: onCodexTabSelected)
                 case .computerPower:
                     let generation = state.powerGeneration
                     let inputGeneration = state.confirmationInputGeneration

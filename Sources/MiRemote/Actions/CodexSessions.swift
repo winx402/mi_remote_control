@@ -197,7 +197,7 @@ final class CodexSessions {
 
     nonisolated static func selfCheck() -> Bool {
         let fixture = #"{"data":[{"id":"older","name":"  第一个\n会话  ","updatedAt":1,"preview":"PRIVATE PREVIEW","cwd":"/private/example"},{"id":"newer","name":null,"updatedAt":3},{"id":"same-time","name":"   ","updatedAt":3}],"nextCursor":"next-page"}"#
-        guard CodexSessionIdentity.selfCheck(), CodexSessionCatalog.selfCheck() else { return false }
+        guard CodexSessionIdentity.selfCheck(), CodexSessionCatalog.selfCheck(), CodexNewSession.selfCheck() else { return false }
         guard let page = try? JSONDecoder().decode(Page.self, from: Data(fixture.utf8)),
               page.data.count == 3, page.nextCursor == "next-page",
               page.data[0].title == "第一个 会话",

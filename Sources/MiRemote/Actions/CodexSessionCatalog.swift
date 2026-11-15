@@ -10,6 +10,9 @@ enum CodexSessionCatalog {
         let hostID: String?
         let roots: [String]
         var hostName: String? = nil
+        // Deep links resolve IDs against the raw desktop local-projects map,
+        // whose keys can differ from migrated app-server UUIDs.
+        var localLaunchID: String? = nil
         var groupID: String { CodexSessions.Entry.key(hostID ?? "local", id) }
     }
 
@@ -153,7 +156,7 @@ enum CodexSessionCatalog {
                     ?? migrations["local"]?["projectsMigrated"] as? Bool ?? false
             }
             result.projects = (global.locals ?? [:]).values.sorted { $0.id < $1.id }.map {
-                Project(id: $0.id, name: $0.name, hostID: nil, roots: $0.rootPaths)
+                Project(id: $0.id, name: $0.name, hostID: nil, roots: $0.rootPaths, localLaunchID: $0.id)
             } + (global.remotes ?? []).map {
                 Project(id: $0.id, name: $0.label, hostID: $0.hostId, roots: [$0.remotePath])
             }
@@ -265,7 +268,10 @@ enum CodexSessionCatalog {
                 let ids = Set(orderedIDs)
                 let remaining = result.projects.filter { $0.hostID != nil || (!authoritative && !ids.contains($0.id)) }
                 result.projects = orderedIDs.compactMap { id in
-                    projects[id].map { Project(id: id, name: $0.0, hostID: nil, roots: $0.1) }
+                    projects[id].map { value in
+                        Project(id: id, name: value.0, hostID: nil, roots: value.1,
+                            localLaunchID: result.projects.first(where: { $0.id == id && $0.hostID == nil })?.localLaunchID)
+                    }
                 } + remaining
             }
             return success

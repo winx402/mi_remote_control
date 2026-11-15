@@ -52,22 +52,22 @@ enum CodexConversationControls {
         let target = snapshot.elements[index]
         lastFormRoot = snapshot.elements[form.root]
         highlightedAnswer = target
-        // Focus moves without AXPress. Clicking a mid-turn option would send it.
-        var candidate: Int? = form.options.contains(index) ? index : nil
-        while let item = candidate, descendant(item, of: form.root, in: snapshot.nodes) {
-            let element = snapshot.elements[item]
-            if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
-               focusedEditor(for: element, app: snapshot.app).map({ CFEqual($0, element) }) == true { break }
-            candidate = snapshot.nodes[item].parent
-        }
+        // The remote previews answers without moving the native caret. Chromium
+        // can report an intermediate group after an AX focus write and erase an
+        // otherwise valid preview before the next physical press.
+        previewOptionOrdinal = form.options.firstIndex(of: index)
+        previewClickCount = CGEventSource.counterForEventType(.combinedSessionState, eventType: .leftMouseDown)
         focusAfterPreview = element(snapshot.app, kAXFocusedUIElementAttribute as CFString)
         answerHighlight.showTarget(snapshot.nodes[index].rect)
         highlightMonitor?.invalidate()
         highlightMonitor = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
             MainActor.assumeIsolated {
                 guard let highlightedAnswer, CFEqual(highlightedAnswer, target) else { return }
-                guard sameWindow(snapshot), let bounds = frame(target), bounds.intersects(snapshot.window) else {
-                    resetInputTarget()
+                guard sameWindow(snapshot) else { resetInputTarget(); return }
+                guard let bounds = frame(target), bounds.intersects(snapshot.window) else {
+                    // A re-render can replace the row. Keep its ordinal for the
+                    // next direction press; submission still requires a live row.
+                    answerHighlight.hide()
                     return
                 }
                 if bounds != snapshot.nodes[index].rect {
@@ -81,6 +81,7 @@ enum CodexConversationControls {
         highlightMonitor?.invalidate()
         highlightMonitor = nil
         highlightedAnswer = nil
+        previewOptionOrdinal = nil
         focusAfterPreview = nil
         lastFormRoot = nil
         answerHighlight.hide()
@@ -103,6 +104,8 @@ enum CodexConversationControls {
         clearAnswer()
     }
 
+    @MainActor private static var previewOptionOrdinal: Int?
+    @MainActor private static var previewClickCount: UInt32 = 0
     @MainActor private static var focusAfterPreview: AXUIElement?
     @MainActor private static var highlightedAnswer: AXUIElement?
     @MainActor private static var lastFormRoot: AXUIElement?
@@ -500,8 +503,10 @@ enum CodexConversationControls {
             if questionRoot.map({ CFEqual($0, root) }) != true {
                 resetInputTarget()
                 questionRoot = root
-            } else if let focusAfterPreview, !CFEqual(focusAfterPreview, focused) {
-                clearAnswer()
+            } else if highlightedAnswer != nil {
+                let clicked = CGEventSource.counterForEventType(.combinedSessionState, eventType: .leftMouseDown) != previewClickCount
+                let changedFocus = focusAfterPreview.map { !CFEqual($0, focused) } ?? false
+                if clicked || changedFocus { clearAnswer() }
             }
             targetWindow = window
             composerTarget = nil
@@ -541,6 +546,7 @@ enum CodexConversationControls {
         trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
         let focusedCard = syncFocusedInput()
+        if moveFocusedCaret(action, isCurrent: isCurrent) { return true }
         if action == .submit, focusedCard == nil, submitFocusedComposer(isCurrent: isCurrent) { return true }
         let scrolling = action == .up || action == .down
         if scrolling && questionRoot == nil {
@@ -590,7 +596,9 @@ enum CodexConversationControls {
             case .up, .down:
                 let saved: Int? = highlightedAnswer.flatMap { target in
                     guard let lastFormRoot, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return nil }
-                    return snapshot.elements.firstIndex { CFEqual(target, $0) }
+                    if let row = snapshot.elements.firstIndex(where: { CFEqual(target, $0) }) { return row }
+                    guard let ordinal = previewOptionOrdinal, form.options.indices.contains(ordinal) else { return nil }
+                    return form.options[ordinal]
                 }
                 guard let index = nextAnswer(in: form, nodes: snapshot.nodes, from: saved, up: action == .up) else { return true }
                 previewAnswer(index, form: form, in: snapshot)
@@ -654,6 +662,44 @@ enum CodexConversationControls {
             case .left, .right: break
             }
         }
+        return true
+    }
+
+    private static func editingArrowKey(_ action: Action, role: String, previewingAnswer: Bool) -> CGKeyCode? {
+        guard !previewingAnswer, inputRoles.contains(role) else { return nil }
+        switch action {
+        case .left: return 123
+        case .right: return 124
+        default: return nil
+        }
+    }
+
+    /// Keep the editor's native selection and IME handling. Previewing an answer
+    /// can leave AX focus in an editor, so that state must retain question navigation.
+    @MainActor private static func moveFocusedCaret(_ action: Action, isCurrent: () -> Bool) -> Bool {
+        guard action == .left || action == .right, highlightedAnswer == nil,
+              let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == "com.openai.codex",
+              AXIsProcessTrusted(), isCurrent() else { return false }
+        let app = accessibilityApplication(front.processIdentifier)
+        guard let window = element(app, kAXFocusedWindowAttribute as CFString), let windowBounds = frame(window),
+              let editor = element(app, kAXFocusedUIElementAttribute as CFString),
+              let key = editingArrowKey(action, role: string(editor, kAXRoleAttribute as CFString) ?? "",
+                                       previewingAnswer: highlightedAnswer != nil),
+              bool(editor, kAXEnabledAttribute as CFString) != false,
+              bool(editor, "AXEditable" as CFString) != false,
+              let bounds = frame(editor), bounds.intersects(windowBounds) else { return false }
+        // Once this gesture belongs to the editor, a focus change cancels it;
+        // it must not fall through to a question-navigation button.
+        guard isCurrent(), stillFrontmost(front.processIdentifier),
+              let currentWindow = element(app, kAXFocusedWindowAttribute as CFString), CFEqual(window, currentWindow),
+              let currentEditor = element(app, kAXFocusedUIElementAttribute as CFString), CFEqual(editor, currentEditor),
+              let down = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) else { return true }
+        down.flags = []
+        up.flags = []
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        trace.notice("moved focused editor with native horizontal key")
         return true
     }
 
@@ -1186,6 +1232,18 @@ enum CodexConversationControls {
 
     /// Pure fixture checks: no AX, keyboard, mouse, network, or actual Codex UI access.
     static func selfCheck() -> Bool {
+        // Both question replies and chat drafts use native editing. An answer
+        // preview must keep navigating questions even if AX still reports that editor.
+        for role in inputRoles {
+            guard editingArrowKey(.left, role: role, previewingAnswer: false) == 123,
+                  editingArrowKey(.right, role: role, previewingAnswer: false) == 124,
+                  Action.allCases.allSatisfy({ editingArrowKey($0, role: role, previewingAnswer: true) == nil }),
+                  [.up, .down, .ok, .submit].allSatisfy({ editingArrowKey($0, role: role, previewingAnswer: false) == nil }) else { return false }
+        }
+        guard ["AXButton", "AXRadioButton", "AXGroup", "AXWindow"].allSatisfy({ role in
+            editingArrowKey(.left, role: role, previewingAnswer: false) == nil
+                && editingArrowKey(.right, role: role, previewingAnswer: false) == nil
+        }) else { return false }
         let window = CGRect(x: 0, y: 0, width: 1000, height: 800)
         var form = [
             Node(parent: nil, role: "AXWindow", rect: window),
@@ -1203,6 +1261,18 @@ enum CodexConversationControls {
         guard nextAnswer(in: detected, nodes: form, from: 4, up: false) == 8,
               nextAnswer(in: detected, nodes: form, from: 8, up: true) == 4,
               nextAnswer(in: detected, nodes: form, from: 8, up: false) == 8 else { return false }
+        // The editor can keep AX focus throughout a run of remote previews.
+        form[8].focused = true
+        var preview: Int? = nil
+        for expected in [4, 3, 3] {
+            preview = nextAnswer(in: detected, nodes: form, from: preview, up: true)
+            guard preview == expected else { return false }
+        }
+        for expected in [4, 8, 8] {
+            preview = nextAnswer(in: detected, nodes: form, from: preview, up: false)
+            guard preview == expected else { return false }
+        }
+        form[8].focused = false
         form[7].label = "提交答案"
         guard activeForm(form)?.submit == 7 else { return false }
         form[1].label = "answered-questions"

@@ -93,7 +93,7 @@ scripts/probe-hdmi-signal-wake.sh --run --standby-first
 
 这项改进不等于已实现跨主机抢占：2 Pro 是否保留多个主机的配对信息仍未确认。用户已说明本次是按组合键重新与电视配对，因此 Mac 的旧配对记录不能证明遥控器仍保留有效 Mac 密钥。CoreBluetooth 语音链路连接也不能代表系统 HID 已接入，最终需用真实按键验收。Mac 端释放某条 CoreBluetooth 连接不能保证系统 HID 物理链路释放，更不能命令电视交还连接；详见 [Apple cancelPeripheralConnection](https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/cancelperipheralconnection(_:))。检测到 HDMI 变化只解决触发条件，不解决蓝牙交接本身。现阶段不自动解绑、重配或抢占遥控器。
 
-光标在 Codex 问题卡的输入框中时，上下直接选择枚举选项和底部的自定义回复，短按 OK 进入自定义回复编辑。在 Codex 编辑框里，短按返回退格，长按返回清空按下时聚焦的输入框。
+光标在 Codex 问题卡的输入框中时，上下直接选择枚举选项和底部的自定义回复，短按 OK 进入自定义回复编辑。编辑文字时短按左右移动光标，浏览选项时左右切题。在 Codex 编辑框里，短按返回退格，长按返回清空按下时聚焦的输入框。
 
 其他应用的返回长按使用独立全局 `quit_app` 动作，请求当前前台应用正常退出，保留应用自己的保存／取消流程。一次按住只请求一次，松手不补发返回；单击仍执行当前应用原有返回操作。退出前会释放鼠标拖拽并收起临时面板。鼠标模式仍可用返回单击或闲置 20 秒退出。
 

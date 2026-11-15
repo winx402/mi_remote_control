@@ -745,10 +745,18 @@ final class OverlayCenter {
     // MARK: 电脑电源列表
 
     private func handlePowerKey(_ key: RemoteKey) {
+        if key == .menu, powerMenu.appOption == nil, case .launchApp(let id) = powerMenu.selection.command {
+            cancelPowerConfirmation(refresh: false)
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+                .contains { !$0.isTerminated && $0.activationPolicy == .regular }
+            powerMenu.showAppOptions(running: running)
+            sync(animated: false)
+            return
+        }
         if key == .ok {
             guard !powerOKHeld else { return }
             powerOKHeld = true
-            if powerMenu.selection.command?.requiresHoldConfirmation == true {
+            if powerMenu.selectedCommand?.requiresHoldConfirmation == true {
                 beginPowerConfirmation()
                 return
             }
@@ -785,6 +793,7 @@ final class OverlayCenter {
     private func beginPowerConfirmation() {
         guard powerConfirmingID == nil, !powerMenu.isExecuting else { return }
         let choice = powerMenu.selection
+        let command = powerMenu.selectedCommand
         let token = powerGeneration
         let inputToken = engine?.inputGeneration ?? 0
         powerConfirmingID = choice.id
@@ -792,7 +801,10 @@ final class OverlayCenter {
         let timer = Timer(timeInterval: SystemMenuCatalog.confirmHoldSeconds, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.powerOKHeld, self.powerConfirmingID == choice.id else { return }
-                self.confirmPowerChoice(choice, generation: token, inputGeneration: inputToken)
+                guard self.active == .computerPower, self.powerGeneration == token,
+                      self.engine?.inputGeneration == inputToken, self.powerMenu.selection.id == choice.id,
+                      self.powerMenu.selectedCommand == command else { return }
+                self.handlePowerEffect(self.powerMenu.handle(.ok))
             }
         }
         powerConfirmTimer = timer

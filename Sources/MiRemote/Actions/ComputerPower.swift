@@ -178,6 +178,23 @@ struct PowerMenuState {
     private(set) var isOpen = false
     private(set) var isExecuting = false
     private(set) var error: String?
+    enum AppOption { case open, quit }
+    private(set) var appOption: AppOption?
+    private(set) var canQuitSelectedApp = false
+
+    mutating func showAppOptions(running: Bool) {
+        guard isOpen, !isExecuting, case .launchApp = selection.command else { return }
+        canQuitSelectedApp = running
+        appOption = .open
+    }
+
+    var selectedCommand: Command? {
+        if appOption == .quit, case .launchApp(let id) = selection.command {
+            return .quitApp(bundleID: id)
+        }
+        return selection.command
+    }
+
     private var executingCommand: Command?
     private var preferredPosition = 0.5 / Double(appColumns)
 
@@ -202,6 +219,7 @@ struct PowerMenuState {
     mutating func open(choices: [Choice] = [.sleep, .shutDown, .cancel]) {
         var ids: Set<String> = [Choice.cancel.id]
         self.choices = choices.filter { ids.insert($0.id).inserted } + [.cancel]
+        appOption = nil
         selection = .cancel
         preferredPosition = 0.5 / Double(Self.appColumns)
         isOpen = true
@@ -216,6 +234,7 @@ struct PowerMenuState {
     }
 
     mutating func close() {
+        appOption = nil
         isOpen = false
         isExecuting = false
         executingCommand = nil
@@ -224,6 +243,17 @@ struct PowerMenuState {
 
     mutating func handle(_ key: RemoteKey) -> Effect {
         guard isOpen else { return .none }
+        if appOption != nil, !isExecuting {
+            switch key {
+            case .back, .menu: appOption = nil
+            case .up, .left: appOption = .open
+            case .down, .right: if canQuitSelectedApp { appOption = .quit }
+            case .ok: return activateSelection()
+            case .home, .power, .tv: close(); return .dismiss
+            default: break
+            }
+            return .none
+        }
         if [.back, .power, .home, .tv, .menu].contains(key) {
             close()
             return .dismiss
@@ -269,6 +299,7 @@ struct PowerMenuState {
     }
 
     private mutating func updateSelection(_ choice: Choice) {
+        appOption = nil
         selection = choice
         error = nil
         if let row = visualRows.first(where: { $0.choices.contains { $0.id == choice.id } }),
@@ -320,10 +351,11 @@ struct PowerMenuState {
 
     private mutating func activateSelection() -> Effect {
         guard !selection.disabled else { return .none }
-        guard let command = selection.command else {
+        guard let command = selectedCommand else {
             close()
             return .dismiss
         }
+        appOption = nil
         isExecuting = true
         executingCommand = command
         error = nil
@@ -352,6 +384,15 @@ struct PowerMenuState {
             Choice(id: "\(section).\(index)", title: "\(index)", symbol: "app", section: section,
                    command: .systemAction("action.\(index)"), disabled: disabled)
         }
+        var options = Self()
+        let target = Choice(id: "one", title: "One", symbol: "app", section: "Apps", command: .launchApp(bundleID: "one"))
+        options.open(choices: [target])
+        options.showAppOptions(running: false)
+        guard options.handle(.down) == .none, options.appOption == .open,
+              options.handle(.back) == .none, options.selection == target, options.isOpen else { return false }
+        options.showAppOptions(running: true)
+        guard options.handle(.down) == .none, options.selectedCommand == .quitApp(bundleID: "one"),
+              options.handle(.ok) == .execute(.quitApp(bundleID: "one")) else { return false }
         let apps = (0..<13).map {
             Choice(id: "app.\($0)", title: "App \($0)", symbol: "app", section: "软件",
                    command: .launchApp(bundleID: "app.\($0)"), disabled: $0 == 1)

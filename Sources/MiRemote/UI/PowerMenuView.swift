@@ -1,6 +1,13 @@
 import SwiftUI
 
 /// A single expanded surface. Grid columns are shared with remote navigation.
+private struct SelectedAppAnchor: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? { nil }
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        if let next = nextValue() { value = next }
+    }
+}
+
 struct PowerMenuView: View {
     let state: PowerMenuState
     let onSelect: (PowerMenuState.Choice) -> Void
@@ -72,6 +79,7 @@ struct PowerMenuView: View {
                     }
                     .padding(.horizontal, 2).padding(.vertical, 2)
                 }
+                .allowsHitTesting(state.appOption == nil)
                 .scrollIndicators(.automatic)
                 .onChange(of: state.selection.id) { _, id in
                     guard contentHeight > bodyHeight else { return }
@@ -81,12 +89,39 @@ struct PowerMenuView: View {
             .frame(height: bodyHeight + 4)
             footer.frame(height: 26)
         }
+        .overlayPreferenceValue(SelectedAppAnchor.self) { anchor in
+            if let anchor, let option = state.appOption {
+                GeometryReader { geometry in
+                    let rect = geometry[anchor]
+                    let width: CGFloat = 180
+                    let x = rect.maxX + width + 8 <= geometry.size.width
+                        ? rect.maxX + 8 : rect.minX - width - 8
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(state.selection.title).font(.headline).lineLimit(1).padding(6)
+                        optionRow(state.canQuitSelectedApp ? "切换到 App" : "打开 App", symbol: "arrow.up.forward.app", selected: option == .open)
+                        optionRow(state.canQuitSelectedApp ? "退出 App · 长按 OK" : "退出 App · 未运行", symbol: "rectangle.portrait.and.arrow.right", selected: option == .quit)
+                            .opacity(state.canQuitSelectedApp ? 1 : 0.45)
+                    }
+                    .padding(8).frame(width: width)
+                    .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.18)))
+                    .shadow(radius: 8).offset(x: max(0, x), y: max(0, min(rect.minY, geometry.size.height - 132)))
+                    .allowsHitTesting(false)
+                }
+            }
+        }
         .padding(24)
         .frame(width: panelWidth)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
         .overlay(RoundedRectangle(cornerRadius: 24)
             .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1))
         .shadow(color: .black.opacity(0.22), radius: 28, y: 12)
+    }
+
+    private func optionRow(_ title: String, symbol: String, selected: Bool) -> some View {
+        Label(title, systemImage: symbol).font(.callout).padding(7)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Color.accentColor.opacity(0.22) : .clear, in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var header: some View {
@@ -136,6 +171,9 @@ struct PowerMenuView: View {
                     appIcon: appIcon(for: choice), onSelect: { onSelect(choice) },
                     onFocus: { onFocus(choice) }, onConfirmed: { onConfirmed(choice) },
                     width: width, appIsRunning: running(choice), confirmationEpoch: confirmationEpoch)
+                    .anchorPreference(key: SelectedAppAnchor.self, value: .bounds) {
+                        state.selection.id == choice.id && state.appOption != nil ? $0 : nil
+                    }
                     .id(choice.id)
             }
         }
@@ -160,10 +198,12 @@ struct PowerMenuView: View {
     }
 
     private var detailText: String {
+        if state.appOption != nil { return "上下选择操作，返回收起菜单。" }
         if let error = state.error { return error }
         if state.isExecuting { return "正在请求\(state.selection.title)…" }
         if state.selection.id == "cancel" { return "按返回关闭，或用方向键继续选择。" }
         if state.selection.section == "小米电视", let televisionStatus { return televisionStatus }
+        if isApp(state.selection) { return "OK 打开或切换  ·  菜单键查看软件选项" }
         return state.selection.detail ?? "\(state.selection.title)"
     }
     private func rows(in section: PowerMenuState.Section) -> Int {

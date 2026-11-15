@@ -25,6 +25,9 @@ enum PowerMenuPreview {
         if let section = ProcessInfo.processInfo.environment["MIREMOTE_PREVIEW_SECTION"] {
             state.focusSection(section)
         }
+        if ProcessInfo.processInfo.environment["MIREMOTE_PREVIEW_APP_OPTIONS"] == "1" {
+            state.showAppOptions(running: true)
+        }
         let compact = ProcessInfo.processInfo.environment["MIREMOTE_PREVIEW_COMPACT"] == "1"
         let view = PowerMenuView(state: state, onSelect: { _ in }, favoriteApps: apps,
                                 runningAppIDs: running,

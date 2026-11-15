@@ -35,7 +35,7 @@ struct MenuFavoriteAppsSettingsView: View {
                 }
             }
 
-            Text(custom ? "最多选择 6 个 App；取消全部选择可隐藏常用区。" : "默认显示 Dock 中固定的 App，最多 6 个。")
+            Text(custom ? "最多收藏 6 个 App；已运行的软件始终显示在前。" : "收藏默认跟随 Dock，最多 6 个；已运行的软件显示在前。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

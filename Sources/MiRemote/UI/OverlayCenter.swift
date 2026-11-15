@@ -139,6 +139,7 @@ final class OverlayUIState: ObservableObject {
     @Published var menuIndex = 0
     @Published var menuConfirming = false
     @Published var menuApps: [DockApplications.Entry] = []
+    @Published var runningControlAppIDs: Set<String> = []
     @Published var wheelEntries: [AppWheelView.Entry] = []
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
@@ -218,6 +219,7 @@ final class OverlayCenter {
     // 系统功能菜单状态
     private var menuIndex = 0
     private var menuApps: [DockApplications.Entry] = []
+    private var runningControlAppIDs: Set<String> = []
     // App 轮盘状态（停留式，DESIGN §3.1b：TV 长按弹出后松手停留，3s 无操作自动关）
     private var wheelApps: [NSRunningApplication] = []
     private var wheelIndex = 0
@@ -772,13 +774,6 @@ final class OverlayCenter {
         sync()
     }
 
-    private func focusPowerSection(_ section: String) {
-        guard active == .computerPower else { return }
-        cancelPowerConfirmation(refresh: false)
-        powerMenu.focusSection(section)
-        sync()
-    }
-
     private func confirmPowerChoice(_ choice: PowerMenuState.Choice, generation: UInt64, inputGeneration: UInt64) {
         guard active == .computerPower, powerGeneration == generation,
               (engine?.inputGeneration ?? 0) == inputGeneration,
@@ -814,20 +809,45 @@ final class OverlayCenter {
 
     /// Input loss must abort holds even if the physical keyUp never arrives.
     func invalidateInputConfirmation() {
+        let wasConfirming = powerConfirmingID != nil || confirmingIndex != nil || powerOKHeld
         powerOKHeld = false
         cancelPowerConfirmation(refresh: false)
         cancelConfirm(refresh: false)
         stopRepeat()
-        if active == .computerPower, !powerMenu.isExecuting { powerMenu.focus(.cancel) }
+        if wasConfirming, active == .computerPower, !powerMenu.isExecuting { powerMenu.focus(.cancel) }
         sync(animated: false)
     }
 
     private func reloadControlApplications() {
-        let apps: [DockApplications.Entry]
-        if let ids = model?.config.menuFavoriteApps { apps = ids.compactMap { DockApplications.resolve($0) } }
-        else { apps = DockApplications.pinned() }
-        var ids = Set<String>()
-        menuApps = Array(apps.filter { ids.insert($0.id).inserted }.prefix(6))
+        let ownID = Bundle.main.bundleIdentifier
+        let running = NSWorkspace.shared.runningApplications.filter {
+            !$0.isTerminated && $0.activationPolicy == .regular
+                && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+                && $0.bundleIdentifier?.caseInsensitiveCompare(ownID ?? "") != .orderedSame
+                && $0.bundleIdentifier != nil && $0.bundleURL != nil
+        }
+        let recent = services?.keyMapper?.mruExternalApplications ?? []
+        let orderedRunning = recent + running.sorted {
+            ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending
+        }
+        let allowedPIDs = Set(running.map(\.processIdentifier))
+        var entries: [String: DockApplications.Entry] = [:]
+        var runningIDs: [String] = []
+        for app in orderedRunning where allowedPIDs.contains(app.processIdentifier) {
+            guard let id = app.bundleIdentifier, let url = app.bundleURL, entries[id.lowercased()] == nil else { continue }
+            runningIDs.append(id)
+            entries[id.lowercased()] = DockApplications.Entry(id: id,
+                name: app.localizedName ?? url.deletingPathExtension().lastPathComponent,
+                url: url, icon: NSWorkspace.shared.icon(forFile: url.path))
+        }
+        let availableFavorites: [DockApplications.Entry]
+        if let ids = model?.config.menuFavoriteApps { availableFavorites = ids.compactMap { DockApplications.resolve($0) } }
+        else { availableFavorites = Array(DockApplications.pinned().prefix(6)) }
+        let favorites = availableFavorites.filter { $0.id.caseInsensitiveCompare(ownID ?? "") != .orderedSame }
+        for entry in favorites where entries[entry.id.lowercased()] == nil { entries[entry.id.lowercased()] = entry }
+        menuApps = PowerMenuCatalog.orderedAppIDs(running: runningIDs, favorites: favorites.map(\.id))
+            .compactMap { entries[$0.lowercased()] }
+        runningControlAppIDs = Set(runningIDs.map { $0.lowercased() })
     }
 
     private func handleTelevisionPowerKey(_ key: RemoteKey) {
@@ -895,7 +915,7 @@ final class OverlayCenter {
     private func handlePowerEffect(_ effect: PowerMenuState.Effect) {
         switch effect {
         case .none:
-            sync()
+            sync(animated: false)
         case .dismiss:
             close()
         case .execute(let command):
@@ -979,6 +999,7 @@ final class OverlayCenter {
             uiState.menuIndex = menuIndex
             uiState.menuConfirming = confirmingIndex != nil
             uiState.menuApps = menuApps
+            uiState.runningControlAppIDs = runningControlAppIDs
             uiState.wheelEntries = wheelApps.map {
                 AppWheelView.Entry(name: $0.localizedName ?? $0.bundleIdentifier ?? "App",
                                    bundleID: $0.bundleIdentifier)
@@ -1019,7 +1040,6 @@ final class OverlayCenter {
             onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) },
             onPowerSelect: { [weak self] in self?.selectPowerChoice($0) },
             onPowerFocus: { [weak self] in self?.focusPowerChoice($0) },
-            onPowerSection: { [weak self] in self?.focusPowerSection($0) },
             onPowerConfirmed: { [weak self] in self?.confirmPowerChoice($0, generation: $1, inputGeneration: $2) }))
         panel = p
         return p
@@ -1412,7 +1432,6 @@ private struct OverlayRootView: View {
     let onMenuActivate: (Int) -> Void
     let onPowerSelect: (PowerMenuState.Choice) -> Void
     let onPowerFocus: (PowerMenuState.Choice) -> Void
-    let onPowerSection: (String) -> Void
     let onPowerConfirmed: (PowerMenuState.Choice, UInt64, UInt64) -> Void
 
     private var visible: Bool { state.kind != nil }
@@ -1443,9 +1462,9 @@ private struct OverlayRootView: View {
                     let inputGeneration = state.confirmationInputGeneration
                     PowerMenuView(state: state.powerMenu, onSelect: onPowerSelect,
                         televisionStatus: state.televisionPowerStatus, favoriteApps: state.menuApps,
-                        onFocus: onPowerFocus, onFocusSection: onPowerSection,
+                        runningAppIDs: state.runningControlAppIDs, onFocus: onPowerFocus,
                         onConfirmed: { choice in onPowerConfirmed(choice, generation, inputGeneration) },
-                        confirmingID: state.powerConfirmingID)
+                        confirmingID: state.powerConfirmingID, confirmationEpoch: inputGeneration)
                 default:
                     EmptyView()
                 }

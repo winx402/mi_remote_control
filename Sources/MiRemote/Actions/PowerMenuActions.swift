@@ -1,11 +1,21 @@
 import AppKit
 
 enum PowerMenuCatalog {
+    /// 运行中 App 优先，收藏补齐；保留首个 ID 的大小写并稳定去重，不限制运行数量。
+    static func orderedAppIDs(running: [String], favorites: [String]) -> [String] {
+        var seen: Set<String> = []
+        return (running + favorites).compactMap { rawID in
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, seen.insert(id.lowercased()).inserted else { return nil }
+            return id
+        }
+    }
+
     static func choices(televisionConfigured: Bool, currentAppName: String?, douyinRunning: Bool,
                         apps: [(id: String, title: String)] = []) -> [PowerMenuState.Choice] {
         typealias Item = PowerMenuState.Choice
         let unavailable = televisionConfigured ? nil : "请先在通用设置中配置电视。"
-        var result = apps.prefix(6).map { app in
+        var result = apps.map { app in
             Item(id: "launch.\(app.id)", title: app.title, symbol: "app", section: "常用 App",
                  detail: "打开或切换到\(app.title)。", command: .launchApp(bundleID: app.id))
         }
@@ -53,7 +63,21 @@ enum PowerMenuCatalog {
     static func selfCheck() -> Bool {
         let configured = choices(televisionConfigured: true, currentAppName: "测试 App", douyinRunning: true)
         let unavailable = choices(televisionConfigured: false, currentAppName: nil, douyinRunning: false)
-        return Set(configured.map(\.id)).count == configured.count
+        let appList = (0..<23).map { (id: "example.app.\($0)", title: "App \($0)") }
+        let withApps = choices(televisionConfigured: true, currentAppName: nil, douyinRunning: false,
+                               apps: appList)
+        let launchChoices = withApps.filter { $0.command?.isAppLaunch == true }
+        let runningIDs = (0..<23).map { "running.\($0)" }
+        return orderedAppIDs(running: ["", "  ", "App.A", "app.a", " App.B "],
+                             favorites: ["APP.B", "app.C", "", "APP.A", "app.c"]) == ["App.A", "App.B", "app.C"]
+            && orderedAppIDs(running: runningIDs, favorites: ["RUNNING.0", "favorite"]) == runningIDs + ["favorite"]
+            && orderedAppIDs(running: [], favorites: []) == []
+            && launchChoices.count == appList.count
+            && launchChoices.map(\.id) == appList.map { "launch.\($0.id)" }
+            && Array(withApps.prefix(appList.count)) == launchChoices
+            && launchChoices.map(\.command) == appList.map { .launchApp(bundleID: $0.id) }
+            && Array(withApps.dropFirst(appList.count)).map(\.id) == configured.map(\.id)
+            && Set(configured.map(\.id)).count == configured.count
             && configured.filter { $0.section == "小米电视" }.allSatisfy { !$0.disabled }
             && unavailable.filter { $0.section == "小米电视" || $0.id == "apps.current" || $0.id == "apps.douyin" }.allSatisfy(\.disabled)
             && configured.contains { $0.command == .computer(.shutDown) && $0.title.contains("Mac") }

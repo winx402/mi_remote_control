@@ -1,7 +1,10 @@
 import SwiftUI
 
-/// 危险卡的短按只聚焦；手势与遥控计时都仅反馈到同一个明确确认入口。
+/// Applications use an icon tile; commands use a compact horizontal button.
+/// Both pointer and remote confirmation still use the same guarded action exit.
 struct PowerMenuActionCard: View {
+    static let applicationHeight: CGFloat = 64
+    static let commandHeight: CGFloat = 40
     let choice: PowerMenuState.Choice
     let selected: Bool
     let executing: Bool
@@ -11,94 +14,121 @@ struct PowerMenuActionCard: View {
     let onFocus: () -> Void
     let onConfirmed: () -> Void
     var width: CGFloat = 142
+    var appIsRunning = false
+    var confirmationEpoch: UInt64 = 0
 
     @State private var mousePressing = false
     @State private var holdStarted: Date?
-
+    @State private var pressedConfirmation: (() -> Void)?
     private var needsConfirmation: Bool { choice.command?.requiresHoldConfirmation == true }
     private var tint: Color { needsConfirmation ? .red : .accentColor }
     private var holding: Bool { confirming || mousePressing }
+    private var isApp: Bool {
+        if case .launchApp = choice.command { return true }
+        return false
+    }
 
-    @ViewBuilder
-    var body: some View {
+    @ViewBuilder var body: some View {
         if needsConfirmation {
-            button
-                .onLongPressGesture(minimumDuration: 0.6, maximumDistance: 12,
-                                    pressing: { pressing in
+            button.onLongPressGesture(minimumDuration: 0.6, maximumDistance: 12,
+                pressing: { pressing in
                     guard !choice.disabled, !executing else { return }
                     mousePressing = pressing
-                    if pressing { onFocus() }
+                    if pressing {
+                        // Keep the callback containing the menu/input generations
+                        // from pointer-down, never a newer SwiftUI render's token.
+                        pressedConfirmation = onConfirmed
+                        onFocus()
+                    }
                 }, perform: {
-                    guard !choice.disabled, !executing else { return }
-                    onConfirmed()
+                    guard !choice.disabled, !executing, let confirm = pressedConfirmation else { return }
+                    pressedConfirmation = nil
+                    confirm()
                 })
                 .onChange(of: holding, initial: true) { _, active in holdStarted = active ? Date() : nil }
+                .onChange(of: confirmationEpoch) { _, _ in cancelPointerHold() }
+                .onChange(of: selected) { _, active in if !active { cancelPointerHold() } }
                 .onChange(of: executing) { _, active in
-                    if active { mousePressing = false; holdStarted = nil }
+                    if active { cancelPointerHold() }
                 }
-        } else {
-            button
-        }
+                .onDisappear { cancelPointerHold() }
+        } else { button }
+    }
+    private func cancelPointerHold() {
+        pressedConfirmation = nil
+        mousePressing = false
+        holdStarted = nil
     }
 
     private var button: some View {
         Button {
             if needsConfirmation { onFocus() } else { onSelect() }
         } label: {
-            VStack(spacing: 10) {
-                icon
-                Text(choice.title)
-                    .font(.callout.weight(selected ? .semibold : .medium))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .frame(height: 36)
-                Text(choice.disabled ? "不可用" : needsConfirmation ? (holding ? "继续按住…" : "按住确认") : "按 OK 执行")
-                    .font(.caption2)
-                    .foregroundStyle(needsConfirmation ? tint : .secondary)
+            Group {
+                if isApp {
+                    VStack(spacing: 6) {
+                        ZStack(alignment: .bottomTrailing) {
+                            if let appIcon {
+                                Image(nsImage: appIcon).resizable().interpolation(.high)
+                                    .scaledToFit().frame(width: 36, height: 36)
+                            } else { Image(systemName: "app").font(.system(size: 30)) }
+                            if appIsRunning {
+                                Circle().fill(.green).frame(width: 7, height: 7)
+                                    .overlay(Circle().stroke(Color(nsColor: .controlBackgroundColor), lineWidth: 1.5))
+                                    .offset(x: 2, y: 1)
+                            }
+                        }
+                        Text(choice.title).font(.system(size: 12, weight: selected ? .semibold : .medium))
+                            .lineLimit(1).frame(maxWidth: .infinity)
+                    }
+                    .padding(.horizontal, 5)
+                } else {
+                    HStack(spacing: 8) {
+                        commandIcon
+                        Text(choice.title).font(.system(size: 12, weight: selected ? .semibold : .medium))
+                            .lineLimit(1).minimumScaleFactor(0.9)
+                        Spacer(minLength: 0)
+                        if needsConfirmation {
+                            Image(systemName: "hand.tap").font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
             }
-            .foregroundStyle(choice.disabled ? Color.secondary : needsConfirmation ? tint : .primary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 14)
-            .frame(width: width, height: 156)
-            .contentShape(RoundedRectangle(cornerRadius: Radius.card))
-            .background(selected ? tint.opacity(0.13) : Color.primary.opacity(0.04),
-                        in: RoundedRectangle(cornerRadius: Radius.card))
-            .overlay(RoundedRectangle(cornerRadius: Radius.card)
-                .stroke(selected ? tint : Color.primary.opacity(0.1), lineWidth: selected ? 2 : 1))
-            .opacity(choice.disabled ? 0.45 : 1)
+            .frame(width: width, height: isApp ? Self.applicationHeight : Self.commandHeight)
+            .foregroundStyle(choice.disabled ? Color.secondary : .primary)
+            .contentShape(RoundedRectangle(cornerRadius: isApp ? 12 : 10))
+            .background(selected ? tint.opacity(0.14) : Color.primary.opacity(isApp ? 0.025 : 0.045),
+                        in: RoundedRectangle(cornerRadius: isApp ? 12 : 10))
+            .overlay(RoundedRectangle(cornerRadius: isApp ? 12 : 10)
+                .strokeBorder(selected ? tint : Color.primary.opacity(0.045), lineWidth: selected ? 2 : 1))
+            .opacity(choice.disabled ? 0.4 : 1)
         }
-        .buttonStyle(.plain)
-        .disabled(choice.disabled || executing)
+        .buttonStyle(.plain).disabled(choice.disabled || executing)
         .help(accessibilityDetail)
         .accessibilityElement(children: .combine)
         .accessibilityHint(accessibilityDetail)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
-    private var icon: some View {
+    private var commandIcon: some View {
         ZStack {
-            if let appIcon {
-                Image(nsImage: appIcon).resizable().interpolation(.high)
-                    .scaledToFit().frame(width: 46, height: 46)
-            } else {
-                Circle().fill(tint.opacity(selected ? 0.1 : 0.06)).frame(width: 48, height: 48)
-                Image(systemName: choice.symbol).font(.system(size: 24, weight: .regular))
-            }
+            Image(systemName: choice.symbol).font(.system(size: 16, weight: .medium))
+                .foregroundStyle(needsConfirmation ? Color.red.opacity(0.85) : Color.accentColor)
             if holding {
                 TimelineView(.animation(minimumInterval: 1.0 / 30)) { timeline in
                     let progress = min(1, max(0, timeline.date.timeIntervalSince(holdStarted ?? timeline.date) / 0.6))
                     Circle().trim(from: 0, to: progress)
-                        .stroke(tint, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                        .frame(width: 56, height: 56)
+                        .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(-90)).frame(width: 28, height: 28)
                 }
             }
-        }
-        .frame(height: 52)
+        }.frame(width: 22, height: 28)
     }
-
     private var accessibilityDetail: String {
         let detail = choice.detail ?? choice.title
-        return needsConfirmation ? "\(detail) 按住 0.6 秒确认。" : detail
+        if needsConfirmation { return "\(detail) 按住 0.6 秒确认。" }
+        return appIsRunning ? "已运行。\(detail)" : detail
     }
 }

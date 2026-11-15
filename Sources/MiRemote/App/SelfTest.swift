@@ -241,7 +241,7 @@ enum SelfTest {
         expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
-        expect(PowerMenuState.selfCheck(), "电源菜单默认取消、明确确认才执行（假执行器）")
+        expect(PowerMenuState.selfCheck(), "控制中心默认软件焦点、网格导航与明确确认（假执行器）")
         expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
         expect(TelevisionPowerMenuState.selfCheck(), "电视原生关机确认、异常回执与取消导航（无真实操作）")
         expect(ATVVReconnectPlan.selfCheck(), "ATVV 重连窗口合并、一次已知尝试、停止与旧代隔离")

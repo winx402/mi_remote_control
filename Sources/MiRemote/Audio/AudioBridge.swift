@@ -285,6 +285,11 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
         )
         var created: AudioQueueRef?
         let token = generation
+        let began = DispatchTime.now().uptimeNanoseconds
+        func logStartup(_ stage: String) {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000_000
+            NSLog("[AudioBridge] startup stage=%@ elapsed=%.3fs device=%@", stage, elapsed, deviceName ?? "default")
+        }
         do {
             try check(AudioQueueNewOutputWithDispatchQueue(&created, &format, 0, stateQueue) { [weak self] queue, buffer in
                 self?.refill(queue, buffer, generation: token)
@@ -293,6 +298,7 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
                 throw NSError(domain: "AudioBridge", code: -1,
                               userInfo: [NSLocalizedDescriptionKey: "未创建播放队列"])
             }
+            logStartup("created")
             if let name = deviceName {
                 if let device = CoreAudioDevices.findOutputDevice(namePrefix: name) {
                     var address = AudioObjectPropertyAddress(
@@ -319,6 +325,7 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
                 throw NSError(domain: "AudioBridge", code: -3,
                               userInfo: [NSLocalizedDescriptionKey: "严格设备模式必须指定输出设备"])
             }
+            logStartup("device-bound")
             // Exactly source-rate frames: never label 16k PCM as 48k (which plays only 1/3 as long).
             let bytes = UInt32((sourceSampleRate * 0.02).rounded(.up)) * UInt32(MemoryLayout<Float>.size)
             for _ in 0..<3 {
@@ -335,6 +342,7 @@ final class AudioBridge: PCMSink, @unchecked Sendable {
             audioQueue = queue
             try check(AudioQueueStart(queue, nil), "启动播放")
             accepting = true
+            logStartup("running")
             onReady?(true)
         } catch {
             audioQueue = nil

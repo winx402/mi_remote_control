@@ -220,7 +220,15 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
             defer { if direction { Self.pendingCodexDirection.withLock { $0 = false } } }
             guard current(), issued.duration(to: .now) < .milliseconds(500) else { return }
             if name == "codex_context_submit", CodexDictation.isActive {
-                CodexNavigation.showNotice("请再按一次语音键结束输入，然后长按 OK 发送。")
+                CodexNavigation.showNotice("请先结束听写，等文字出现在输入框后再长按 OK 发送。")
+                return
+            }
+            if name == "codex_context_focus" {
+                CodexConversationControls.cycleInputTarget(isCurrent: current)
+                return
+            }
+            if name == "codex_context_voice_start" {
+                CodexDictation.beginPhysicalHold()
                 return
             }
             if name == CodexDictation.actionName {
@@ -233,7 +241,14 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
 
     private func system(_ name: String) {
         switch name {
-        case "codex_context_up", "codex_context_down", "codex_context_left", "codex_context_right",
+        case "codex_context_voice_cancel":
+            DispatchQueue.main.async { CodexDictation.shutdown() }
+            return
+        case "codex_context_voice_end":
+            // Release must reach the same FIFO main queue even after context invalidation.
+            DispatchQueue.main.async { CodexDictation.endPhysicalHold() }
+            return
+        case "codex_context_focus", "codex_context_voice_start", "codex_context_up", "codex_context_down", "codex_context_left", "codex_context_right",
              "codex_context_ok", "codex_context_submit", "codex_context_dictate":
             dispatchCodexControl(name)
             return

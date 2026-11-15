@@ -56,10 +56,11 @@
       "voice": {
         "tap": {
           "type": "system",
-          "value": "codex_context_dictate"
+          "value": "codex_context_focus"
         },
         "hold": {
-          "type": "voice"
+          "type": "system",
+          "value": "codex_context_voice_start"
         }
       }
     }

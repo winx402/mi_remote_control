@@ -26,6 +26,12 @@ final class IndependentGestures {
 
     func isTracking(_ key: RemoteKey) -> Bool { states[key] != nil }
 
+    /// Revoke one local press without disturbing unrelated global gestures.
+    func cancel(_ key: RemoteKey) {
+        serial &+= 1
+        states.removeValue(forKey: key)
+    }
+
     func handle(_ event: ButtonEvent, policy: Policy) {
         let key = event.key
         if event.isDown {

@@ -180,13 +180,13 @@ enum Presets {
     static let codexContextActions: [RemoteKey: Action] = [
         .up: .system("codex_context_up"), .down: .system("codex_context_down"),
         .left: .system("codex_context_left"), .right: .system("codex_context_right"),
-        .ok: .system("codex_context_ok"), .voice: .system("codex_context_dictate"),
+        .ok: .system("codex_context_ok"), .voice: .system("codex_context_focus"),
     ]
 
     static let codexDesktop = Preset(
         id: "ai_codex_desktop",
         displayName: "Codex 桌面版",
-        note: "上下按当前区域浏览，左右调整当前控件；OK=选择/进入输入，长按OK=发送一次；菜单=会话列表，语音短按=输入框听写，返回=Esc。",
+        note: "上下按当前区域浏览，左右调整当前控件；OK=选择/进入输入，长按OK=发送一次；菜单=会话列表，语音短按=聚焦输入框，按住=说话、松手=结束，返回=Esc。",
         bundleID: "com.openai.codex",
         bindings: [
             "up": KeyBinding(tap: .system("codex_context_up"), overrideBase: true),
@@ -196,7 +196,7 @@ enum Presets {
             "ok": KeyBinding(tap: .system("codex_context_ok"), hold: .system("codex_context_submit")),
             "back": KeyBinding(tap: ks("escape"), overrideBase: true),
             "menu": KeyBinding(tap: .overlay("codex_sessions")),
-            "voice": KeyBinding(tap: .system("codex_context_dictate"), hold: .voice),
+            "voice": KeyBinding(tap: .system("codex_context_focus"), hold: .system("codex_context_voice_start")),
         ]
     )
 
@@ -453,6 +453,7 @@ enum Presets {
         let bindings = codexDesktop.bindings
         guard codexContextActions.allSatisfy({ key, action in bindings[key.rawValue]?.tap == action }),
               bindings["ok"]?.hold == .system("codex_context_submit"),
+              bindings["voice"]?.hold == .system("codex_context_voice_start"),
               bindings["menu"]?.tap == .overlay("codex_sessions"),
               bindings["back"]?.overrideBase == true,
               bindings["back"]?.tap == .keyStroke(key: "escape", mods: []),

@@ -410,7 +410,8 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.dockNavigation.engine = km.engine
             km.engine.onInputReset = { [weak self] in
                 MainActor.assumeIsolated {
-                    CodexConversationControls.clearAnswer()
+                    if CodexDictation.isActive { CodexDictation.shutdown() }
+                    CodexConversationControls.resetInputTarget()
                     self?.overlayCenter?.invalidateInputConfirmation()
                 }
             }

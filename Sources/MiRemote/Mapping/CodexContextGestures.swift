@@ -2,9 +2,10 @@ import Foundation
 
 /// Explicit Codex context bindings use physical presses, never OS autorepeat.
 /// Only vertical navigation repeats; confirmation holds commit once and consume
-/// their release. Context changes retain held keys until their physical release.
+/// their release. Voice holds start at the threshold and end on release/reset.
+/// Context changes retain held keys until their physical release.
 final class CodexContextGestures {
-    private enum Phase { case down, consumed }
+    private enum Phase { case down, voiceHolding, consumed }
     private struct State {
         var phase: Phase
         var token: UInt64
@@ -14,6 +15,11 @@ final class CodexContextGestures {
     private let schedule: (Int, @escaping () -> Void) -> Void
     var onDirection: ((RemoteKey) -> Void)?
     var onConfirm: ((_ hold: Bool) -> Void)?
+    var onVoiceTap: (() -> Void)?
+    /// Return false if the context was revoked before the threshold.
+    var onVoiceStart: (() -> Bool)?
+    var onVoiceEnd: (() -> Void)?
+    var onVoiceCancel: (() -> Void)?
 
     init(schedule: @escaping (Int, @escaping () -> Void) -> Void) { self.schedule = schedule }
 
@@ -24,21 +30,29 @@ final class CodexContextGestures {
             serial &+= 1
             let token = serial
             states[key] = State(phase: .down, token: token)
-            if key == .ok {
+            if key == .ok || key == .voice {
                 schedule(max(1, holdMs)) { [weak self] in
                     guard let self, var state = self.states[key],
                           state.token == token, state.phase == .down else { return }
-                    state.phase = .consumed
-                    self.states[key] = state
-                    self.onConfirm?(true)
+                    if key == .voice {
+                        state.phase = self.onVoiceStart?() == true ? .voiceHolding : .consumed
+                        self.states[key] = state
+                    } else {
+                        state.phase = .consumed
+                        self.states[key] = state
+                        self.onConfirm?(true)
+                    }
                 }
             } else {
                 onDirection?(key)
                 if key == .up || key == .down { repeatDirection(key, token: token, delay: 350) }
             }
         } else {
-            guard let state = states.removeValue(forKey: key), state.phase == .down else { return }
+            guard let state = states.removeValue(forKey: key) else { return }
+            if state.phase == .voiceHolding { onVoiceEnd?(); return }
+            guard state.phase == .down else { return }
             if key == .ok { onConfirm?(false) }
+            if key == .voice { onVoiceTap?() }
         }
     }
 
@@ -57,8 +71,19 @@ final class CodexContextGestures {
         return true
     }
 
+    func cancelVoice() {
+        guard var state = states[.voice], state.phase != .consumed else { return }
+        let wasHolding = state.phase == .voiceHolding
+        serial &+= 1
+        state.phase = .consumed
+        state.token = serial
+        states[.voice] = state
+        if wasHolding { onVoiceCancel?() }
+    }
+
     func reset(preservePressed: Bool = true) {
         serial &+= 1
+        cancelVoice()
         if !preservePressed { states.removeAll(); return }
         for key in states.keys {
             states[key]?.phase = .consumed

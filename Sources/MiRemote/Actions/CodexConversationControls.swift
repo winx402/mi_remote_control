@@ -57,7 +57,7 @@ enum CodexConversationControls {
             MainActor.assumeIsolated {
                 guard let lastOption, CFEqual(lastOption, target) else { return }
                 guard sameWindow(snapshot), let bounds = frame(target), bounds.intersects(snapshot.window) else {
-                    clearAnswer()
+                    resetInputTarget()
                     return
                 }
                 if bounds != snapshot.nodes[index].rect {
@@ -73,6 +73,15 @@ enum CodexConversationControls {
         lastOption = nil
         lastFormRoot = nil
         answerHighlight.hide()
+    }
+
+    @MainActor private static var questionRoot: AXUIElement?
+    @MainActor private static var composerTarget: AXUIElement?
+
+    @MainActor static func resetInputTarget() {
+        questionRoot = nil
+        composerTarget = nil
+        clearAnswer()
     }
 
     @MainActor private static var lastOption: AXUIElement?
@@ -305,10 +314,15 @@ enum CodexConversationControls {
                 && live.contains { nodes[$0].role == "AXButton" && matches(nodes[$0], skipTitles) })
     }
 
-    private static func composer(_ nodes: [Node], window: CGRect) -> Int? {
-        guard !blocksChat(nodes), window.height > 0 else { return nil }
+    private static func composer(_ nodes: [Node], window: CGRect, outside form: Form? = nil) -> Int? {
+        guard window.height > 0, form != nil || !blocksChat(nodes) else { return nil }
+        let footerY = form.flatMap { card in
+            nodes.indices.filter { descendant($0, of: card.root, in: nodes) && matches(nodes[$0], skipTitles) }
+                .map { nodes[$0].rect.midY }.max()
+        }
         let candidates = nodes.indices.filter { index in
             let n = nodes[index]
+            if let form, descendant(index, of: form.root, in: nodes) || n.rect.midY < (footerY ?? nodes[form.root].rect.maxY) { return false }
             guard inputRoles.contains(n.role), n.editable, n.enabled, !historicallyInactive(index, in: nodes),
                   n.rect.width >= window.width * 0.25, n.rect.midY >= window.minY + window.height * 0.50,
                   !contains(n.label, ["search", "find", "filter", "terminal", "搜索", "查找", "过滤", "终端"]) else { return false }
@@ -342,9 +356,13 @@ enum CodexConversationControls {
         trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
         let scrolling = action == .up || action == .down
-        guard let snapshot = snapshot(budget: scrolling ? 0.16 : 0.65) else {
+        if scrolling && questionRoot == nil {
+            CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent)
+            return true
+        }
+        guard let snapshot = snapshot(budget: 0.65, preferForm: composerTarget == nil) else {
             // A large Chromium tree must not make normal wheel input unusable.
-            if scrolling && isCurrent() { fallbackScroll(action == .up, isCurrent: isCurrent) }
+            if scrolling && isCurrent() { resetInputTarget(); CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent) }
             else { unavailable("无法确认前台 Codex 的可用控件，本次未执行。") }
             return true
         }
@@ -356,11 +374,16 @@ enum CodexConversationControls {
         let numbers = snapshot.nodes.filter { optionNumber($0) != nil }.count
         trace.notice("nodes=\(snapshot.nodes.count) complete=\(snapshot.complete) heading=\(heading) skip=\(skip) custom=\(custom) numbers=\(numbers) options=\(recognized?.options.count ?? 0)")
         guard snapshot.complete else {
-            if scrolling && !blocksChat(snapshot.nodes) { fallbackScroll(action == .up, snapshot: snapshot, isCurrent: isCurrent) }
+            if scrolling { unavailable("未能读取当前问题框，请短按语音键切换输入位置。") }
             else if !scrolling { unavailable("当前控件信息不完整，本次未执行确认或输入。") }
             return true
         }
-        if let form = recognized {
+        if let target = questionRoot, recognized.map({ CFEqual(target, snapshot.elements[$0.root]) }) != true {
+            resetInputTarget()
+            if scrolling { CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent) }
+            return true
+        }
+        if let form = recognized, questionRoot != nil {
             switch action {
             case .up, .down:
                 let choices = form.options
@@ -403,12 +426,16 @@ enum CodexConversationControls {
         } else if lastOption != nil && action == .submit {
             clearAnswer()
             return true
+        } else if let target = composerTarget, let field = composer(snapshot.nodes, window: snapshot.window, outside: recognized),
+                  CFEqual(target, snapshot.elements[field]) {
+            if action == .submit { press(composerSend(field, nodes: snapshot.nodes), in: snapshot, isCurrent: isCurrent) }
+            if action == .ok { _ = focus(field, in: snapshot) }
         } else if blocksChat(snapshot.nodes) {
             clearAnswer()
             unavailable("当前弹层或提问控件尚未确认，请在 Codex 中检查。")
         } else {
             switch action {
-            case .up, .down: clearAnswer(); scroll(action == .up, snapshot: snapshot, isCurrent: isCurrent)
+            case .up, .down: CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent)
             case .ok:
                 if let field = composer(snapshot.nodes, window: snapshot.window) { _ = focus(field, in: snapshot) }
             case .submit:
@@ -429,23 +456,44 @@ enum CodexConversationControls {
         return form.fields.count == 1 ? form.fields[0] : nil
     }
 
-    @MainActor static func focusForDictation() -> Bool {
-        clearAnswer()
-        guard let snapshot = snapshot(), snapshot.complete else { return false }
-        if let form = activeForm(snapshot.nodes) {
-            if let field = preferredField(form, nodes: snapshot.nodes) { return focus(field, in: snapshot) }
-            let otherTitles: Set<String> = ["other", "something else", "type your own answer", "custom answer", "其他", "其它", "其他答案", "自定义答案", "自訂答案"]
-            let other = form.options.filter { matches(snapshot.nodes[$0], otherTitles) }
-            guard other.count == 1 else { return false }
-            select(other[0], in: snapshot)
-            // Selecting Other can reveal an editable field. A fresh AX projection is required;
-            // never dictate into the old chat composer while a question is active.
-            guard let updated = self.snapshot(), updated.complete, let currentForm = activeForm(updated.nodes),
-                  let field = preferredField(currentForm, nodes: updated.nodes) else { return false }
-            return focus(field, in: updated)
+    /// The microphone tap cycles the remote target. Previewing a question never
+    /// presses an answer. Only the existing long-OK path can submit it.
+    @MainActor static func cycleInputTarget(isCurrent: () -> Bool) {
+        guard isCurrent(), let first = snapshot(preferForm: questionRoot == nil),
+              first.complete, sameWindow(first), isCurrent() else { return }
+        let form = activeForm(first.nodes)
+        if let form, questionRoot.map({ CFEqual($0, first.elements[form.root]) }) != true {
+            composerTarget = nil
+            questionRoot = first.elements[form.root]
+            if let index = form.options.first {
+                previewAnswer(index, ordinal: 1, form: form, in: first)
+            } else if let field = preferredField(form, nodes: first.nodes) {
+                _ = focus(field, in: first)
+            }
+            return
         }
-        guard let field = composer(snapshot.nodes, window: snapshot.window) else { return false }
-        return focus(field, in: snapshot)
+        guard let field = composer(first.nodes, window: first.window, outside: form),
+              isCurrent(), focus(field, in: first) else {
+            unavailable("未找到可聚焦的对话输入框。")
+            return
+        }
+        resetInputTarget()
+        composerTarget = first.elements[field]
+    }
+
+    @MainActor static func focusForDictation() -> Bool {
+        guard let snapshot = snapshot(preferForm: questionRoot != nil), snapshot.complete else { return false }
+        let form = activeForm(snapshot.nodes)
+        if let target = questionRoot {
+            guard let form, CFEqual(target, snapshot.elements[form.root]),
+                  let field = preferredField(form, nodes: snapshot.nodes) else { return false }
+            clearAnswer()
+            return focus(field, in: snapshot)
+        }
+        guard let field = composer(snapshot.nodes, window: snapshot.window, outside: form),
+              focus(field, in: snapshot) else { return false }
+        composerTarget = snapshot.elements[field]
+        return true
     }
 
     @MainActor private static func unavailable(_ message: String) {
@@ -505,124 +553,9 @@ enum CodexConversationControls {
         return stillFrontmost(snapshot.pid) && bool(target, kAXFocusedAttribute as CFString) == true
     }
 
-    // MARK: - Ordinary pixel wheel, never keyboard arrows or AX page scrolling
-
-    @MainActor private static func scroll(_ up: Bool, snapshot: Snapshot, isCurrent: () -> Bool) {
-        let inputRects = snapshot.nodes.filter { $0.editable }.map(\.rect)
-        let scored = snapshot.nodes.indices.compactMap { index -> (Int, Int)? in
-            let n = snapshot.nodes[index]
-            guard ["AXScrollArea", "AXWebArea"].contains(n.role) else { return nil }
-            guard let score = CodexNavigation.scrollScore(.init(role: n.role, label: n.label, frame: n.rect,
-                windowFrame: snapshot.window, editableFrames: inputRects,
-                excludedContext: historicallyInactive(index, in: snapshot.nodes) || excludedScroll(index, nodes: snapshot.nodes),
-                hasScrollMechanism: n.role == "AXScrollArea" || actions(snapshot.elements[index]).contains("AXScrollDownByPage"))) else { return nil }
-            return (index, score)
-        }.sorted { $0.1 > $1.1 }
-        guard let target = scored.first, scored.count == 1 || target.1 - scored[1].1 >= 40 else {
-            fallbackScroll(up, snapshot: snapshot, isCurrent: isCurrent) ; return
-        }
-        let rect = snapshot.nodes[target.0].rect.intersection(snapshot.window)
-        for relative in [CGPoint(x: 0.65, y: 0.45), CGPoint(x: 0.45, y: 0.35), CGPoint(x: 0.75, y: 0.65)] {
-            let point = CGPoint(x: rect.minX + rect.width * relative.x, y: rect.minY + rect.height * relative.y)
-            guard sameWindow(snapshot), isCurrent() else { return }
-            var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(snapshot.app, Float(point.x), Float(point.y), &hit) == .success,
-                  var current = hit else { continue }
-            var safe = false
-            for _ in 0..<32 {
-                if CFEqual(current, snapshot.elements[target.0]) { safe = true ; break }
-                let role = string(current, kAXRoleAttribute as CFString) ?? ""
-                if inputRoles.contains(role) || ["AXSearchField", "AXScrollArea", "AXButton", "AXLink"].contains(role) { break }
-                guard let parent = element(current, kAXParentAttribute as CFString) else { break }
-                current = parent
-            }
-            guard safe, let original = CGEvent(source: nil)?.location,
-                  let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                                      wheel1: up ? 90 : -90, wheel2: 0, wheel3: 0), stillFrontmost(snapshot.pid) else { continue }
-            wheel.flags = []
-            wheel.location = point
-            guard CGWarpMouseCursorPosition(point) == .success else { return }
-            defer { CGWarpMouseCursorPosition(original) }
-            if sameWindow(snapshot), isCurrent() { wheel.postToPid(snapshot.pid) }
-            return
-        }
-        fallbackScroll(up, snapshot: snapshot, isCurrent: isCurrent)
-    }
-
-    /// No full-tree dependency: validate an unobstructed content hit and its ancestors.
-    /// Ambiguous editor/dialog hits quietly do nothing instead of producing repeated notices.
-    @MainActor private static func fallbackScroll(_ up: Bool, snapshot supplied: Snapshot? = nil, isCurrent: () -> Bool = { true }) {
-        let context: Snapshot
-        if let supplied { context = supplied }
-        else {
-            guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex",
-                  AXIsProcessTrusted() else { return }
-            let ax = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(ax, 0.025)
-            guard let win = element(ax, kAXFocusedWindowAttribute as CFString), let rect = frame(win) else { return }
-            context = Snapshot(pid: app.processIdentifier, app: ax, elements: [win],
-                               nodes: [Node(parent: nil, role: "AXWindow", rect: rect)], window: rect, complete: false)
-        }
-        guard sameWindow(context), isCurrent(), !blocksChat(context.nodes) else { return }
-        // Sheets and a focused modal block scrolling even if absent from a truncated walk.
-        if let win = context.elements.first,
-           let sheets = attribute(win, "AXSheets" as CFString) as? [AXUIElement], !sheets.isEmpty { return }
-        if let focused = element(context.app, kAXFocusedUIElementAttribute as CFString),
-           hitPathUnsafe(focused, pid: context.pid, allowInputAtLeaf: true) { return }
-        let rect = context.window
-        guard rect.width >= 350, rect.height >= 250 else { return }
-        for relative in [CGPoint(x: 0.70, y: 0.42), CGPoint(x: 0.62, y: 0.52)] {
-            let point = CGPoint(x: rect.minX + rect.width * relative.x, y: rect.minY + rect.height * relative.y)
-            var hit: AXUIElement?
-            guard stillFrontmost(context.pid),
-                  AXUIElementCopyElementAtPosition(context.app, Float(point.x), Float(point.y), &hit) == .success,
-                  let hit, !hitPathUnsafe(hit, pid: context.pid, allowInputAtLeaf: false),
-                  let wheel = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
-                                      wheel1: up ? 90 : -90, wheel2: 0, wheel3: 0),
-                  let original = CGEvent(source: nil)?.location, stillFrontmost(context.pid) else { continue }
-            wheel.flags = []
-            wheel.location = point
-            guard CGWarpMouseCursorPosition(point) == .success else { return }
-            defer { CGWarpMouseCursorPosition(original) }
-            if sameWindow(context), isCurrent() { wheel.postToPid(context.pid) }
-            return
-        }
-    }
-
-    private static func hitPathUnsafe(_ leaf: AXUIElement, pid: pid_t, allowInputAtLeaf: Bool) -> Bool {
-        var current = leaf
-        var content = false
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.12
-        for depth in 0..<24 {
-            guard ProcessInfo.processInfo.systemUptime < deadline else { return true }
-            var actualPID: pid_t = 0
-            guard AXUIElementGetPid(current, &actualPID) == .success, actualPID == pid else { return true }
-            let role = string(current, kAXRoleAttribute as CFString) ?? ""
-            let label = ["AXStaticText", "AXHeading"].contains(role) ? "" : metadata(current)
-            if ["AXDialog", "AXSheet", "AXMenu", "AXRadioGroup", "AXRadioButton", "AXCheckBox", "AXListBox"].contains(role)
-                || contains(label, formMarkers)
-                || (!allowInputAtLeaf && contains(label, ["sidebar", "side bar", "navigation", "history", "search", "terminal", "diff", "code editor", "侧栏", "侧边栏", "导航", "历史", "搜索", "终端", "差异", "編輯器"]))
-                || (!allowInputAtLeaf && (inputRoles.contains(role) || role == "AXSearchField"))
-                || (depth == 0 && !allowInputAtLeaf && ["AXButton", "AXLink"].contains(role)) { return true }
-            if ["AXWebArea", "AXScrollArea"].contains(role) { content = true }
-            if role == "AXWindow" { return !content && !allowInputAtLeaf }
-            guard let parent = element(current, kAXParentAttribute as CFString) else { return true }
-            current = parent
-        }
-        return true
-    }
-    private static func excludedScroll(_ index: Int, nodes: [Node]) -> Bool {
-        var current: Int? = index
-        while let value = current {
-            if contains(nodes[value].label, ["sidebar", "side bar", "navigation", "history", "composer", "search", "terminal", "diff", "侧栏", "侧边栏", "导航", "历史", "搜索", "输入", "終端"]) { return true }
-            current = nodes[value].parent
-        }
-        return false
-    }
-
     // MARK: - Bounded AX snapshot, with no text values
 
-    @MainActor private static func snapshot(budget: TimeInterval = 0.65) -> Snapshot? {
+    @MainActor private static func snapshot(budget: TimeInterval = 0.65, preferForm: Bool = true) -> Snapshot? {
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex",
               AXIsProcessTrusted() else { return nil }
         let ax = AXUIElementCreateApplication(app.processIdentifier)
@@ -638,7 +571,7 @@ enum CodexConversationControls {
         let deadline = ProcessInfo.processInfo.systemUptime + 0.35
         var visited = Set<AXUIElement>()
         let system = AXUIElementCreateSystemWide()
-        for (x, y) in [(0.40, 0.76), (0.55, 0.70), (0.68, 0.82)] {
+        for (x, y) in [(0.40, 0.76), (0.55, 0.70), (0.68, 0.82)] where preferForm {
             let point = CGPoint(x: windowRect.minX + windowRect.width * x,
                                 y: windowRect.minY + windowRect.height * y)
             var hit: AXUIElement?
@@ -660,7 +593,7 @@ enum CodexConversationControls {
         }
         guard let whole = project(ax, window: window, rect: windowRect, root: window,
                                   pid: app.processIdentifier, budget: budget) else { return nil }
-        if !whole.complete, let form = activeForm(whole.nodes),
+        if preferForm, !whole.complete, let form = activeForm(whole.nodes),
            let isolated = project(ax, window: window, rect: windowRect, root: whole.elements[form.root],
                                   pid: whole.pid, budget: 0.25),
            isolated.complete, activeForm(isolated.nodes) != nil { return isolated }
@@ -841,7 +774,7 @@ enum CodexConversationControls {
         guard activeForm(missingPlaceholder)?.options == [6, 9] else { return false }
         guard let screenshot = activeForm(card), screenshot.root == 2, screenshot.options == [6, 9],
               screenshot.fields == [11], screenshot.submit == nil, blocksChat(card),
-              composer(card, window: window) == nil else { return false }
+              composer(card, window: window) == nil, composer(card, window: window, outside: screenshot) == 16 else { return false }
         // Ordinary option buttons must win over their number text descendants.
         card[5].role = "AXButton"; card[5].pressable = true
         card[8].role = "AXButton"; card[8].pressable = true

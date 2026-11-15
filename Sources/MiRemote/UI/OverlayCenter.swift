@@ -1332,10 +1332,10 @@ enum HintBarCatalog {
     }
 
     static func hintsForCodex() -> [Hint] {
-        [Hint(keys: [.up, .down], text: "阅读对话／选择答案"),
+        [Hint(keys: [.up, .down], text: "滚动对话 · 问题框内选答案"),
          Hint(keys: [.left, .right], text: "切换题目"),
          Hint(keys: [.menu], text: "会话列表"),
-         Hint(keys: [.voice], text: "开始／结束听写"),
+         Hint(keys: [.voice], text: "短按切输入位置 · 按住说话"),
          Hint(keys: [.ok], text: "单击选择 · 长按发送")]
     }
 

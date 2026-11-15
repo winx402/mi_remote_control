@@ -3,14 +3,36 @@ import ApplicationServices
 import Carbon
 import CoreAudio
 
-/// Codex 专用的两按听写。这里只控制已配置的输入法／系统听写，绝不发送 Return。
-/// 遥控器松手后的持续 PCM 尚未验证，因此仅使用当前真实默认输入设备，不重开遥控器麦克风。
+/// Codex 听写：新预设按住遥控器说话、松手结束；旧两按动作保留兼容。
+/// 遥控器 PCM 直接本机识别，识别结果只写回原输入框，绝不发送 Return。
 enum CodexDictation {
     static let actionName = "codex_context_dictate"
     @MainActor static var onNotice: ((String) -> Void)?
     /// true 表示已投递开始动作；不能据此宣称第三方已经收音或成功识别。
     @MainActor static var onStateChanged: ((Bool) -> Void)?
     @MainActor private static var triggerConfig = VoiceTriggerConfig()
+    /// 服务容器同步打开／关闭遥控器 PCM 交付；映射引擎是长按判定的唯一来源。
+    @MainActor static var onPhysicalHoldState: ((Bool) -> Void)?
+    @MainActor private static var useRemoteMicrophone = true
+    @MainActor private static var inputEnabled = true
+    @MainActor private static var physicalHoldActive = false
+    @MainActor private static var remoteGeneration: UInt64 = 0
+    @MainActor private static var remoteSession: RemoteSession?
+    @MainActor private static var remoteTimer: Timer?
+    @MainActor private static var finalTimeout: Task<Void, Never>?
+
+    private struct RemoteTarget {
+        let pid: pid_t
+        let element: AXUIElement
+        let window: AXUIElement
+        let selection: CFRange?
+    }
+    private struct RemoteSession {
+        let target: RemoteTarget
+        let recognizer: RemoteSpeechTranscriber
+        var released = false
+        var finalText: String?
+    }
 
     private enum Route {
         case inputMethod(VoiceTriggerConfig)
@@ -28,10 +50,218 @@ enum CodexDictation {
     @MainActor private static var selectedInputPrefix: String?
     @MainActor private static var restoreTask: Task<Void, Never>?
     @MainActor private static var contextTimer: Timer?
-    @MainActor static var isActive: Bool { preparing || session != nil }
+    @MainActor static var remotePCMToken: UInt64 { remoteGeneration }
+    @MainActor static var isActive: Bool { preparing || session != nil || physicalHoldActive || remoteSession != nil }
 
     @MainActor static func configure(triggerConfig: VoiceTriggerConfig) {
         self.triggerConfig = triggerConfig
+    }
+
+    @MainActor static func configureInput(remoteMicrophone: Bool, enabled: Bool) {
+        if useRemoteMicrophone != remoteMicrophone || inputEnabled != enabled {
+            stop(reason: "音源设置改变", restoreImmediately: true)
+        }
+        useRemoteMicrophone = remoteMicrophone
+        inputEnabled = enabled
+    }
+
+    /// 仅由映射引擎确认长按后调用；短按不会请求识别、切换输入法或写入文本。
+    @MainActor static func beginPhysicalHold() {
+        guard inputEnabled, !physicalHoldActive else { return }
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.openai.codex" else { return }
+        // 新一次按住不能把上次尚在等待的识别结果写进新上下文。
+        stop(reason: nil, restoreImmediately: true)
+        guard useRemoteMicrophone else {
+            physicalHoldActive = true
+            toggle()
+            return
+        }
+        guard AXIsProcessTrusted(), CodexConversationControls.focusForDictation(),
+              let target = captureRemoteTarget() else {
+            notice("无法确认 Codex 当前可编辑的输入框或辅助功能权限，本次未开始听写。")
+            return
+        }
+        guard let unavailable = RemoteSpeechTranscriber.availabilityNotice() else {
+            remoteGeneration &+= 1
+            let token = remoteGeneration
+            guard let recognizer = RemoteSpeechTranscriber(completion: { text, failure in
+                receiveRecognition(text: text, failure: failure, token: token)
+            }) else {
+                notice("本机中文语音识别暂不可用，本次未开始听写。")
+                return
+            }
+            remoteSession = RemoteSession(target: target, recognizer: recognizer)
+            physicalHoldActive = true
+            onPhysicalHoldState?(true)
+            onStateChanged?(true)
+            notice("遥控器听写中；松开语音键结束，文字不会自动发送。")
+            remoteTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+                Task { @MainActor in
+                    guard let remoteSession else { return }
+                    guard remoteTargetIsCurrent(remoteSession.target) else {
+                        stop(reason: "应用、窗口或输入焦点改变", restoreImmediately: true)
+                        return
+                    }
+                }
+            }
+            return
+        }
+        notice(unavailable)
+    }
+
+    @MainActor static func endPhysicalHold() {
+        guard physicalHoldActive else { return }
+        physicalHoldActive = false
+        onPhysicalHoldState?(false) // 立即拒绝松手后的 PCM，再等待已采集音频的最终结果。
+        guard var current = remoteSession else {
+            stop(reason: nil, restoreImmediately: false)
+            return
+        }
+        current.released = true
+        remoteSession = current
+        current.recognizer.endAudio()
+        if let text = current.finalText {
+            finishRemote(text: text)
+            return
+        }
+        notice("已停止收音，正在整理文字；不会自动发送。")
+        let token = remoteGeneration
+        finalTimeout = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, remoteGeneration == token, remoteSession != nil else { return }
+            stop(reason: "未及时取得最终识别结果，本次文字已丢弃", restoreImmediately: true)
+        }
+    }
+
+    /// AppServices 在主线程按 ATVV 顺序投递；松手及取消后不再接收。
+    @MainActor static func receiveRemotePCM(_ samples: [Int16], token: UInt64) {
+        guard token == remoteGeneration, physicalHoldActive, let current = remoteSession else { return }
+        current.recognizer.append(samples)
+    }
+
+    @MainActor static func endRemoteTransport(token: UInt64) {
+        guard token == remoteGeneration else { return }
+        endPhysicalHold()
+    }
+
+    @MainActor static func cancelRemoteTransport(token: UInt64) {
+        guard token == remoteGeneration else { return }
+        stop(reason: "遥控器音频链路停止", restoreImmediately: true)
+    }
+
+    @MainActor static func reportPermissionResult(approved: Bool) {
+        notice(approved ? "语音识别已获允许；请重新按住语音键说话。"
+               : "未获得语音识别权限；可在系统设置 → 隐私与安全性 → 语音识别中开启。")
+    }
+
+    @MainActor private static func receiveRecognition(text: String?, failure: String?, token: UInt64) {
+        guard token == remoteGeneration, var current = remoteSession else { return }
+        guard remoteTargetIsCurrent(current.target) else {
+            stop(reason: "识别期间输入上下文改变，文字已丢弃", restoreImmediately: true)
+            return
+        }
+        if let text {
+            current.finalText = text
+            remoteSession = current
+            if current.released { finishRemote(text: text) }
+        } else if let failure {
+            stop(reason: failure, restoreImmediately: true)
+        }
+    }
+
+    @MainActor private static func finishRemote(text: String) {
+        guard let current = remoteSession, current.released else { return }
+        let safeText = sanitizedText(text)
+        guard !safeText.isEmpty else {
+            stop(reason: "没有识别到文字", restoreImmediately: true)
+            return
+        }
+        // 优先直接写原控件；Chromium 未实现 AXSelectedText 时，向原 pid 投递无修饰键 Unicode。
+        guard remoteTargetIsCurrent(current.target), insertRemoteText(safeText, target: current.target) else {
+            stop(reason: "原输入框已改变或不支持安全写入，识别文字已丢弃", restoreImmediately: true)
+            return
+        }
+        clearRemote()
+        onStateChanged?(false)
+        notice("已向 Codex 原输入框投递文字，尚未发送。")
+    }
+
+    @MainActor private static func clearRemote() {
+        remoteGeneration &+= 1
+        let hadPhysicalSession = physicalHoldActive || remoteSession != nil
+        physicalHoldActive = false
+        if hadPhysicalSession { onPhysicalHoldState?(false) }
+        remoteSession?.recognizer.cancel()
+        remoteSession = nil
+        remoteTimer?.invalidate()
+        remoteTimer = nil
+        finalTimeout?.cancel()
+        finalTimeout = nil
+    }
+
+    @MainActor private static func captureRemoteTarget() -> RemoteTarget? {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex" else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused = axElement(axApp, attribute: kAXFocusedUIElementAttribute),
+              let window = axElement(focused, attribute: kAXWindowAttribute) else { return nil }
+        return RemoteTarget(pid: app.processIdentifier, element: focused, window: window, selection: selectedRange(focused))
+    }
+
+    @MainActor private static func remoteTargetIsCurrent(_ target: RemoteTarget) -> Bool {
+        guard stillFrontmost(target.pid),
+              let focused = axElement(AXUIElementCreateApplication(target.pid), attribute: kAXFocusedUIElementAttribute),
+              CFEqual(focused, target.element),
+              let window = axElement(focused, attribute: kAXWindowAttribute), CFEqual(window, target.window) else { return false }
+        if let expected = target.selection {
+            guard let range = selectedRange(focused), range.location == expected.location,
+                  range.length == expected.length else { return false }
+        }
+        return true
+    }
+
+    static func sanitizedText(_ text: String) -> String {
+        text.components(separatedBy: .controlCharacters).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @MainActor private static func insertRemoteText(_ text: String, target: RemoteTarget) -> Bool {
+        var settable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(target.element, kAXSelectedTextAttribute as CFString, &settable) == .success,
+           settable.boolValue,
+           AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString, text as CFString) == .success {
+            return true
+        }
+        // 一次有界 Unicode 事件，避免分段投递期间焦点变化。绝不使用 Return、粘贴或全局事件 tap。
+        let unicode = Array(text.utf16)
+        guard !unicode.isEmpty, unicode.count <= 8_192, remoteTargetIsCurrent(target),
+              let source = CGEventSource(stateID: .privateState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return false }
+        down.flags = []
+        up.flags = []
+        down.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
+        up.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
+        guard remoteTargetIsCurrent(target) else { return false }
+        down.postToPid(target.pid)
+        up.postToPid(target.pid)
+        return true
+    }
+
+    private static func axElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func selectedRange(_ element: AXUIElement) -> CFRange? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        let axValue = value as! AXValue
+        var range = CFRange()
+        guard AXValueGetType(axValue) == .cfRange, AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return range
     }
 
     @discardableResult static func perform(_ name: String) -> Bool {
@@ -136,7 +366,7 @@ enum CodexDictation {
 
     @MainActor private static func didStart(inputName: String, method: String) {
         onStateChanged?(true)
-        notice("\(method) · 音源：\(inputName)。再按语音键结束，不会发送消息。")
+        notice("\(method) · 音源：\(inputName)。松开语音键结束；旧版两按动作可再按结束，不会发送消息。")
         contextTimer?.invalidate()
         contextTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
             Task { @MainActor in
@@ -154,6 +384,11 @@ enum CodexDictation {
     }
 
     @MainActor private static func stop(reason: String?, restoreImmediately: Bool) {
+        let hadRemote = remoteSession != nil
+        let hadPhysical = physicalHoldActive
+        clearRemote()
+        if hadRemote, let reason { notice("\(reason)；没有发送消息。") }
+        if hadRemote || hadPhysical { onStateChanged?(false) }
         let wasPreparing = preparing
         let old = session
         preparing = false
@@ -356,7 +591,9 @@ enum CodexDictation {
 
     /// 纯菜单语义验收，不访问真实 Codex、不合成键盘或启动录音。
     static func selfCheck() -> Bool {
-        menuTitleMatches("Start Dictation…", stopping: false)
+        RemotePCMHoldGate.selfCheck()
+            && sanitizedText("hello\r\nworld\t\u{1B}") == "hello  world"
+            && menuTitleMatches("Start Dictation…", stopping: false)
             && menuTitleMatches("开始听写...", stopping: false)
             && menuTitleMatches("停止聽寫", stopping: true)
             && !menuTitleMatches("Start Dictation", stopping: true)

@@ -10,6 +10,8 @@
     <string>com.miremote.cli</string>
     <key>CFBundleName</key>
     <string>miremote</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>按住遥控器语音键，将说话内容识别并填入当前输入框。</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>连接小米蓝牙遥控器并接收语音数据。</string>
 </dict>

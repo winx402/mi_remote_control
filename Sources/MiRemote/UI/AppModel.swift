@@ -97,6 +97,8 @@ enum ActionSummary {
         ("codex_context_up", "向上读对话／上一选项"), ("codex_context_down", "向下读对话／下一选项"),
         ("codex_context_left", "上一题"), ("codex_context_right", "下一题"),
         ("codex_context_ok", "选择或聚焦回答"), ("codex_context_submit", "发送消息或提交答案"),
+        ("codex_context_focus", "聚焦或切换问题框／输入框"),
+        ("codex_context_voice_start", "开始按住听写"), ("codex_context_voice_end", "松开结束听写"),
         ("codex_context_dictate", "开始／结束语音输入"),
         ("codex_scroll_up", "Codex 向上滚动回复"), ("codex_scroll_down", "Codex 向下滚动回复"),
         ("codex_previous_chat", "Codex 上一个会话"), ("codex_next_chat", "Codex 下一个会话"),
@@ -339,6 +341,7 @@ final class AppModel: ObservableObject {
     /// 语音模式 → VoiceBridgeApp 开关（A=切BlackHole+豆包 / B=仅豆包 / off=全关）。
     func applyVoiceMode() {
         guard let voice = services?.voiceApp else { return }
+        CodexDictation.configureInput(remoteMicrophone: voiceMode != .macMic, enabled: true)
         switch voiceMode {
         case .remoteMic: voice.switchInput = true; voice.doubao = true; voice.voiceEnabled = true
         case .macMic: voice.switchInput = false; voice.doubao = true; voice.voiceEnabled = true

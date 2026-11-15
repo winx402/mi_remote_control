@@ -122,7 +122,12 @@ final class MappingEngine: @unchecked Sendable {
         guard codexContextActive,
               overlayDeclared(key)?.tap == Presets.codexContextActions[key] else { return false }
         if key == .ok { return overlayDeclared(key)?.hold == .system("codex_context_submit") }
+        if key == .voice { return overlayDeclared(key)?.hold == .system("codex_context_voice_start") }
         return isDirection(key)
+    }
+    private var codexVoiceContextAvailable: Bool {
+        codexContextKey(.voice) && overlayHandler == nil && !MouseMode.shared.isActive
+            && !TransientSystemUI.isMissionControlActive()
     }
     private lazy var codexContextGestures: CodexContextGestures = {
         let gestures = CodexContextGestures(schedule: scheduleAfter)
@@ -136,6 +141,22 @@ final class MappingEngine: @unchecked Sendable {
                   !MouseMode.shared.isActive, !TransientSystemUI.isMissionControlActive() else { return }
             let binding = self.overlayDeclared(.ok)
             self.runIndependentLocal(hold ? binding?.hold : binding?.tap)
+        }
+        gestures.onVoiceTap = { [weak self] in
+            guard let self, self.codexVoiceContextAvailable else { return }
+            self.runIndependentLocal(.system("codex_context_focus"))
+        }
+        gestures.onVoiceStart = { [weak self] in
+            guard let self, self.codexVoiceContextAvailable else { return false }
+            self.runIndependentLocal(.system("codex_context_voice_start"))
+            return true
+        }
+        gestures.onVoiceEnd = { [weak self] in
+            self?.runIndependentLocal(.system("codex_context_voice_end"))
+        }
+        // Revocation discards recognition rather than committing a late result.
+        gestures.onVoiceCancel = { [weak self] in
+            self?.runIndependentLocal(.system("codex_context_voice_cancel"))
         }
         return gestures
     }()
@@ -368,6 +389,7 @@ final class MappingEngine: @unchecked Sendable {
 
     private func _setConfig(_ config: MappingConfig) {
         invalidateInputSession()
+        revokeLegacyVoicePress()
         applicationNavigationGestures.reset()
         codexContextGestures.reset()
         reservedDirectionGestures.reset()
@@ -398,6 +420,7 @@ final class MappingEngine: @unchecked Sendable {
 
     private func _setActiveProfile(_ bundleID: String?) {
         invalidateInputSession()
+        revokeLegacyVoicePress()
         applicationNavigationGestures.reset()
         codexContextGestures.reset()
         reservedDirectionGestures.reset()
@@ -443,11 +466,27 @@ final class MappingEngine: @unchecked Sendable {
         log("RESET input state (\(reason))")
     }
 
+    /// A press begun under an older/custom profile must not borrow the new
+    /// profile's hold action or replay its release into the physical voice path.
+    private func revokeLegacyVoicePress() {
+        var state = states[.voice] ?? KeyState()
+        guard state.phase != .idle || independentGestures.isTracking(.voice) else { return }
+        independentGestures.cancel(.voice)
+        state.seq &+= 1
+        state.phase = .consumed
+        states[.voice] = state
+    }
+
     private func _handle(_ event: ButtonEvent) {
         // 暂停态：遥控完全惰性——不进状态机、不追踪逃生、不喂浮层。
         if suspendedLock.withLock({ $0 }) { return }
+        if event.key == .voice, states[.voice]?.phase == .consumed {
+            if !event.isDown { handleUp(.voice) }
+            return
+        }
         // A hold/context change consumes that physical press through release,
         // even if its global action focuses another app or opens a new panel.
+        if !codexVoiceContextAvailable { codexContextGestures.cancelVoice() }
         if applicationNavigationGestures.consumeSuppressed(event)
             || reservedDirectionGestures.consumeSuppressed(event)
             || codexContextGestures.consumeSuppressed(event) { return }
@@ -491,7 +530,7 @@ final class MappingEngine: @unchecked Sendable {
             return
         }
         if !TransientSystemUI.isMissionControlActive(), codexContextKey(event.key) {
-            codexContextGestures.handle(event, holdMs: overlayDeclared(.ok)?.holdMs ?? config.settings.holdMs)
+            codexContextGestures.handle(event, holdMs: overlayDeclared(event.key)?.holdMs ?? config.settings.holdMs)
             return
         }
         if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0,
@@ -589,9 +628,13 @@ final class MappingEngine: @unchecked Sendable {
             // Explicit Codex submit owns OK hold/double locally. Panels and mouse
             // capture above still receive physical down/up before this decision.
             if !TransientSystemUI.isMissionControlActive(), codexContextKey(key) {
-                codexContextGestures.handle(event, holdMs: overlayDeclared(.ok)?.holdMs ?? config.settings.holdMs)
+                codexContextGestures.handle(event, holdMs: overlayDeclared(event.key)?.holdMs ?? config.settings.holdMs)
                 return
             }
+        }
+        if key == .voice, codexContextKey(.voice), overlayHandler == nil {
+            codexContextGestures.handle(event, holdMs: overlayDeclared(.voice)?.holdMs ?? config.settings.holdMs)
+            return
         }
         if event.isDown, !independentGestures.isTracking(key) {
             gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
@@ -1046,6 +1089,7 @@ final class MappingEngine: @unchecked Sendable {
         let eff = effectiveLayer
         guard eff != lastNotifiedLayer else { return }
         lastNotifiedLayer = eff
+        codexContextGestures.reset()
         publishTapRoute()
         delegate?.layerChanged(eff)
         log("LAYER \(eff)")
@@ -1153,6 +1197,7 @@ extension MappingEngine {
             config.profiles["global"] = ["voice": KeyBinding(tap: .voice)]
             config.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
             config.profiles["com.openai.codex"]?["ok"]?.holdMs = 750
+            config.profiles["com.openai.codex"]?["voice"]?.holdMs = 450
             if independentMode {
                 config.globalShortcuts = [
                     "left": KeyBinding(hold: .system("space_left"), holdMs: 650),
@@ -1194,8 +1239,52 @@ extension MappingEngine {
             clock.advance(1); event(.ok, true); clock.advance(2000); event(.ok, false)
             expect(take() == [.system("codex_context_submit")], "hold submits once, release has no tap")
             tap(.menu); clock.advance(300); tap(.voice)
-            expect(take() == [.overlay("codex_sessions"), .system("codex_context_dictate")],
-                   "menu opens sessions and short voice dictates")
+            expect(take() == [.overlay("codex_sessions"), .system("codex_context_focus")],
+                   "menu opens sessions and short voice focuses input")
+            event(.voice, true); clock.advance(449); event(.voice, true)
+            expect(take().isEmpty, "voice repeat cannot start before its local threshold")
+            clock.advance(1)
+            expect(take() == [.system("codex_context_voice_start")], "voice starts at threshold while held")
+            event(.voice, true); clock.advance(2000)
+            expect(take().isEmpty, "voice hold and raw repeat start only once")
+            event(.voice, false); event(.voice, false)
+            expect(take() == [.system("codex_context_voice_end")], "release ends once without focus tap")
+            tap(.voice); tap(.voice); clock.advance(1000)
+            expect(take() == [.system("codex_context_focus"), .system("codex_context_focus")],
+                   "rapid voice taps focus independently and stale timers cannot record")
+            event(.voice, true); clock.advance(100); engine.setActiveProfile("com.example.other")
+            clock.advance(1000); event(.voice, true); event(.voice, false)
+            expect(take().isEmpty, "focus loss before threshold consumes voice through release")
+            engine.setActiveProfile("com.openai.codex")
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.setActiveProfile("com.example.other")
+            expect(take() == [.system("codex_context_voice_cancel")], "focus loss immediately releases active voice")
+            event(.voice, true); event(.voice, false); clock.advance(1000)
+            expect(take().isEmpty, "focus loss cannot replay the held voice press")
+            engine.setActiveProfile("com.openai.codex")
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.setOverlayCapture({ _ in })
+            expect(take() == [.system("codex_context_voice_cancel")], "capture immediately releases active voice")
+            engine.setOverlayCapture(nil); event(.voice, true); event(.voice, false)
+            expect(take().isEmpty, "capture reset consumes held voice until release")
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.setConfig(config)
+            expect(take() == [.system("codex_context_voice_cancel")], "reload releases active voice")
+            event(.voice, false)
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.resetInputState(reason: "lost voice release")
+            expect(take() == [.system("codex_context_voice_cancel")], "device input reset releases active voice")
+            tap(.voice)
+            expect(take() == [.system("codex_context_focus")], "fresh physical input works after device reset")
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.toggleLayer(2)
+            expect(take() == [.system("codex_context_voice_cancel")], "mode transition releases active voice")
+            event(.voice, true); event(.voice, false); engine.toggleLayer(2)
+            expect(take().isEmpty, "mode transition consumes voice through release")
+            event(.voice, true); clock.advance(450); _ = take()
+            engine.setSuspended(true)
+            expect(take() == [.system("codex_context_voice_cancel")], "suspending releases active voice")
+            event(.voice, false); engine.setSuspended(false)
             if independentMode {
                 event(.left, true); clock.advance(650); event(.left, false)
                 expect(take() == [.system("space_left")], "global Left hold remains reserved")
@@ -1234,6 +1323,33 @@ extension MappingEngine {
                 clock.advance(1000); event(.ok, true); event(.ok, false); event(.menu, false)
                 expect(take().isEmpty, "escape cancels pending submit through OK release")
             }
+            engine.setActiveProfile("com.example.other")
+            event(.voice, true); clock.advance(100)
+            engine.setActiveProfile("com.openai.codex")
+            event(.voice, true); clock.advance(1000); event(.voice, false)
+            expect(take().isEmpty, "both configuration generations quarantine pre-profile voice repeat")
+            tap(.voice)
+            expect(take() == [.system("codex_context_focus")], "new physical press works after quarantined release")
+            // Saved two-press dictation remains a normal explicit action until
+            // the user installs the new physical-hold preset.
+            config.profiles["com.openai.codex"] = [
+                "voice": KeyBinding(tap: .system("codex_context_dictate"), hold: .voice),
+            ]
+            config.globalShortcuts = nil
+            engine.setConfig(config); engine.setApplicationNavigationEnabled(false)
+            tap(.voice)
+            expect(take() == [.system("codex_context_dictate")], "saved legacy voice actions are not reinterpreted")
+            event(.voice, true); clock.advance(100)
+            config.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
+            engine.setConfig(config)
+            clock.advance(1000); event(.voice, true); event(.voice, false)
+            expect(take().isEmpty, "preset replacement cannot borrow a legacy in-flight voice hold")
+            tap(.voice)
+            expect(take() == [.system("codex_context_focus")], "new preset works after legacy voice release")
+            engine.setActiveProfile("com.example.other")
+            event(.voice, true); clock.advance(100); engine.setActiveProfile("com.openai.codex")
+            clock.advance(1000); event(.voice, true); event(.voice, false)
+            expect(take().isEmpty, "profile change cannot borrow an unrelated in-flight voice hold")
             // A legacy/custom profile has not opted into semantic interception.
             config.profiles["com.openai.codex"] = ["ok": KeyBinding(tap: .keyStroke(key: "return", mods: []))]
             config.globalShortcuts = nil

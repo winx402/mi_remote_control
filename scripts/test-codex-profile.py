@@ -56,7 +56,8 @@ class CodexProfileTests(unittest.TestCase):
         for key in ("up", "down", "left", "right", "ok"):
             self.assertEqual(profile[key]["tap"], {"type": "system", "value": f"codex_context_{key}"})
         self.assertEqual(profile["ok"]["hold"], {"type": "system", "value": "codex_context_submit"})
-        self.assertEqual(profile["voice"]["tap"], {"type": "system", "value": "codex_context_dictate"})
+        self.assertEqual(profile["voice"]["tap"], {"type": "system", "value": "codex_context_focus"})
+        self.assertEqual(profile["voice"]["hold"], {"type": "system", "value": "codex_context_voice_start"})
         self.assertEqual(profile["menu"]["tap"], {"type": "overlay", "value": "codex_sessions"})
         self.assertNotIn("tv", profile)
         for key in ("up", "down", "left", "right", "back"):

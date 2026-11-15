@@ -385,9 +385,13 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// GUI 开关与 ATVV 回调串行化。不得持锁调用会等待主线程 TIS 的 shutdown。
     private let sessionLock = NSLock()
     private var deliveryGate = VoiceDeliveryGate()
-    /// Codex 两按听写使用真实默认麦克风；本次物理按住不能另开旧 ATVV 听写链路。
+    /// 旧 Codex 两按听写隔离 ATVV；专用按住动作单独缓冲／交付 PCM。
     private var suppressPhysicalSession = false
     private var physicalVoiceInProgress = false
+    private var codexPhysicalSession = false
+    private var codexPCM = RemotePCMHoldGate()
+    /// 松手后仍可能等待最终结果；断连也必须取消这个 token。
+    private var codexRecognitionToken: UInt64?
     private var cleanupCount = 0
     private var _switchInput: Bool
     private var _doubao: Bool
@@ -434,6 +438,28 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     var resolveTriggerConfig: (() -> VoiceTriggerConfig)?
     /// 仅查询锁保护的配置／前台快照，不得在 ATVV 队列读取 AppKit UI。
     var shouldSuppressPhysicalVoice: (() -> Bool)?
+    var shouldUseCodexPhysicalHold: (() -> Bool)?
+
+    /// 只有映射确认的长按可激活；音频桥开关 off 不影响此独立且明确配置的 Codex 动作。
+    func setCodexPhysicalHold(active: Bool, token: UInt64) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard active else {
+            codexPCM.deactivate()
+            if codexRecognitionToken != token { codexRecognitionToken = nil }
+            return
+        }
+        codexRecognitionToken = token
+        if let delivery = codexPCM.activate(token: token) {
+            for frame in delivery.frames { processCodexFrame(frame, token: delivery.token) }
+        }
+    }
+
+    private func processCodexFrame(_ frame: VoicePressGate.Frame, token: UInt64) {
+        if let sync = frame.sync { decoder.reset(predictor: sync.predictor, stepIndex: sync.stepIndex) }
+        let samples = post.process(decoder.decode(frame.data))
+        DispatchQueue.main.async { CodexDictation.receiveRemotePCM(samples, token: token) }
+    }
 
     /// 语音会话期间默认麦克风的切换目标（前缀匹配；默认 BlackHole，配置可换）。
     private let micDeviceName: String
@@ -465,7 +491,16 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     }
 
     func atvvDisconnected(error: String?) {
-        atvvVoiceStopped() // 断连也是物理会话边界，避免重连后的新 START 被旧锁存拦住。
+        // 断连是取消，必须先隔离 token，不能把 BLE 丢失当作正常松手提交。
+        sessionLock.lock()
+        let streamToken = codexPCM.end()
+        let cancelledToken = codexRecognitionToken ?? streamToken
+        codexRecognitionToken = nil
+        sessionLock.unlock()
+        if let cancelledToken {
+            DispatchQueue.main.async { CodexDictation.cancelRemoteTransport(token: cancelledToken) }
+        }
+        atvvVoiceStopped() // 清理其余物理会话状态，避免重连后被旧锁存拦住。
         log("断开连接\(error.map { ": \($0)" } ?? "")（自动重连中）")
         onConnection?(false, nil)
     }
@@ -475,6 +510,13 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         defer { sessionLock.unlock() }
         guard !physicalVoiceInProgress else { return }
         physicalVoiceInProgress = true
+        if shouldUseCodexPhysicalHold?() == true {
+            codexPhysicalSession = true
+            codexPCM.begin()
+            decoder.reset(predictor: 0, stepIndex: 0)
+            post.reset()
+            return
+        }
         if shouldSuppressPhysicalVoice?() == true {
             suppressPhysicalSession = true
             return
@@ -524,6 +566,14 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         physicalVoiceInProgress = false
+        if codexPhysicalSession {
+            codexPhysicalSession = false
+            // BLE STOP 是兜底收音边界；映射正常 release 同样会执行 endPhysicalHold。
+            if let token = codexPCM.end() {
+                DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+            }
+            return
+        }
         if suppressPhysicalSession {
             suppressPhysicalSession = false
             return
@@ -574,6 +624,11 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
     private func prepareForceEndLocked() -> Bool {
         cleanupCount += 1
+        let streamToken = codexPCM.end()
+        if let token = codexRecognitionToken ?? streamToken {
+            DispatchQueue.main.async { CodexDictation.cancelRemoteTransport(token: token) }
+        }
+        codexRecognitionToken = nil
         deliveryGate.cancelPending()
         restoreGeneration &+= 1
         let hadPendingMicRestore = restoreWork != nil
@@ -614,6 +669,13 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         guard cleanupCount == 0, !suppressPhysicalSession else { return }
+        if codexPhysicalSession {
+            let packet = VoicePressGate.Frame(data: frame, sync: sync)
+            if let delivery = codexPCM.receive(packet) {
+                for frame in delivery.frames { processCodexFrame(frame, token: delivery.token) }
+            }
+            return
+        }
         guard let delivery = deliveryGate.receive(.init(data: frame, sync: sync),
                                               nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
         switch delivery {
@@ -773,12 +835,15 @@ private final class VoiceRuleStore: @unchecked Sendable {
     private var rules: [String: VoiceTriggerRule]?
     private var bundleID: String?
     private var codexTwoPressDictation = false
+    private var codexPhysicalHold = false
 
     func update(config: MappingConfig) {
         lock.lock()
         rules = config.voiceProfiles
         codexTwoPressDictation = config.profiles["com.openai.codex"]?["voice"]?.tap
             == .system(CodexDictation.actionName)
+        codexPhysicalHold = config.profiles["com.openai.codex"]?["voice"]?.hold
+            == .system("codex_context_voice_start")
         lock.unlock()
     }
 
@@ -792,6 +857,11 @@ private final class VoiceRuleStore: @unchecked Sendable {
         let snapshotBundle = bundleID
         lock.unlock()
         return VoiceTriggerRouting.resolve(snapshotRules, bundleID: snapshotBundle)
+    }
+
+    func useCodexPhysicalHold() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return codexPhysicalHold && bundleID == "com.openai.codex"
     }
 
     func suppressPhysicalVoice() -> Bool {
@@ -950,6 +1020,14 @@ final class AppServices {
             voiceRuleStore.update(config: config)
             voiceApp.shouldSuppressPhysicalVoice = { [weak voiceRuleStore] in
                 voiceRuleStore?.suppressPhysicalVoice() ?? false
+            }
+            voiceApp.shouldUseCodexPhysicalHold = { [weak voiceRuleStore] in
+                voiceRuleStore?.useCodexPhysicalHold() ?? false
+            }
+            Task { @MainActor [weak voiceApp] in
+                CodexDictation.onPhysicalHoldState = { [weak voiceApp] active in
+                    voiceApp?.setCodexPhysicalHold(active: active, token: CodexDictation.remotePCMToken)
+                }
             }
             let km = KeyMapperApp(config: config, verbose: options.verbose)
             voiceRuleStore.update(bundleID: km.lastExternalApplication?.bundleIdentifier)

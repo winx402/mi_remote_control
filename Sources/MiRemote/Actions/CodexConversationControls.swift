@@ -42,6 +42,8 @@ enum CodexConversationControls {
         var complete: Bool
     }
 
+    @MainActor private static var lastOption: AXUIElement?
+    @MainActor private static var lastFormRoot: AXUIElement?
     @MainActor private static var accessibilityPID: pid_t?
 
     private static let inputRoles: Set<String> = ["AXTextArea", "AXTextField", "AXComboBox"]
@@ -83,18 +85,106 @@ enum CodexConversationControls {
         return false
     }
 
-    /// 只接受专用提问组件，或同时具备单选组和明确 Submit answers 语义的有界组件。
-    /// 普通消息、Markdown 列表及只有 OK/Confirm 的通用对话框均不构成表单。
+    private static let questionTitles: Set<String> = ["question", "questions", "问题", "問題"]
+    private static let customReplyTitles: Set<String> = [
+        "or write your own reply", "or write your own response", "or write your own answer",
+        "write your own reply", "write your own response", "type your own answer",
+        "或自行撰写回复", "或自行撰寫回覆", "或自行撰写回答", "或自行撰寫回答"]
+    private static let skipTitles: Set<String> = ["skip", "skip question", "跳过", "跳過"]
+    private static let formContainers: Set<String> = ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog"]
+
+    /// Static text is numeric only when its whole label is an integer. An AXButton
+    /// may combine the ordinal and answer into one title ("1 Answer", "2. Answer").
+    private static func optionNumber(_ node: Node) -> Int? {
+        let label = node.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = label.prefix { $0.isASCII && $0.isNumber }
+        guard !digits.isEmpty, let number = Int(digits), (1...12).contains(number),
+              String(number) == digits else { return nil }
+        let suffix = label.dropFirst(digits.count)
+        if suffix.isEmpty { return number }
+        guard node.role == "AXButton", let separator = suffix.first,
+              separator.isWhitespace || ".)、:：".contains(separator) else { return nil }
+        if separator == ".", suffix.dropFirst().first?.isNumber == true { return nil }
+        guard !suffix.drop(while: { $0.isWhitespace || ".)、:：".contains($0) }).isEmpty else { return nil }
+        return number
+    }
+
+    private static func numberedOptions(_ members: [Int], root: Int, nodes: [Node]) -> [Int] {
+        var choices: [Int: Int] = [:]
+        for index in members where nodes[index].enabled && !historicallyInactive(index, in: nodes) {
+            guard let number = optionNumber(nodes[index]) else { continue }
+            // Chromium may expose the number inside a button, or just as static text
+            // in a clickable row. Prefer the real button whenever AXPress is available.
+            var target = index
+            var parent = nodes[index].parent
+            while let value = parent, value != root {
+                if nodes[value].enabled && nodes[value].pressable && nodes[value].role == "AXButton" {
+                    target = value
+                    break
+                }
+                parent = nodes[value].parent
+            }
+            if let existing = choices[number], existing != target { return [] }
+            choices[number] = target
+        }
+        let numbers = choices.keys.sorted()
+        guard numbers.count >= 2, numbers == Array(1...numbers.count), Set(choices.values).count == numbers.count else { return [] }
+        return numbers.compactMap { choices[$0] }
+    }
+
+    /// The current question card has no dedicated AX identifier in some Codex builds.
+    /// Its fixed UI anchors, numbered choices and local footer provide the boundary.
+    /// Disabled Send is part of the structure but is never an actionable submission.
+    private static func questionCards(_ nodes: [Node]) -> [Form] {
+        var roots = Set<Int>()
+        for title in nodes.indices where matches(nodes[title], questionTitles) {
+            var parent: Int? = title
+            for _ in 0..<32 {
+                guard let value = parent else { break }
+                if formContainers.contains(nodes[value].role) { roots.insert(value) }
+                parent = nodes[value].parent
+            }
+        }
+        var cards: [Form] = []
+        for root in roots.sorted() {
+            guard !historicallyInactive(root, in: nodes) else { continue }
+            let members = nodes.indices.filter { descendant($0, of: root, in: nodes) }
+            guard members.count <= 160,
+                  members.contains(where: { matches(nodes[$0], customReplyTitles) }),
+                  members.contains(where: { nodes[$0].role == "AXButton" && matches(nodes[$0], skipTitles) }) else { continue }
+            // An ancestor spanning the ordinary composer is not a local card. This
+            // also stops a missing card footer from borrowing the chat's Send.
+            guard !members.contains(where: { index in
+                let node = nodes[index]
+                return contains(node.label, ["composer", "chat input"])
+                    || (node.editable && inputRoles.contains(node.role)
+                        && matches(node, ["message", "prompt", "消息", "输入消息", "輸入訊息"]))
+            }) else { continue }
+            let options = numberedOptions(members, root: root, nodes: nodes)
+            guard !options.isEmpty else { continue }
+            let submits = members.filter { nodes[$0].role == "AXButton" && matches(nodes[$0], formSubmits) }
+            let fields = members.filter { nodes[$0].enabled && nodes[$0].editable && inputRoles.contains(nodes[$0].role) }
+            func uniqueEnabled(_ titles: Set<String>) -> Int? {
+                let controls = members.filter { nodes[$0].role == "AXButton" && nodes[$0].enabled
+                    && nodes[$0].pressable && matches(nodes[$0], titles) }
+                return controls.count == 1 ? controls[0] : nil
+            }
+            cards.append(Form(root: root, options: options, fields: fields,
+                              previous: uniqueEnabled(previousTitles), next: uniqueEnabled(nextTitles),
+                              submit: submits.count == 1 ? uniqueEnabled(formSubmits) : nil))
+        }
+        return cards.filter { outer in !cards.contains { $0.root != outer.root && descendant($0.root, of: outer.root, in: nodes) } }
+    }
+
+    /// Accept dedicated forms, bounded radio forms, or the fixed question-card structure.
+    /// Plain transcript lists and generic confirmation dialogs do not qualify.
     private static func activeForm(_ nodes: [Node]) -> Form? {
-        var forms: [Form] = []
-        let containers: Set<String> = ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog"]
-        var roots = Set(nodes.indices.filter { containers.contains(nodes[$0].role) && contains(nodes[$0].label, formMarkers) })
-        // Ordinary transcript groups need no descendant scans. Only walk ancestors of an
-        // actual answer-submit control when the dedicated widget marker is absent.
-        for index in nodes.indices where nodes[index].enabled && nodes[index].role == "AXButton" && matches(nodes[index], answerSubmits) {
+        var forms = questionCards(nodes)
+        var roots = Set(nodes.indices.filter { formContainers.contains(nodes[$0].role) && contains(nodes[$0].label, formMarkers) })
+        for index in nodes.indices where nodes[index].role == "AXButton" && matches(nodes[index], answerSubmits) {
             var parent = nodes[index].parent
             while let value = parent {
-                if containers.contains(nodes[value].role) { roots.insert(value) }
+                if formContainers.contains(nodes[value].role) { roots.insert(value) }
                 parent = nodes[value].parent
             }
         }
@@ -102,18 +192,18 @@ enum CodexConversationControls {
             guard !historicallyInactive(root, in: nodes) else { continue }
             let members = nodes.indices.filter { descendant($0, of: root, in: nodes) }
             guard members.count <= 160 else { continue }
-            let buttons = members.filter { nodes[$0].enabled && nodes[$0].pressable && nodes[$0].role == "AXButton" }
+            let allButtons = members.filter { nodes[$0].role == "AXButton" }
+            let buttons = allButtons.filter { nodes[$0].enabled && nodes[$0].pressable }
             let marked = contains(nodes[root].label, formMarkers)
             let radios = members.filter { nodes[$0].enabled && nodes[$0].pressable && ["AXRadioButton", "AXCheckBox"].contains(nodes[$0].role) }
             let hasRadioGroup = members.contains { nodes[$0].role == "AXRadioGroup" }
-            let explicitSubmit = buttons.filter { matches(nodes[$0], answerSubmits) }
+            let explicitSubmit = allButtons.filter { matches(nodes[$0], answerSubmits) }
             guard marked || (hasRadioGroup && radios.count >= 2 && explicitSubmit.count == 1) else { continue }
             let fields = members.filter { nodes[$0].enabled && nodes[$0].editable && inputRoles.contains(nodes[$0].role) }
             let options = members.filter { index in
                 if radios.contains(index) { return true }
                 guard marked, nodes[index].role == "AXButton", nodes[index].enabled, nodes[index].pressable,
                       !matches(nodes[index], formSubmits.union(previousTitles).union(nextTitles)) else { return false }
-                // Generic buttons are options only inside an actual radio/listbox option group.
                 return members.contains { ["AXRadioGroup", "AXListBox"].contains(nodes[$0].role) && descendant(index, of: $0, in: nodes) }
             }
             guard !options.isEmpty || !fields.isEmpty else { continue }
@@ -121,19 +211,23 @@ enum CodexConversationControls {
                 let result = buttons.filter { matches(nodes[$0], titles) }
                 return result.count == 1 ? result[0] : nil
             }
-            forms.append(Form(root: root, options: options, fields: fields,
-                              previous: unique(previousTitles), next: unique(nextTitles), submit: unique(formSubmits)))
+            if !forms.contains(where: { $0.root == root }) {
+                forms.append(Form(root: root, options: options, fields: fields,
+                                  previous: unique(previousTitles), next: unique(nextTitles), submit: unique(formSubmits)))
+            }
         }
-        // An outer question panel may contain the actual form. Prefer its deepest unique child;
-        // two unrelated visible forms are ambiguous and must never cause submission.
         let deepest = forms.filter { outer in !forms.contains { $0.root != outer.root && descendant($0.root, of: outer.root, in: nodes) } }
         return deepest.count == 1 ? deepest[0] : nil
     }
 
     private static func blocksChat(_ nodes: [Node]) -> Bool {
-        nodes.contains { ["AXDialog", "AXSheet"].contains($0.role) }
-            || nodes.contains { contains($0.label, formMarkers) && $0.enabled }
-            || nodes.contains { $0.role == "AXButton" && $0.enabled && matches($0, answerSubmits) }
+        let live = nodes.indices.filter { !historicallyInactive($0, in: nodes) }
+        return nodes.contains { ["AXDialog", "AXSheet"].contains($0.role) }
+            || live.contains { contains(nodes[$0].label, formMarkers) }
+            || live.contains { nodes[$0].role == "AXButton" && matches(nodes[$0], answerSubmits) }
+            || live.contains { matches(nodes[$0], customReplyTitles) }
+            || (live.contains { matches(nodes[$0], questionTitles) }
+                && live.contains { nodes[$0].role == "AXButton" && matches(nodes[$0], skipTitles) })
     }
 
     private static func composer(_ nodes: [Node], window: CGRect) -> Int? {
@@ -191,16 +285,30 @@ enum CodexConversationControls {
                 guard !choices.isEmpty else { return true }
                 let current = choices.firstIndex { snapshot.nodes[$0].focused }
                     ?? choices.firstIndex { snapshot.nodes[$0].selected }
+                    ?? choices.firstIndex {
+                        guard let lastFormRoot, let lastOption,
+                              CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
+                        return CFEqual(lastOption, snapshot.elements[$0])
+                    }
                 let next = current.map { min(choices.count - 1, max(0, $0 + (action == .up ? -1 : 1))) }
                     ?? (action == .up ? choices.count - 1 : 0)
-                select(choices[next], in: snapshot, isCurrent: isCurrent)
+                if select(choices[next], in: snapshot, isCurrent: isCurrent) {
+                    lastFormRoot = snapshot.elements[form.root]
+                    lastOption = snapshot.elements[choices[next]]
+                }
             case .left: press(form.previous, in: snapshot, isCurrent: isCurrent)
             case .right: press(form.next, in: snapshot, isCurrent: isCurrent)
             case .ok:
-                if let field = preferredField(form, nodes: snapshot.nodes) { _ = focus(field, in: snapshot) }
-                else if let choice = form.options.first(where: { snapshot.nodes[$0].focused || snapshot.nodes[$0].selected }) ?? form.options.first {
-                    select(choice, in: snapshot, isCurrent: isCurrent)
+                let choice = form.options.first { index in
+                    if snapshot.nodes[index].focused || snapshot.nodes[index].selected { return true }
+                    guard let lastFormRoot, let lastOption, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
+                    return CFEqual(lastOption, snapshot.elements[index])
                 }
+                if let choice {
+                    select(choice, in: snapshot, isCurrent: isCurrent)
+                } else if let field = preferredField(form, nodes: snapshot.nodes) {
+                    _ = focus(field, in: snapshot)
+                } else if let first = form.options.first { select(first, in: snapshot, isCurrent: isCurrent) }
             case .submit:
                 // Never synthesize Return: no confirmed button means no submission.
                 if let submit = form.submit { press(submit, in: snapshot, isCurrent: isCurrent) }
@@ -268,10 +376,36 @@ enum CodexConversationControls {
               sameWindow(snapshot), isCurrent() else { return }
         AXUIElementPerformAction(snapshot.elements[index], kAXPressAction as CFString)
     }
-    @MainActor private static func select(_ index: Int, in snapshot: Snapshot, isCurrent: () -> Bool = { true }) {
-        // Avoid unchecking an already selected multi-select answer.
-        if !snapshot.nodes[index].selected { press(index, in: snapshot, isCurrent: isCurrent) }
-        if isCurrent() { _ = focus(index, in: snapshot) }
+    @MainActor @discardableResult private static func select(_ index: Int, in snapshot: Snapshot,
+                                                             isCurrent: () -> Bool = { true }) -> Bool {
+        guard isCurrent(), sameWindow(snapshot), snapshot.nodes[index].enabled else { return false }
+        let target = snapshot.elements[index]
+        if !snapshot.nodes[index].selected {
+            if actions(target).contains(kAXPressAction as String),
+               AXUIElementPerformAction(target, kAXPressAction as CFString) == .success {
+                _ = focus(index, in: snapshot)
+                return true
+            }
+            // Chromium can expose a numbered badge as static text inside a clickable row.
+            // Only click the freshly resolved option itself (or one of its descendants).
+            guard let bounds = frame(target), bounds.width > 0, bounds.height > 0 else { return false }
+            let point = CGPoint(x: bounds.midX, y: bounds.midY)
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
+                  var current = hit else { return false }
+            var matched = false
+            for _ in 0..<12 {
+                if CFEqual(current, target) { matched = true; break }
+                guard let parent = element(current, kAXParentAttribute as CFString) else { break }
+                current = parent
+            }
+            guard matched, sameWindow(snapshot), isCurrent(),
+                  let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
+                  let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else { return false }
+            down.postToPid(snapshot.pid)
+            up.postToPid(snapshot.pid)
+        } else { _ = focus(index, in: snapshot) }
+        return true
     }
     @MainActor private static func focus(_ index: Int, in snapshot: Snapshot) -> Bool {
         guard sameWindow(snapshot), snapshot.nodes[index].enabled else { return false }
@@ -408,15 +542,43 @@ enum CodexConversationControls {
             accessibilityPID = app.processIdentifier
         }
         guard let window = element(ax, kAXFocusedWindowAttribute as CFString), let windowRect = frame(window) else { return nil }
-        var queue: [(AXUIElement, Int?, Int)] = [(window, nil, 0)]
+        // Locate the live card independently of the size of the conversation history.
+        // Sample points only discover candidate ancestors. No action uses these points.
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.12
+        var visited = Set<AXUIElement>()
+        for fraction in [0.76, 0.63, 0.84] {
+            let point = CGPoint(x: windowRect.minX + windowRect.width * 0.61,
+                                y: windowRect.minY + windowRect.height * fraction)
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(ax, Float(point.x), Float(point.y), &hit) == .success,
+                  var candidate = hit else { continue }
+            for _ in 0..<14 {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+                if visited.insert(candidate).inserted, let bounds = frame(candidate),
+                   bounds.width >= windowRect.width * 0.25, bounds.height >= 100,
+                   bounds.height <= windowRect.height * 0.70,
+                   let local = project(ax, window: window, rect: windowRect, root: candidate,
+                                       pid: app.processIdentifier, budget: 0.12),
+                   local.complete, activeForm(local.nodes) != nil { return local }
+                guard let parent = element(candidate, kAXParentAttribute as CFString), !CFEqual(parent, window) else { break }
+                candidate = parent
+            }
+        }
+        return project(ax, window: window, rect: windowRect, root: window, pid: app.processIdentifier, budget: budget)
+    }
+
+    @MainActor private static func project(_ ax: AXUIElement, window: AXUIElement, rect windowRect: CGRect,
+                                           root: AXUIElement, pid: pid_t, budget: TimeInterval) -> Snapshot? {
+        let local = !CFEqual(window, root)
+        var queue: [(AXUIElement, Int?, Int)] = [(root, local ? 0 : nil, 0)]
         var head = 0
-        var nodes: [Node] = []
-        var elements: [AXUIElement] = []
+        var nodes: [Node] = local ? [Node(parent: nil, role: "AXWindow", rect: windowRect)] : []
+        var elements: [AXUIElement] = local ? [window] : []
         var seen: [CFHashCode: [AXUIElement]] = [:]
         let deadline = ProcessInfo.processInfo.systemUptime + budget
         var complete = true
         while head < queue.count, head < 1800 {
-            guard stillFrontmost(app.processIdentifier) else { return nil }
+            guard stillFrontmost(pid) else { return nil }
             if ProcessInfo.processInfo.systemUptime >= deadline { complete = false ; break }
             let (current, parent, depth) = queue[head]
             head += 1
@@ -434,7 +596,13 @@ enum CodexConversationControls {
             let editable = inputRoles.contains(role) && values[5] as? Bool != false
             let actionable = ["AXButton", "AXRadioButton", "AXCheckBox"].contains(role)
             let readMetadata = actionable || editable || ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog", "AXSheet", "AXScrollArea", "AXWebArea", "AXListBox"].contains(role)
-            let label = readMetadata ? metadata(current) : ""
+            var label = readMetadata ? metadata(current) : ""
+            if (role == "AXStaticText" || role == "AXHeading"), rect.width > 0, (local || rect.width < 220) {
+                let value = string(current, kAXValueAttribute as CFString) ?? ""
+                if Int(value).map({ (1...99).contains($0) }) == true || questionTitles.contains(normalized(value)) || customReplyTitles.contains(normalized(value)) {
+                    label = value
+                }
+            }
             let enabled = values[3] as? Bool != false
                 && (!(actionable || editable) || (rect.width > 0 && rect.height > 0 && windowRect.intersects(rect)))
             let selected = role == "AXRadioButton" || role == "AXCheckBox"
@@ -448,8 +616,8 @@ enum CodexConversationControls {
             if depth >= 25 && !kids.isEmpty { complete = false ; continue }
             queue.append(contentsOf: kids.map { ($0, index, depth + 1) })
         }
-        guard stillFrontmost(app.processIdentifier) else { return nil }
-        return Snapshot(pid: app.processIdentifier, app: ax, elements: elements, nodes: nodes, window: windowRect,
+        guard stillFrontmost(pid) else { return nil }
+        return Snapshot(pid: pid, app: ax, elements: elements, nodes: nodes, window: windowRect,
                         complete: complete && head == queue.count)
     }
     private static func attribute(_ node: AXUIElement, _ name: CFString) -> CFTypeRef? {
@@ -527,6 +695,58 @@ enum CodexConversationControls {
                     Node(parent: 1, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true),
                     Node(parent: 1, role: "AXButton", label: "Send message", rect: CGRect(x: 900, y: 700, width: 40, height: 40), pressable: true),
                     Node(parent: 0, role: "AXButton", label: "Send message", pressable: true)]
+        // Screenshot layout: a question card above the independent chat composer.
+        // Question / answer prose is intentionally absent from the metadata projection.
+        var card = [
+            Node(parent: nil, role: "AXWindow", rect: window),                         // 0
+            Node(parent: 0, role: "AXGroup"),                                        // 1
+            Node(parent: 1, role: "AXGroup", rect: CGRect(x: 330, y: 240, width: 620, height: 330)), // 2
+            Node(parent: 2, role: "AXStaticText", label: "问题"),                     // 3
+            Node(parent: 2, role: "AXStaticText"),                                    // 4 question prose
+            Node(parent: 2, role: "AXGroup", rect: CGRect(x: 350, y: 300, width: 570, height: 45)), // 5 row
+            Node(parent: 5, role: "AXStaticText", label: "1", rect: CGRect(x: 360, y: 310, width: 20, height: 20)), // 6
+            Node(parent: 5, role: "AXStaticText"),                                    // 7 answer prose
+            Node(parent: 2, role: "AXGroup", rect: CGRect(x: 350, y: 350, width: 570, height: 45)), // 8 row
+            Node(parent: 8, role: "AXStaticText", label: "2", rect: CGRect(x: 360, y: 360, width: 20, height: 20)), // 9
+            Node(parent: 8, role: "AXStaticText"),                                    // 10 answer prose
+            Node(parent: 2, role: "AXTextArea", label: "或自行撰写回复", rect: CGRect(x: 350, y: 420, width: 570, height: 65), editable: true), // 11
+            Node(parent: 2, role: "AXGroup"),                                        // 12 footer
+            Node(parent: 12, role: "AXButton", label: "跳过", pressable: true),        // 13
+            Node(parent: 12, role: "AXButton", label: "发送", enabled: false, pressable: true), // 14
+            Node(parent: 1, role: "AXGroup", label: "composer"),                     // 15
+            Node(parent: 15, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true), // 16
+            Node(parent: 15, role: "AXButton", label: "Send", pressable: true)         // 17
+        ]
+        guard let screenshot = activeForm(card), screenshot.root == 2, screenshot.options == [6, 9],
+              screenshot.fields == [11], screenshot.submit == nil, blocksChat(card),
+              composer(card, window: window) == nil else { return false }
+        // Ordinary option buttons must win over their number text descendants.
+        card[5].role = "AXButton"; card[5].pressable = true
+        card[8].role = "AXButton"; card[8].pressable = true
+        card[14].enabled = true
+        guard activeForm(card)?.options == [5, 8], activeForm(card)?.submit == 14 else { return false }
+        card[5].label = "1 已完成第二次测试"; card[6].label = ""
+        card[8].label = "2. 稍后再测"; card[9].label = ""
+        guard activeForm(card)?.options == [5, 8],
+              optionNumber(Node(parent: nil, role: "AXStaticText", label: "1 text")) == nil,
+              optionNumber(Node(parent: nil, role: "AXButton", label: "1.2 version")) == nil,
+              optionNumber(Node(parent: nil, role: "AXButton", label: "1 2026 plan")) == 1 else { return false }
+        // English and per-question navigation share the same card boundary.
+        card[3].label = "Question"; card[11].label = "Or write your own reply"
+        card[13].label = "Skip"; card[14].label = "Send"
+        card.append(Node(parent: 12, role: "AXButton", label: "Previous question", pressable: true)) // 18
+        card.append(Node(parent: 12, role: "AXButton", label: "Next question", pressable: true))     // 19
+        guard activeForm(card)?.previous == 18, activeForm(card)?.next == 19,
+              activeForm(card)?.submit == 14 else { return false }
+        // Missing card Send cannot borrow the chat Send, even without a composer label.
+        card[14].label = ""; card[15].label = ""; card[16].label = ""
+        guard activeForm(card)?.root == 2, activeForm(card)?.submit == nil, blocksChat(card) else { return false }
+        card[5].label = ""; card[8].label = ""
+        guard activeForm(card) == nil, blocksChat(card), composer(card, window: window) == nil else { return false }
+        card[3].label = "" // A partial card with its unique placeholder still blocks chat.
+        guard activeForm(card) == nil, blocksChat(card) else { return false }
+        card[11].label = ""
+        guard !blocksChat(card) else { return false }
         return activeForm(chat) == nil && composer(chat, window: window) == 2 && composerSend(2, nodes: chat) == 3
             && Action.allCases.count == 6 && Action(rawValue: "codex_scroll_up") == nil
     }

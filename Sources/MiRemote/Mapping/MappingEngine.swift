@@ -739,6 +739,8 @@ final class MappingEngine: @unchecked Sendable {
         let backPress = key == .back ? codexBackPress : nil
         let editingBack = key == .back && codexEditingBackPress
         if key == .back { codexEditingBackPress = false; codexBackPress = nil }
+        // A Back hold cannot clear or quit an app that became active mid-press.
+        if key == .back, gesture == .hold, context?.0 != contextGeneration { return }
         // Codex Return hold always owns this slot, including old saved profiles,
         // modal panels and mouse mode. A missing editor is a consumed hold.
         if key == .back, gesture == .hold, activeBundleID == "com.openai.codex" {

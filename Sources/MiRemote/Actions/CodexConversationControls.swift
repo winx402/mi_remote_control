@@ -45,6 +45,36 @@ enum CodexConversationControls {
         var complete: Bool
     }
 
+    @MainActor private static let answerHighlight = NavigationFocusOverlay()
+    @MainActor private static var highlightMonitor: Timer?
+    @MainActor private static func previewAnswer(_ index: Int, ordinal: Int, form: Form, in snapshot: Snapshot) {
+        let target = snapshot.elements[index]
+        lastFormRoot = snapshot.elements[form.root]
+        lastOption = target
+        answerHighlight.showAnswer(snapshot.nodes[index].rect, ordinal: ordinal)
+        highlightMonitor?.invalidate()
+        highlightMonitor = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let lastOption, CFEqual(lastOption, target) else { return }
+                guard sameWindow(snapshot), let bounds = frame(target), bounds.intersects(snapshot.window) else {
+                    clearAnswer()
+                    return
+                }
+                if bounds != snapshot.nodes[index].rect {
+                    answerHighlight.showAnswer(bounds, ordinal: ordinal)
+                }
+            }
+        }
+    }
+
+    @MainActor static func clearAnswer() {
+        highlightMonitor?.invalidate()
+        highlightMonitor = nil
+        lastOption = nil
+        lastFormRoot = nil
+        answerHighlight.hide()
+    }
+
     @MainActor private static var lastOption: AXUIElement?
     @MainActor private static var lastFormRoot: AXUIElement?
     @MainActor private static var accessibilityPID: pid_t?
@@ -335,44 +365,50 @@ enum CodexConversationControls {
             case .up, .down:
                 let choices = form.options
                 guard !choices.isEmpty else { return true }
-                let current = choices.firstIndex { snapshot.nodes[$0].focused }
-                    ?? choices.firstIndex { snapshot.nodes[$0].selected }
-                    ?? choices.firstIndex {
-                        guard let lastFormRoot, let lastOption,
-                              CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
-                        return CFEqual(lastOption, snapshot.elements[$0])
-                    }
+                let current = choices.firstIndex {
+                    guard let lastFormRoot, let lastOption, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
+                    return CFEqual(lastOption, snapshot.elements[$0])
+                } ?? choices.firstIndex { snapshot.nodes[$0].selected || snapshot.nodes[$0].focused }
                 let next = current.map { min(choices.count - 1, max(0, $0 + (action == .up ? -1 : 1))) }
                     ?? (action == .up ? choices.count - 1 : 0)
-                let applied = select(choices[next], in: snapshot, isCurrent: isCurrent)
-                trace.notice("selected ordinal=\(next + 1) dispatched=\(applied)")
-                if applied {
-                    lastFormRoot = snapshot.elements[form.root]
-                    lastOption = snapshot.elements[choices[next]]
-                }
-            case .left: press(form.previous, in: snapshot, isCurrent: isCurrent)
-            case .right: press(form.next, in: snapshot, isCurrent: isCurrent)
+                let index = choices[next]
+                previewAnswer(index, ordinal: next + 1, form: form, in: snapshot)
+                trace.notice("preview ordinal=\(next + 1)")
+            case .left: clearAnswer(); press(form.previous, in: snapshot, isCurrent: isCurrent)
+            case .right: clearAnswer(); press(form.next, in: snapshot, isCurrent: isCurrent)
             case .ok:
-                let choice = form.options.first { index in
-                    if snapshot.nodes[index].focused || snapshot.nodes[index].selected { return true }
-                    guard let lastFormRoot, let lastOption, CFEqual(lastFormRoot, snapshot.elements[form.root]) else { return false }
-                    return CFEqual(lastOption, snapshot.elements[index])
-                }
-                if let choice {
-                    select(choice, in: snapshot, isCurrent: isCurrent)
-                } else if let field = preferredField(form, nodes: snapshot.nodes) {
+                if lastOption == nil, let field = preferredField(form, nodes: snapshot.nodes) {
                     _ = focus(field, in: snapshot)
-                } else if let first = form.options.first { select(first, in: snapshot, isCurrent: isCurrent) }
+                }
             case .submit:
-                // Never synthesize Return: no confirmed button means no submission.
-                if let submit = form.submit { press(submit, in: snapshot, isCurrent: isCurrent) }
-                else { unavailable("未找到当前提问的明确提交按钮，本次未提交。") }
+                if let pending = lastOption {
+                    let root = lastFormRoot
+                    clearAnswer()
+                    guard let root, CFEqual(root, snapshot.elements[form.root]),
+                          let index = form.options.first(where: { CFEqual(snapshot.elements[$0], pending) }) else { return true }
+                    if !snapshot.nodes[index].selected {
+                        guard select(index, in: snapshot, isCurrent: isCurrent) else { return true }
+                        // Some option rows immediately send. Only press a separate Send
+                        // if the very same question and its original options still exist.
+                        guard let verified = self.snapshot(), verified.complete, sameWindow(snapshot), isCurrent(),
+                              let remaining = activeForm(verified.nodes), CFEqual(root, verified.elements[remaining.root]),
+                              remaining.options.count == form.options.count,
+                              zip(remaining.options, form.options).allSatisfy({ CFEqual(verified.elements[$0.0], snapshot.elements[$0.1]) }) else { return true }
+                        press(remaining.submit, in: verified, isCurrent: isCurrent)
+                        return true
+                    }
+                }
+                press(form.submit, in: snapshot, isCurrent: isCurrent)
             }
+        } else if lastOption != nil && action == .submit {
+            clearAnswer()
+            return true
         } else if blocksChat(snapshot.nodes) {
+            clearAnswer()
             unavailable("当前弹层或提问控件尚未确认，请在 Codex 中检查。")
         } else {
             switch action {
-            case .up, .down: scroll(action == .up, snapshot: snapshot, isCurrent: isCurrent)
+            case .up, .down: clearAnswer(); scroll(action == .up, snapshot: snapshot, isCurrent: isCurrent)
             case .ok:
                 if let field = composer(snapshot.nodes, window: snapshot.window) { _ = focus(field, in: snapshot) }
             case .submit:
@@ -394,6 +430,7 @@ enum CodexConversationControls {
     }
 
     @MainActor static func focusForDictation() -> Bool {
+        clearAnswer()
         guard let snapshot = snapshot(), snapshot.complete else { return false }
         if let form = activeForm(snapshot.nodes) {
             if let field = preferredField(form, nodes: snapshot.nodes) { return focus(field, in: snapshot) }

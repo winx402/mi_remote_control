@@ -409,7 +409,10 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self, let km = services.keyMapper, let filter = services.hidFilter else { return }
             self.dockNavigation.engine = km.engine
             km.engine.onInputReset = { [weak self] in
-                MainActor.assumeIsolated { self?.overlayCenter?.invalidateInputConfirmation() }
+                MainActor.assumeIsolated {
+                    CodexConversationControls.clearAnswer()
+                    self?.overlayCenter?.invalidateInputConfirmation()
+                }
             }
             km.engine.onApplicationNavigation = { [weak self] key, down in
                 MainActor.assumeIsolated { self?.applicationNavigation.handle(key, isDown: down) }

@@ -312,13 +312,14 @@ struct PowerMenuState {
         guard selection.id != Choice.cancel.id,
               let row = visualRows.first(where: { $0.choices.contains { $0.id == selection.id } }),
               let column = row.choices.firstIndex(where: { $0.id == selection.id }) else { return }
-        var next = column + delta
-        while row.choices.indices.contains(next) {
+        // 只在当前视觉行内循环；末行按实际项目数取模，并跳过禁用格。
+        var next = column
+        for _ in row.choices.indices {
+            next = (next + delta + row.choices.count) % row.choices.count
             if !row.choices[next].disabled {
                 updateSelection(row.choices[next])
                 return
             }
-            next += delta
         }
     }
 
@@ -403,7 +404,8 @@ struct PowerMenuState {
         var state = PowerMenuState()
         state.open()
         guard state.selection == .sleep, !state.isExecuting,
-              state.handle(.left) == .none, state.selection == .sleep else { return false }
+              state.handle(.left) == .none, state.selection == .shutDown,
+              state.handle(.right) == .none, state.selection == .sleep else { return false }
         state.open(choices: [actions[0]] + apps + [actions[1], apps[0]])
         guard state.selection == apps[0], !state.isExecuting,
               state.choices.count == 16,
@@ -411,28 +413,36 @@ struct PowerMenuState {
               state.sections[0].choices == [actions[0], actions[1]],
               state.sections[1].columnCount == 10,
               state.sections[0].columnCount == 6 else { return false }
-        // 软件十列折行；左右边界不进入相邻行，禁用格可跨越。
+        // 软件十列折行；左右在同一视觉行首尾循环，禁用格可跨越。
         state.open(choices: apps + actions)
         guard state.selection == apps[0], state.handle(.right) == .none,
               state.selection == apps[2], state.handle(.left) == .none,
               state.selection == apps[0] else { return false }
         state.focus(apps[9])
-        guard state.handle(.right) == .none, state.selection == apps[9],
+        guard state.handle(.right) == .none, state.selection == apps[0],
+              state.handle(.left) == .none, state.selection == apps[9],
               state.handle(.down) == .none, state.selection == apps[12],
-              state.handle(.right) == .none, state.selection == apps[12],
+              state.handle(.right) == .none, state.selection == apps[10],
+              state.handle(.left) == .none, state.selection == apps[12],
               state.handle(.up) == .none, state.selection == apps[2] else { return false }
         state.focus(apps[10])
-        guard state.handle(.left) == .none, state.selection == apps[10],
+        guard state.handle(.left) == .none, state.selection == apps[12],
+              state.handle(.right) == .none, state.selection == apps[10],
               state.handle(.up) == .none, state.selection == apps[0] else { return false }
         // 六列功能区逐行移动，并按固定格中心在十列/六列之间对齐。
         state.focus(actions[5])
-        guard state.handle(.right) == .none, state.selection == actions[5],
+        guard state.handle(.right) == .none, state.selection == actions[0],
+              state.handle(.left) == .none, state.selection == actions[5],
               state.handle(.down) == .none, state.selection == actions[11],
               state.handle(.up) == .none, state.selection == actions[5] else { return false }
         state.focus(actions[6])
-        guard state.handle(.left) == .none, state.selection == actions[6],
+        guard state.handle(.left) == .none, state.selection == actions[11],
+              state.handle(.right) == .none, state.selection == actions[6],
               state.handle(.right) == .none, state.selection == actions[8],
               state.handle(.left) == .none, state.selection == actions[6] else { return false }
+        state.focus(actions[13])
+        guard state.handle(.right) == .none, state.selection == actions[12],
+              state.handle(.left) == .none, state.selection == actions[13] else { return false }
         state.focus(apps[12])
         guard state.handle(.down) == .none, state.selection == actions[1],
               state.handle(.up) == .none, state.selection == apps[12] else { return false }
@@ -477,7 +487,17 @@ struct PowerMenuState {
               state.handle(.down) == .none, state.selection == apps[0], state.error == nil else { return false }
         state.focusSection("电视")
         state.focusSection("不存在")
-        guard state.selection == volume, !state.isExecuting else { return false }
+        guard state.selection == volume, !state.isExecuting,
+              state.handle(.left) == .none, state.selection == volume,
+              state.handle(.right) == .none, state.selection == volume else { return false }
+        // 首尾禁用时循环仍寻找可用格；整行只有一个可用项时保持原位。
+        state.open(choices: (0..<8).map { item($0, disabled: [0, 2, 5, 6].contains($0)) })
+        guard state.selection.id == actions[1].id,
+              state.handle(.left) == .none, state.selection.id == actions[4].id,
+              state.handle(.right) == .none, state.selection.id == actions[1].id,
+              state.handle(.down) == .none, state.selection.id == actions[7].id,
+              state.handle(.left) == .none, state.selection.id == actions[7].id,
+              state.handle(.right) == .none, state.selection.id == actions[7].id else { return false }
         // 执行中仍可关闭；关闭后的完成回调不会复活面板。
         for key in [RemoteKey.back, .power, .home, .tv, .menu] {
             state.open(choices: [volume])

@@ -51,6 +51,16 @@ final class NavigationFocusOverlay {
             }
             title = "\(region.title) · \(hint)"
         } else { title = "" }
+        render(nodeRect: nodeRect, regionRect: regionRect, target: target, primary: primary, title: title)
+    }
+
+    func showAnswer(_ bounds: CGRect, ordinal: Int) {
+        guard let primary = NSScreen.screens.first, bounds.width >= 3, bounds.height >= 3 else { hide(); return }
+        let rect = NavigationFocusOverlayGeometry.appKitRect(bounds, primaryTop: primary.frame.maxY)
+        render(nodeRect: rect, regionRect: nil, target: rect, primary: primary, title: "选项 \(ordinal) · 长按 OK 提交")
+    }
+
+    private func render(nodeRect: CGRect?, regionRect: CGRect?, target: CGRect, primary: NSScreen, title: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
             .foregroundColor: NSColor.white

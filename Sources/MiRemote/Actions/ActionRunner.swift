@@ -218,11 +218,12 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
         let issued = ContinuousClock.now
         DispatchQueue.main.async {
             defer { if direction { Self.pendingCodexDirection.withLock { $0 = false } } }
-            guard current(), issued.duration(to: .now) < .milliseconds(500) else { return }
+            guard current() else { return }
             if name == "codex_context_back" || name == "codex_delete_backward" {
                 CodexBackspace.perform(allowsEscape: name == "codex_context_back", isCurrent: current)
                 return
             }
+            guard issued.duration(to: .now) < .milliseconds(500) else { return }
             if name == "codex_context_submit", CodexDictation.isActive {
                 CodexNavigation.showNotice("请先结束听写，等文字出现在输入框后再长按 OK 发送。")
                 return

@@ -281,6 +281,16 @@ final class CodexSessions {
             let task = Process()
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
+            // npm 安装的 codex 通过 /usr/bin/env 查找 node；GUI 的 PATH 可能不含它所在的目录。
+            var environment = ProcessInfo.processInfo.environment
+            var paths = (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+                .split(separator: ":").map(String.init)
+            for directory in [executable.deletingLastPathComponent().path, "/opt/homebrew/bin", "/usr/local/bin"]
+                where !paths.contains(directory) {
+                paths.append(directory)
+            }
+            environment["PATH"] = paths.joined(separator: ":")
+            task.environment = environment
             task.executableURL = executable
             task.arguments = ["app-server", "-c", "analytics.enabled=false"]
             task.standardInput = stdinPipe

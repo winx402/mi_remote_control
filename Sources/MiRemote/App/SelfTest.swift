@@ -73,6 +73,16 @@ private func rms(_ a: [Int16], _ b: [Int16]) -> Double {
     return (a.isEmpty ? 0 : (acc / Double(a.count)).squareRoot())
 }
 
+private final class RecordingPCMSink: PCMSink {
+    private(set) var startCount = 0
+    private(set) var writeCount = 0
+    private(set) var stopCount = 0
+
+    func streamStarted(sampleRate: Double) { startCount += 1 }
+    func write(_ samples: [Int16]) { writeCount += 1 }
+    func streamStopped() { stopCount += 1 }
+}
+
 enum SelfTest {
     private static var failures = 0
 
@@ -250,6 +260,7 @@ enum SelfTest {
         expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
         expect(TelevisionPowerMenuState.selfCheck(), "电视原生关机确认、异常回执与取消导航（无真实操作）")
         expect(ATVVReconnectPlan.selfCheck(), "ATVV 重连窗口合并、一次已知尝试、停止与旧代隔离")
+        expect(AudioBridge.selfTest(), "长音频按源采样率完整排空并核对样本数（无设备 I/O）")
         expect(VoiceDeliveryGate.selfCheck(), "语音关闭总门、旧会话隔离与清理代次（无音频输出）")
         expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")
@@ -1299,6 +1310,31 @@ enum SelfTest {
             let bad = AppServices.startupVoiceTriggerConfig(
                 globalRule: rule, cliKey: "no_such_key", cliMode: "no_such_mode", cliIME: nil)
             expect(bad.keyName == "fn" && bad.mode == .tap, "CLI 坏值安全回落配置值")
+        }
+
+        // CZ-5. 模式 B 的契约是「只触发、不碰音频」：即使收到遥控器音频帧，
+        // 也不能启动、写入或停止 BlackHole sink；模式 A 保持完整音频生命周期。
+        do {
+            let macSink = RecordingPCMSink()
+            let macMic = VoiceBridgeApp(outputName: nil, wavPath: nil, gainDB: 0, verbose: false,
+                                        switchInput: false, doubao: false, sinkOverride: macSink)
+            macMic.configureVoiceMode(routeRemoteAudio: false, switchInput: false, doubao: false)
+            macMic.atvvVoiceStarted()
+            macMic.atvvAudioFrame(Data([0x00]), sync: nil)
+            macMic.atvvVoiceStopped()
+            expect(macSink.startCount == 0 && macSink.writeCount == 0 && macSink.stopCount == 0,
+                   "Mac 麦克风模式完全绕过 PCM/BlackHole sink")
+
+            let remoteSink = RecordingPCMSink()
+            let remoteMic = VoiceBridgeApp(outputName: nil, wavPath: nil, gainDB: 0, verbose: false,
+                                           switchInput: false, doubao: false, sinkOverride: remoteSink)
+            remoteMic.configureVoiceMode(routeRemoteAudio: true, switchInput: false, doubao: false)
+            remoteMic.atvvVoiceStarted()
+            remoteMic.atvvAudioFrame(Data([0x00]), sync: nil)
+            remoteMic.configureVoiceMode(routeRemoteAudio: false, switchInput: false, doubao: false)
+            remoteMic.atvvVoiceStopped()
+            expect(remoteSink.startCount == 1 && remoteSink.writeCount == 1 && remoteSink.stopCount == 1,
+                   "遥控器麦克风模式保留 PCM sink 完整生命周期")
         }
 
         print(failures == 0 ? "SELF-TEST PASS" : "SELF-TEST FAIL (\(failures))")

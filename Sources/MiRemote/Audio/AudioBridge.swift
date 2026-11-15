@@ -1,5 +1,4 @@
 import Foundation
-import AVFoundation
 import CoreAudio
 import AudioToolbox
 
@@ -90,279 +89,276 @@ private enum CoreAudioDevices {
     }
 }
 
-// MARK: - 线程安全环形缓冲（单生产者/单消费者，Float 样本）
-
-// C1：被音频 render 回调（@Sendable 闭包）捕获，内部所有可变状态由 NSLock 保护，
-// 故标注 @unchecked Sendable —— 由锁而非编译器保证并发安全。
-private final class RingBuffer: @unchecked Sendable {
-    private var storage: [Float]
-    private let capacity: Int
-    private var readIndex = 0
-    private var writeIndex = 0
-    private var fillCount = 0
-    private let lock = NSLock()
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        self.storage = [Float](repeating: 0, count: capacity)
-    }
-
-    /// 写入样本，缓冲满则丢弃最旧的（保证实时性，宁可丢老数据不阻塞）。
-    func write(_ samples: [Float]) {
-        lock.lock()
-        defer { lock.unlock() }
-        for s in samples {
-            storage[writeIndex] = s
-            writeIndex = (writeIndex + 1) % capacity
-            if fillCount == capacity {
-                // 满了：覆盖，读指针跟进
-                readIndex = (readIndex + 1) % capacity
-            } else {
-                fillCount += 1
-            }
-        }
-    }
-
-    /// 读取 count 个样本到 dst；不足部分补零（欠载不崩溃）。返回实际读到的有效样本数。
-    @discardableResult
-    func read(into dst: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        let available = min(count, fillCount)
-        for i in 0..<available {
-            dst[i] = storage[readIndex]
-            readIndex = (readIndex + 1) % capacity
-        }
-        fillCount -= available
-        if available < count {
-            for i in available..<count { dst[i] = 0 }
-        }
-        return available
-    }
-
-    var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return fillCount
-    }
-
-    func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        readIndex = 0
-        writeIndex = 0
-        fillCount = 0
-    }
-}
-
 // MARK: - AudioBridge
 
-/// 把 16kHz Int16 单声道 PCM 实时播放到指定输出设备。
-///
-/// C1：start/stop 的状态迁移在 @Sendable 闭包里捕获 self，可变状态统一由串行 stateQueue
-/// 串起来（render 回调只碰 ring），因此标注 @unchecked Sendable —— 由 stateQueue 保证隔离。
+/// AudioQueue receives source-rate PCM and converts to the explicitly bound device format.
+/// All state and output callbacks share stateQueue; no audio callback touches main-thread state.
 final class AudioBridge: PCMSink, @unchecked Sendable {
+    /// AudioQueueDispose waits for callbacks. It must never run on their dispatch queue.
+    private final class QueueHandle: @unchecked Sendable {
+        let queue: AudioQueueRef
+        init(_ queue: AudioQueueRef) { self.queue = queue }
+    }
+    private static let disposalQueue = DispatchQueue(label: "com.miremote.audiobridge.dispose", qos: .userInitiated)
+
+    private static func dispose(_ queue: AudioQueueRef, then completion: @escaping @Sendable () -> Void) {
+        let handle = QueueHandle(queue)
+        disposalQueue.async {
+            let status = AudioQueueDispose(handle.queue, true)
+            if status != noErr { NSLog("[AudioBridge] 清理播放队列失败 (\(status))") }
+            completion()
+        }
+    }
 
     private let deviceName: String?
     private let requiresNamedDevice: Bool
-    private let engine = AVAudioEngine()
-    private var sourceNode: AVAudioSourceNode?
-    private let ring: RingBuffer
-    private var sourceSampleRate: Double = 16000
-    private var isRunning = false
+    private let stateQueue = DispatchQueue(label: "com.miremote.audiobridge.state", qos: .userInitiated)
+    private var audioQueue: AudioQueueRef?
+    private var playback = AudioPlaybackBuffer()
+    private var sourceSampleRate: Double = 16_000
+    private var accepting = false
+    private var stopping = false
+    private var generation: UInt64 = 0
+    private var drainDeadline: UInt64 = 0
+    private var drainCallbacks: [@Sendable () -> Void] = []
+    private var inFlight: [UInt: Int] = [:]
 
-    // C4/S12：所有 started/stopped 状态迁移都排到这条串行 queue，化解二者竞态；
-    // 排空+停引擎的阻塞工作再甩到 workQueue，绝不阻塞调用线程。
-    private let stateQueue = DispatchQueue(label: "com.miremote.audiobridge.state")
-    private let workQueue = DispatchQueue(label: "com.miremote.audiobridge.work", qos: .userInitiated)
-    /// 每次状态迁移自增；停机的后台排空完成后据此判断期间是否又来了新的 start（来了则取消停机）。
-    private var generation = 0
-
-    /// - Parameter deviceName: 目标输出设备名前缀（如 "BlackHole 2ch"）；nil = 系统默认输出。
     init(deviceName: String?, requiresNamedDevice: Bool = false) {
         self.deviceName = deviceName
         self.requiresNamedDevice = requiresNamedDevice
-        // 几秒容量（按 16k 源速率算，实际以 float 存，容量给足）：4 秒
-        self.ring = RingBuffer(capacity: 16000 * 4)
     }
 
-    // MARK: PCMSink
-
-    func streamStarted(sampleRate: Double) {
-        streamStarted(sampleRate: sampleRate, onReady: nil)
+    deinit {
+        if let queue = audioQueue { Self.dispose(queue) {} }
     }
 
-    /// 回调只确认音频输出引擎可运行，不代表输入法已经开始收音。
+    func streamStarted(sampleRate: Double) { streamStarted(sampleRate: sampleRate, onReady: nil) }
+
+    /// Confirms only that the output queue is ready; the input method has its own startup gate.
     func streamStarted(sampleRate: Double, onReady: (@Sendable (Bool) -> Void)?) {
         stateQueue.async { [self] in
-            // S12：新的 start 使任何在途的停机失效（下方 stopped 的后台任务会据 generation 放弃）。
-            generation += 1
-            guard !isRunning else { onReady?(true); return }
-            sourceSampleRate = sampleRate
-            ring.clear()
-            // 若上一次 stop 的后台排空尚未真正停机，引擎仍在运行——直接复用，不重复 attach。
-            if engine.isRunning, sourceNode != nil {
-                isRunning = true
-                NSLog("[AudioBridge] 复用运行中的引擎（取消上一次停机）")
-                onReady?(true)
+            guard sampleRate.isFinite, (8_000...192_000).contains(sampleRate) else {
+                onReady?(false)
                 return
             }
-            do {
-                try start()
-                isRunning = true
-                onReady?(true)
-            } catch {
-                NSLog("[AudioBridge] 启动失败: \(error)")
+            if accepting, sourceSampleRate == sampleRate { onReady?(true); return }
+            if audioQueue != nil { finish(reason: "superseded", complete: false) }
+            generation &+= 1
+            sourceSampleRate = sampleRate
+            playback = AudioPlaybackBuffer()
+            inFlight.removeAll(keepingCapacity: true)
+            stopping = false
+            start(onReady: onReady)
+        }
+    }
+
+    func write(_ samples: [Int16]) {
+        guard !samples.isEmpty else { return }
+        // Dispatch preserves start/write/stop order, including a burst of cached pre-roll.
+        stateQueue.async { [self] in
+            guard accepting else { return }
+            playback.append(samples)
+        }
+    }
+
+    func streamStopped() { streamStopped(onDrained: nil) }
+
+    /// Drains every accepted source sample, a 200ms silent tail, and the queue's converter.
+    /// IsRunning=0 after AudioQueueStop(false), rather than an empty FIFO, proves completion.
+    func streamStopped(onDrained: (@Sendable () -> Void)?) {
+        stateQueue.async { [self] in
+            guard audioQueue != nil else { onDrained?(); return }
+            if let onDrained { drainCallbacks.append(onDrained) }
+            guard accepting else { return }
+            accepting = false
+            playback.finish(silenceFrames: Int((sourceSampleRate * 0.2).rounded(.up)))
+            // Backlog may exceed seconds after a gated start; its full duration is allowed.
+            // A stalled/disconnected device still gets a bounded deadline, with explicit loss logging.
+            let seconds = Double(playback.pendingFrames) / sourceSampleRate + 0.06 + 5.0
+            drainDeadline = DispatchTime.now().uptimeNanoseconds + UInt64(seconds * 1_000_000_000)
+            pollDrain(generation: generation)
+        }
+    }
+
+    func cancelStream() {
+        stateQueue.async { [self] in
+            guard audioQueue != nil else { return }
+            finish(reason: "cancelled", complete: false)
+        }
+    }
+
+    private func refill(_ queue: AudioQueueRef, _ buffer: AudioQueueBufferRef, generation token: UInt64) {
+        guard generation == token, audioQueue == queue, !stopping else { return }
+        let key = UInt(bitPattern: buffer)
+        playback.completedFrames += inFlight.removeValue(forKey: key) ?? 0
+        let count = Int(buffer.pointee.mAudioDataBytesCapacity) / MemoryLayout<Float>.size
+        let speechFrames = playback.read(into: buffer.pointee.mAudioData.assumingMemoryBound(to: Float.self), count: count)
+        buffer.pointee.mAudioDataByteSize = buffer.pointee.mAudioDataBytesCapacity
+        let status = AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+        guard status == noErr else {
+            NSLog("[AudioBridge] 提交播放缓冲失败 (\(status))")
+            stateQueue.async { [self] in
+                guard generation == token else { return }
+                finish(reason: "enqueue_failed", complete: false)
+            }
+            stopping = true
+            return
+        }
+        inFlight[key] = speechFrames
+        playback.submittedFrames += speechFrames
+        if !accepting, playback.pendingFrames == 0 {
+            // No more buffers are enqueued after this call. The queue also flushes its converter.
+            stopping = true
+            let status = AudioQueueStop(queue, false)
+            if status != noErr {
+                NSLog("[AudioBridge] 异步排空失败 (\(status))")
+                stateQueue.async { [self] in
+                    guard generation == token else { return }
+                    finish(reason: "stop_failed", complete: false)
+                }
+            }
+        }
+    }
+
+    private func pollDrain(generation token: UInt64) {
+        guard token == generation, let queue = audioQueue, !accepting else { return }
+        if stopping {
+            var running: UInt32 = 1
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            let status = AudioQueueGetProperty(queue, kAudioQueueProperty_IsRunning, &running, &size)
+            if status != noErr {
+                finish(reason: "status_failed", complete: false)
+                return
+            }
+            if running == 0 {
+                // Stop(false) guarantees every submitted buffer played, even if its callback
+                // has not been delivered on stateQueue yet.
+                playback.completedFrames = playback.submittedFrames
+                finish(reason: "drained", complete: playback.submittedFrames == playback.receivedFrames)
+                return
+            }
+        }
+        if DispatchTime.now().uptimeNanoseconds >= drainDeadline {
+            finish(reason: "drain_timeout", complete: false)
+            return
+        }
+        stateQueue.asyncAfter(deadline: .now() + .milliseconds(20)) { [self] in
+            pollDrain(generation: token)
+        }
+    }
+
+    private func finish(reason: String, complete: Bool) {
+        generation &+= 1
+        accepting = false
+        stopping = true
+        // Clear identity before disposal: synchronous disposal can itself deliver old callbacks.
+        let queue = audioQueue
+        audioQueue = nil
+        let discarded = max(0, playback.receivedFrames - playback.completedFrames)
+        NSLog("[AudioBridge] drain status=%@ rate=%.0f received=%ld submitted=%ld completed=%ld discarded=%ld truncated=%@",
+              reason, sourceSampleRate, playback.receivedFrames, playback.submittedFrames,
+              playback.completedFrames, discarded, complete ? "false" : "true")
+        playback = AudioPlaybackBuffer()
+        inFlight.removeAll(keepingCapacity: true)
+        let callbacks = drainCallbacks
+        drainCallbacks.removeAll()
+        let callbackQueue = stateQueue
+        if let queue {
+            Self.dispose(queue) {
+                // The detached queue remains alive until disposal finishes. New starts use a
+                // different generation and never wait on this cleanup queue.
+                callbackQueue.async { callbacks.forEach { $0() } }
+            }
+        } else {
+            callbacks.forEach { $0() }
+        }
+    }
+
+    private func start(onReady: (@Sendable (Bool) -> Void)?) {
+        // PR14: unlike an AVAudioEngine I/O node, this queue keeps its explicit device UID
+        // when an input method switches the system default microphone.
+        var format = AudioStreamBasicDescription(
+            mSampleRate: sourceSampleRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0
+        )
+        var created: AudioQueueRef?
+        let token = generation
+        do {
+            try check(AudioQueueNewOutputWithDispatchQueue(&created, &format, 0, stateQueue) { [weak self] queue, buffer in
+                self?.refill(queue, buffer, generation: token)
+            }, "创建播放队列")
+            guard let queue = created else {
+                throw NSError(domain: "AudioBridge", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "未创建播放队列"])
+            }
+            if let name = deviceName {
+                if let device = CoreAudioDevices.findOutputDevice(namePrefix: name) {
+                    var address = AudioObjectPropertyAddress(
+                        mSelector: kAudioDevicePropertyDeviceUID,
+                        mScope: kAudioObjectPropertyScopeGlobal,
+                        mElement: kAudioObjectPropertyElementMain)
+                    var uid: CFString?
+                    var size = UInt32(MemoryLayout<CFString?>.size)
+                    try withUnsafeMutablePointer(to: &uid) { pointer in
+                        try check(AudioObjectGetPropertyData(device, &address, 0, nil, &size, pointer), "读取输出设备 UID")
+                        guard pointer.pointee != nil else {
+                            throw NSError(domain: "AudioBridge", code: -4,
+                                          userInfo: [NSLocalizedDescriptionKey: "输出设备 UID 为空"])
+                        }
+                        try check(AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, pointer, size), "绑定输出设备")
+                    }
+                } else if requiresNamedDevice {
+                    throw NSError(domain: "AudioBridge", code: -3,
+                                  userInfo: [NSLocalizedDescriptionKey: "未找到指定的音频桥接设备"])
+                } else {
+                    NSLog("[AudioBridge] 未找到输出设备 %@，回退系统默认输出", name)
+                }
+            } else if requiresNamedDevice {
+                throw NSError(domain: "AudioBridge", code: -3,
+                              userInfo: [NSLocalizedDescriptionKey: "严格设备模式必须指定输出设备"])
+            }
+            // Exactly source-rate frames: never label 16k PCM as 48k (which plays only 1/3 as long).
+            let bytes = UInt32((sourceSampleRate * 0.02).rounded(.up)) * UInt32(MemoryLayout<Float>.size)
+            for _ in 0..<3 {
+                var allocated: AudioQueueBufferRef?
+                try check(AudioQueueAllocateBuffer(queue, bytes, &allocated), "分配播放缓冲")
+                guard let buffer = allocated else {
+                    throw NSError(domain: "AudioBridge", code: -2,
+                                  userInfo: [NSLocalizedDescriptionKey: "未分配播放缓冲"])
+                }
+                memset(buffer.pointee.mAudioData, 0, Int(bytes))
+                buffer.pointee.mAudioDataByteSize = bytes
+                try check(AudioQueueEnqueueBuffer(queue, buffer, 0, nil), "提交初始播放缓冲")
+            }
+            audioQueue = queue
+            try check(AudioQueueStart(queue, nil), "启动播放")
+            accepting = true
+            onReady?(true)
+        } catch {
+            audioQueue = nil
+            NSLog("[AudioBridge] 启动失败: \(error)")
+            let callbackQueue = stateQueue
+            if let queue = created {
+                Self.dispose(queue) { callbackQueue.async { onReady?(false) } }
+            } else {
                 onReady?(false)
             }
         }
     }
 
-    func write(_ samples: [Int16]) {
-        // Int16 → Float [-1, 1]
-        var floats = [Float](repeating: 0, count: samples.count)
-        for i in 0..<samples.count {
-            floats[i] = Float(samples[i]) / 32768.0
-        }
-        ring.write(floats)
-    }
-
-    func streamStopped() { streamStopped(onDrained: nil) }
-
-    /// 停止接收后排空已采集音频，再结束输入法，避免截掉长按门缓存的末尾。
-    func streamStopped(onDrained: (@Sendable () -> Void)?) {
-        // C4：调用线程只做一次非阻塞派发；排空+停引擎全部在后台执行。
-        stateQueue.async { [self] in
-            guard isRunning else { onDrained?(); return }
-            isRunning = false
-            generation += 1
-            let gen = generation
-
-            workQueue.async { [self] in
-                // 缓冲已有数据才需排空 + 尾巴；已空则直接停机，不做无谓 sleep。
-                if ring.count > 0 {
-                    let deadline = Date().addingTimeInterval(2.0)
-                    while ring.count > 0 && Date() < deadline {
-                        Thread.sleep(forTimeInterval: 0.02)
-                    }
-                    Thread.sleep(forTimeInterval: 0.2) // 200ms 尾巴，防截尾
-                }
-                // 回到状态 queue 真正停机：期间若来了新的 start（generation 变了），取消本次停机。
-                stateQueue.async { [self] in
-                    guard gen == generation else {
-                        NSLog("[AudioBridge] 停机被新的 start 取消")
-                        onDrained?()
-                        return
-                    }
-                    engine.stop()
-                    if let node = sourceNode {
-                        engine.detach(node)
-                        sourceNode = nil
-                    }
-                    onDrained?()
-                }
-            }
-        }
-    }
-
-    func cancelStream() {
-        ring.clear()
-        streamStopped()
-    }
-
-    // MARK: 引擎搭建
-
-    private func start() throws {
-        // S10：先绑定目标输出设备，再读取输出格式——绑定会改变 outputNode 的当前设备，
-        // 其采样率随之变化，必须在绑定之后读取才拿到目标设备的真实采样率。
-        if let name = deviceName {
-            if let deviceID = CoreAudioDevices.findOutputDevice(namePrefix: name) {
-                try bindOutputDevice(deviceID)
-            } else if requiresNamedDevice {
-                throw NSError(domain: "AudioBridge", code: -3,
-                              userInfo: [NSLocalizedDescriptionKey: "未找到指定的音频桥接设备"])
-            } else {
-                NSLog("[AudioBridge] 未找到输出设备 \"\(name)\"，回退系统默认输出")
-            }
-        }
-
-        let output = engine.outputNode
-        let outputFormat = output.outputFormat(forBus: 0)
-        let outputSampleRate = outputFormat.sampleRate > 0 ? outputFormat.sampleRate : 48000
-
-        // 源节点声明为源采样率（16k）单声道 float；engine 自动把 16k→输出设备采样率做上采样。
-        // ponytail: 让 AVAudioEngine 内部转换器处理重采样，比手写线性插值简单可靠。
-        guard let srcFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sourceSampleRate,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw NSError(domain: "AudioBridge", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "无法创建源格式"])
-        }
-
-        let ringRef = ring
-        let node = AVAudioSourceNode(format: srcFormat) { _, _, frameCount, audioBufferList in
-            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            let n = Int(frameCount)
-            // 单声道非交错：只有一个 buffer
-            if let mData = abl[0].mData {
-                let ptr = mData.assumingMemoryBound(to: Float.self)
-                ringRef.read(into: ptr, count: n)
-            }
-            return noErr
-        }
-        self.sourceNode = node
-        engine.attach(node)
-
-        // 连接到主混音器，用输出设备的采样率格式（engine 会在 source(16k)→mixer 之间自动转换）。
-        let connectFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: outputSampleRate,
-            channels: 1,
-            interleaved: false
-        )
-        engine.connect(node, to: engine.mainMixerNode, format: connectFormat)
-
-        // S9：引擎启动失败时回滚已 attach 的节点，避免残留半初始化状态污染下次 start。
-        do {
-            try engine.start()
-        } catch {
-            engine.detach(node)
-            sourceNode = nil
-            throw error
-        }
-    }
-
-    /// 把 engine.outputNode 底层的 AUHAL 绑定到指定 CoreAudio 设备。
-    private func bindOutputDevice(_ deviceID: AudioObjectID) throws {
-        let audioUnit = engine.outputNode.audioUnit
-        guard let au = audioUnit else {
-            throw NSError(domain: "AudioBridge", code: -2,
-                          userInfo: [NSLocalizedDescriptionKey: "outputNode 无 audioUnit"])
-        }
-        var dev = deviceID
-        let status = AudioUnitSetProperty(
-            au,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &dev,
-            UInt32(MemoryLayout<AudioObjectID>.size)
-        )
+    private func check(_ status: OSStatus, _ operation: String) throws {
         guard status == noErr else {
             throw NSError(domain: "AudioBridge", code: Int(status),
-                          userInfo: [NSLocalizedDescriptionKey: "绑定输出设备失败 (\(status))"])
+                          userInfo: [NSLocalizedDescriptionKey: "\(operation)失败 (\(status))"])
         }
     }
 
-    // MARK: 静态枚举
+    static func listOutputDevices() -> [String] { CoreAudioDevices.outputDeviceNames() }
 
-    /// 枚举所有输出设备名（给 CLI --list-audio-devices 用）。
-    static func listOutputDevices() -> [String] {
-        CoreAudioDevices.outputDeviceNames()
-    }
+    /// Pure FIFO/rate/drain-accounting tests. Does not construct or start an audio device.
+    static func selfTest() -> Bool { AudioPlaybackBuffer.selfTest() }
 }
 
 // MARK: - WAVSink（调试用）
@@ -449,5 +445,13 @@ final class TeeSink: PCMSink {
 
     func streamStarted(sampleRate: Double) { sinks.forEach { $0.streamStarted(sampleRate: sampleRate) } }
     func write(_ samples: [Int16]) { sinks.forEach { $0.write(samples) } }
-    func streamStopped() { sinks.forEach { $0.streamStopped() } }
+    func streamStopped() { streamStopped(onDrained: nil) }
+    func streamStopped(onDrained: (@Sendable () -> Void)?) {
+        let group = DispatchGroup()
+        for sink in sinks {
+            group.enter()
+            sink.streamStopped { group.leave() }
+        }
+        if let onDrained { group.notify(queue: .global(qos: .userInitiated), execute: onDrained) }
+    }
 }

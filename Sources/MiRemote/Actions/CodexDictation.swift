@@ -15,6 +15,10 @@ enum CodexDictation {
     @MainActor private static var triggerConfig = VoiceTriggerConfig()
     /// 服务容器同步打开／关闭遥控器 PCM 交付；映射引擎是长按判定的唯一来源。
     @MainActor static var onPhysicalHoldState: ((Bool) -> Void)?
+    /// HID 松手只请求收尾；ATVV STOP／有界等待及已排队 PCM 交付后才结束识别。
+    @MainActor static var onPhysicalHoldRelease: ((UInt64) -> Void)?
+    /// 新 Codex 会话开始前，清理通用语音工具仍在持有的键／延迟恢复。
+    @MainActor static var onPhysicalHoldPrepare: (() -> Void)?
     @MainActor private static var voiceEngine: CodexVoiceEngine = .wechat
     @MainActor private static var bridgeDeviceName = "BlackHole 2ch"
     @MainActor private static var remoteIME: RemoteInputMethodSession?
@@ -35,6 +39,8 @@ enum CodexDictation {
     @MainActor private static var useRemoteMicrophone = true
     @MainActor private static var inputEnabled = true
     @MainActor private static var physicalHoldActive = false
+    @MainActor private static var remoteReleaseRequested = false
+    @MainActor private static var remotePCMSamples = 0
     @MainActor private static var remoteGeneration: UInt64 = 0
     @MainActor private static var remoteSession: RemoteSession?
     @MainActor private static var remoteTimer: Timer?
@@ -116,6 +122,7 @@ enum CodexDictation {
         // 新一次按住不能把上次尚在等待的识别结果写进新上下文。
         stop(reason: nil, restoreImmediately: true)
         guard remoteIMEFinishing == nil else { return }
+        onPhysicalHoldPrepare?()
         guard useRemoteMicrophone else {
             physicalHoldActive = true
             toggle()
@@ -163,8 +170,26 @@ enum CodexDictation {
 
     @MainActor static func endPhysicalHold() {
         guard physicalHoldActive else { return }
+        if useRemoteMicrophone, remoteIME?.keyDown == true || remoteSession != nil {
+            guard !remoteReleaseRequested else { return }
+            remoteReleaseRequested = true
+            if let onPhysicalHoldRelease {
+                onPhysicalHoldRelease(remoteGeneration)
+                return
+            }
+        }
+        finishPhysicalHold()
+    }
+
+    /// 必须在同一会话最后一个 PCM 的主队列交付之后调用。
+    @MainActor private static func finishPhysicalHold() {
+        guard physicalHoldActive else { return }
         physicalHoldActive = false
-        onPhysicalHoldState?(false) // 立即拒绝松手后的 PCM，再等待已采集音频的最终结果。
+        remoteReleaseRequested = false
+        onPhysicalHoldState?(false)
+        if useRemoteMicrophone {
+            status("音频交付结束 source=remote samples=\(remotePCMSamples) duration=\(String(format: "%.3f", Double(remotePCMSamples) / 16000))s")
+        }
         if remoteIME != nil {
             stop(reason: nil, restoreImmediately: false)
             return
@@ -302,7 +327,7 @@ enum CodexDictation {
             status("引擎结束 engine=wechat reason=\(current.keyDown ? "cancel" : "released-before-ready")")
             return
         }
-        // 松手立即拒绝新 PCM，只把已经采集的缓冲排空，避免截断最后几个字。
+        // 传输结束标记已在最后一个 PCM 后到达；排空完整音频与静音尾后才松开触发键。
         remoteIMEFinishing = current
         let stopID = UUID()
         remoteIMEStopID = stopID
@@ -320,6 +345,11 @@ enum CodexDictation {
         status("收音结束 engine=wechat；正在排空已采集音频")
         current.sink.streamStopped {
             Task { @MainActor in
+                guard remoteIMEStopID == stopID else { return }
+                // 播放排空只证明 PCM 已送给 BlackHole；继续保留原触发键，让微信消费尾部。
+                // 这不是第三方完成识别的确认；上下文监视器可随时取消这段有界等待。
+                status("音频排空 engine=wechat；保留 500ms 触发键收尾窗口")
+                try? await Task.sleep(for: .milliseconds(500))
                 guard remoteIMEStopID == stopID, var pending = remoteIMEFinishing else { return }
                 guard releaseRemoteInputMethodKey(pending) else {
                     restoreBridgeInput()
@@ -334,10 +364,12 @@ enum CodexDictation {
                 onStateChanged?(isActive)
                 bridgeRestoreTask = Task { @MainActor in
                     // 输入法仍可能整理最终文字；这段时间不重新聚焦，焦点改变便提前收尾。
-                    for _ in 0..<24 {
+                    for _ in 0..<60 {
                         try? await Task.sleep(for: .milliseconds(50))
                         guard !Task.isCancelled else { return }
-                        if !remoteTargetHasFocus(pending.target) { break }
+                        if !remoteTargetHasFocus(pending.target)
+                            || !currentInputSourceMatches(prefix: "com.tencent.inputmethod.wetype")
+                            || DefaultInput.currentDefault() != bridgeInput { break }
                     }
                     remoteIMEFinishingTimer?.invalidate()
                     remoteIMEFinishingTimer = nil
@@ -371,7 +403,7 @@ enum CodexDictation {
         bridgeInput = nil
     }
 
-    /// AppServices 在主线程按 ATVV 顺序投递；松手及取消后不再接收。
+    /// AppServices 在主线程按 ATVV 顺序投递；HID 松手后仍允许最后一批已采集尾帧。
     @MainActor static func receiveRemotePCM(_ samples: [Int16], token: UInt64) {
         guard token == remoteGeneration, physicalHoldActive else { return }
         if let current = remoteIME {
@@ -381,15 +413,19 @@ enum CodexDictation {
                 stop(reason: "输入框、输入法或音源改变", restoreImmediately: true, showError: false)
                 return
             }
+            remotePCMSamples += samples.count
             current.sink.write(samples)
             return
         }
-        remoteSession?.recognizer.append(samples)
+        if let current = remoteSession {
+            remotePCMSamples += samples.count
+            current.recognizer.append(samples)
+        }
     }
 
     @MainActor static func endRemoteTransport(token: UInt64) {
         guard token == remoteGeneration else { return }
-        endPhysicalHold()
+        finishPhysicalHold()
     }
 
     @MainActor static func cancelRemoteTransport(token: UInt64) {
@@ -476,6 +512,8 @@ enum CodexDictation {
         restorePasteboard()
         let hadPhysicalSession = physicalHoldActive || remoteSession != nil
         physicalHoldActive = false
+        remoteReleaseRequested = false
+        remotePCMSamples = 0
         if hadPhysicalSession { onPhysicalHoldState?(false) }
         remoteSession?.recognizer.cancel()
         remoteSession = nil

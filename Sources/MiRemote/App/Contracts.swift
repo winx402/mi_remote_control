@@ -41,6 +41,15 @@ protocol PCMSink: AnyObject {
     func write(_ samples: [Int16])
     /// 语音流结束
     func streamStopped()
+    /// 已接收音频实际排空后回调；同步消费端使用默认实现。
+    func streamStopped(onDrained: (@Sendable () -> Void)?)
+}
+
+extension PCMSink {
+    func streamStopped(onDrained: (@Sendable () -> Void)?) {
+        streamStopped()
+        onDrained?()
+    }
 }
 
 // MARK: - M2 按键映射契约

@@ -9,6 +9,11 @@
 
 ### 修复
 
+- 遥控器麦克风通过独立绑定到 BlackHole 的 AudioQueue 输出。松手后先送完已采集的声音，再结束微信的按住说话，减少长句和句尾被截断的情况。[上游 PR #14](https://github.com/godarrenw/mi_remote_control/pull/14)
+- 选择 Mac 麦克风时，遥控器只触发语音工具，绕过普通 BlackHole 音频桥。[上游 PR #9](https://github.com/godarrenw/mi_remote_control/pull/9)
+- 调整设置窗口工具栏和侧栏按钮，隔离 UI 预览的权限向导。[上游 PR #11](https://github.com/godarrenw/mi_remote_control/pull/11)
+- 更新配对指示灯和钥匙串指引，签名脚本区分 OpenSSL 3 与 LibreSSL。[上游 PR #8](https://github.com/godarrenw/mi_remote_control/pull/8)
+
 - **per-app 设的 OK 组合键被引擎静默丢弃**：基础态（层 0）的 OK 短按此前被硬编码成
   纯 Return，`fireTap` 根本不读 profile 的 `ok.tap`——GUI 允许你设、`config.json` 也存得下，
   运行时却整条忽略，用户只看到「设了没用」。典型场景：飞书把发送设成 ⌘+Enter，遥控 OK

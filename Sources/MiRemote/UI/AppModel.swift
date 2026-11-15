@@ -348,16 +348,22 @@ final class AppModel: ObservableObject {
         applyVoiceMode()
     }
 
-    /// 语音模式 → VoiceBridgeApp 开关（A=切BlackHole+豆包 / B=仅豆包 / off=全关）。
+    /// 语音模式 → VoiceBridgeApp 开关（A=远端音频+BlackHole / B=仅触发 / off=全关）。
     func applyVoiceMode() {
         guard let voice = services?.voiceApp else { return }
         CodexDictation.configureInput(remoteMicrophone: voiceMode != .macMic, enabled: voiceMode != .off,
                                        engine: codexVoiceEngine,
                                        bridgeDeviceName: config.settings.voiceOutputDevice ?? "BlackHole 2ch")
         switch voiceMode {
-        case .remoteMic: voice.switchInput = true; voice.doubao = true; voice.voiceEnabled = true
-        case .macMic: voice.switchInput = false; voice.doubao = true; voice.voiceEnabled = true
-        case .off: voice.voiceEnabled = false; voice.switchInput = false; voice.doubao = false
+        case .remoteMic:
+            voice.configureVoiceMode(routeRemoteAudio: true, switchInput: true, doubao: true)
+            voice.voiceEnabled = true
+        case .macMic:
+            voice.configureVoiceMode(routeRemoteAudio: false, switchInput: false, doubao: true)
+            voice.voiceEnabled = true
+        case .off:
+            voice.voiceEnabled = false
+            voice.configureVoiceMode(routeRemoteAudio: false, switchInput: false, doubao: false)
         }
     }
 

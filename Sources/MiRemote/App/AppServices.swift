@@ -392,7 +392,9 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var codexPCM = RemotePCMHoldGate()
     /// 松手后仍可能等待最终结果；断连也必须取消这个 token。
     private var codexRecognitionToken: UInt64?
+    private var codexReleaseWork: DispatchWorkItem?
     private var cleanupCount = 0
+    private var _routeRemoteAudio: Bool
     private var _switchInput: Bool
     private var _doubao: Bool
     /// CLI 默认保留音频桥；GUI off 必须显式关闭此总门。
@@ -409,20 +411,19 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             completeForceEnd(restoreInput: restoreInput)
         }
     }
-    /// GUI 语音页可切换（模式 A=true / 模式 B=false）。
-    var switchInput: Bool {
-        get { cfgLock.lock(); defer { cfgLock.unlock() }; return _switchInput }
-        set { cfgLock.lock(); _switchInput = newValue; cfgLock.unlock() }
-    }
-    /// 是否触发豆包（模式 off=false）。
-    var doubao: Bool {
-        get { cfgLock.lock(); defer { cfgLock.unlock() }; return _doubao }
-        set { cfgLock.lock(); _doubao = newValue; cfgLock.unlock() }
+    /// 三模式原子切换；Mac 麦克风与关闭模式完全绕过远端 PCM/BlackHole。
+    func configureVoiceMode(routeRemoteAudio: Bool, switchInput: Bool, doubao: Bool) {
+        cfgLock.lock()
+        _routeRemoteAudio = routeRemoteAudio
+        _switchInput = switchInput
+        _doubao = doubao
+        cfgLock.unlock()
     }
 
     /// 会话锁存（cfgLock 保护）：一次语音会话实际执行过的操作。stop/结束只按锁存
     /// 状态对称清理——会话中把模式切到 off/macMic 不能跳过已做操作的回滚。
     private var sessionActive = false
+    private var sessionRoutedRemoteAudio = false
     private var sessionSwitchedMic = false
     private var sessionDoubao = false
     private var _minimumHoldMs = 0
@@ -440,11 +441,28 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     var shouldSuppressPhysicalVoice: (() -> Bool)?
     var shouldUseCodexPhysicalHold: (() -> Bool)?
 
+    /// Codex 即将接管触发键；保留其 BLE 预缓存，作废通用会话的所有延迟动作。
+    /// 调用者为主线程；shutdown 可能访问 TIS，必须在 sessionLock 外执行。
+    func prepareCodexPhysicalHold() {
+        sessionLock.lock()
+        restoreGeneration &+= 1
+        restoreWork?.cancel()
+        restoreWork = nil
+        pendingVoiceTriggerEnd = false
+        let restoreInput = inputNeedsRestore
+        inputNeedsRestore = false
+        sessionLock.unlock()
+        VoiceTrigger.shutdown()
+        if restoreInput { DefaultInput.restore() }
+    }
+
     /// 只有映射确认的长按可激活；音频桥开关 off 不影响此独立且明确配置的 Codex 动作。
     func setCodexPhysicalHold(active: Bool, token: UInt64) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         guard active else {
+            codexReleaseWork?.cancel()
+            codexReleaseWork = nil
             codexPCM.deactivate()
             if codexRecognitionToken != token { codexRecognitionToken = nil }
             return
@@ -453,6 +471,31 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         if let delivery = codexPCM.activate(token: token) {
             for frame in delivery.frames { processCodexFrame(frame, token: delivery.token) }
         }
+    }
+
+    /// HID up 与 BLE 尾包走不同队列。等待 STOP；缺失 STOP 时最多补收 250ms，
+    /// 然后在已投递的主队列 PCM 后插入结束标记，不能先递增识别代次。
+    func releaseCodexPhysicalHold(token: UInt64) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        codexReleaseWork?.cancel()
+        guard codexRecognitionToken == token, codexPhysicalSession else {
+            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.sessionLock.lock()
+            defer { self.sessionLock.unlock() }
+            guard self.codexRecognitionToken == token else { return }
+            self.codexReleaseWork = nil
+            _ = self.codexPCM.end()
+            self.codexPhysicalSession = false
+            self.physicalVoiceInProgress = false
+            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+        }
+        codexReleaseWork = work
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
     }
 
     private func processCodexFrame(_ frame: VoicePressGate.Frame, token: UInt64) {
@@ -466,12 +509,17 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
 
     init(outputName: String?, wavPath: String?, gainDB: Double, verbose: Bool,
          switchInput: Bool, doubao: Bool, micDeviceName: String = "BlackHole",
-         extraSink: PCMSink? = nil) {
+         extraSink: PCMSink? = nil, sinkOverride: PCMSink? = nil) {
         self.post = PCMPostprocessor(gainDB: gainDB)
         self.verbose = verbose
+        self._routeRemoteAudio = true
         self._switchInput = switchInput
         self._doubao = doubao
         self.micDeviceName = micDeviceName
+        if let sinkOverride {
+            self.sink = sinkOverride
+            return
+        }
         var sinks: [PCMSink] = [AudioBridge(deviceName: outputName)]
         if let wavPath {
             sinks.append(WAVSink(url: URL(fileURLWithPath: wavPath)))
@@ -501,6 +549,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             DispatchQueue.main.async { CodexDictation.cancelRemoteTransport(token: cancelledToken) }
         }
         atvvVoiceStopped() // 清理其余物理会话状态，避免重连后被旧锁存拦住。
+        // 断连属于取消：作废在途 drain/延迟恢复，并立即对称释放通用触发键。
+        forceEndSessionIfActive()
         log("断开连接\(error.map { ": \($0)" } ?? "")（自动重连中）")
         onConnection?(false, nil)
     }
@@ -522,8 +572,11 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             return
         }
         let delay = minimumHoldMs
+        cfgLock.lock()
+        let actionsEnabled = _switchInput || _doubao
+        cfgLock.unlock()
         deliveryGate.begin(nowNs: DispatchTime.now().uptimeNanoseconds, holdMs: delay,
-                           actionsEnabled: switchInput || doubao)
+                           actionsEnabled: actionsEnabled)
         if cleanupCount > 0 { deliveryGate.cancelPending() }
     }
 
@@ -533,25 +586,38 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         restoreGeneration &+= 1
         restoreWork?.cancel()
         restoreWork = nil
+        if pendingVoiceTriggerEnd {
+            // 上个流仍在排空时开始新流：先关闭旧 tap/double 会话；hold 由 begin 合并。
+            pendingVoiceTriggerEnd = false
+            VoiceTrigger.end()
+        }
         // 会话锁存：本会话按此刻的配置执行并记录实际做过的操作，
         // 结束/stop 只按锁存值对称回滚（会话中途改配置不影响本会话清理）。
-        let (wantSwitch, wantDoubao): (Bool, Bool) = {
+        let (wantAudio, wantSwitch, wantDoubao): (Bool, Bool, Bool) = {
             cfgLock.lock(); defer { cfgLock.unlock() }
             sessionActive = true
+            sessionRoutedRemoteAudio = _routeRemoteAudio
             sessionSwitchedMic = false   // 真正切换后才置位，见 atvvAudioFrame 的 pendingMicSwitch 分支
             sessionDoubao = _doubao
-            return (_switchInput, _doubao)
+            return (_routeRemoteAudio, _switchInput, _doubao)
         }()
+        if !wantAudio, inputNeedsRestore {
+            // 新的 Mac 麦克风会话不能沿用上个远端会话尚待恢复的 BlackHole 输入。
+            DefaultInput.restore()
+            inputNeedsRestore = false
+        }
         // 抖动幽灵会话（有 START/STOP 但零音频帧）不做任何有副作用的操作：
         // 麦克风切换和豆包触发一样，等第一个真实音频帧到达再执行——否则遥控器
         // BLE START/STOP 每次抖动都会拿系统默认输入设备开刀一次，Bluetooth 耳机
         // 据此重新协商音频 profile，每次都炸出一下可闻的杂音。
-        pendingMicSwitch = wantSwitch
+        pendingMicSwitch = wantAudio && wantSwitch
         pendingTrigger = wantDoubao
         cfgLock.lock(); triggered = false; cfgLock.unlock()
-        decoder.reset(predictor: 0, stepIndex: 0)
-        post.reset()
-        sink.streamStarted(sampleRate: 16000)
+        if wantAudio {
+            decoder.reset(predictor: 0, stepIndex: 0)
+            post.reset()
+            sink.streamStarted(sampleRate: 16000)
+        }
     }
 
     private var restoreWork: DispatchWorkItem?
@@ -561,6 +627,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var pendingMicSwitch = false
     private var pendingTrigger = false
     private var triggered = false
+    /// 音频排空前触发键仍属于上个会话；新会话必须先对称收尾再 begin。
+    private var pendingVoiceTriggerEnd = false
 
     func atvvVoiceStopped() {
         sessionLock.lock()
@@ -568,6 +636,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         physicalVoiceInProgress = false
         if codexPhysicalSession {
             codexPhysicalSession = false
+            codexReleaseWork?.cancel()
+            codexReleaseWork = nil
             // BLE STOP 是兜底收音边界；映射正常 release 同样会执行 endPhysicalHold。
             if let token = codexPCM.end() {
                 DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
@@ -583,33 +653,62 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         onVoiceActive?(false)
         pendingMicSwitch = false
         pendingTrigger = false
-        let (didSwitch, didDoubao, didTrigger): (Bool, Bool, Bool) = {
+        let (didAudio, didSwitch, didDoubao, didTrigger): (Bool, Bool, Bool, Bool) = {
             cfgLock.lock(); defer { cfgLock.unlock() }
-            let r = (sessionSwitchedMic, sessionDoubao, triggered)
+            let r = (sessionRoutedRemoteAudio, sessionSwitchedMic, sessionDoubao, triggered)
             sessionActive = false
+            sessionRoutedRemoteAudio = false
             sessionSwitchedMic = false
             sessionDoubao = false
             return r
         }()
-        if didDoubao && didTrigger { VoiceTrigger.end() } // 只有真正触发过才停
-        if didSwitch {
-            // 延迟还原麦克风：给识别收尾留 1.2s，期间听到的是 BlackHole 静音而非环境音
-            restoreGeneration &+= 1
-            let generation = restoreGeneration
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.sessionLock.lock()
-                defer { self.sessionLock.unlock() }
-                guard generation == self.restoreGeneration else { return }
-                DefaultInput.restore()
-                self.inputNeedsRestore = false
-                self.restoreWork = nil
-                log("默认麦克风已还原")
+        let shouldEndTrigger = didDoubao && didTrigger
+        restoreGeneration &+= 1
+        let generation = restoreGeneration
+        pendingVoiceTriggerEnd = shouldEndTrigger
+        if didAudio {
+            sink.streamStopped { [weak self] in
+                // AudioBridge 的回调代表硬件队列已播完 PCM 与静音尾；不得按固定时长猜测。
+                // 额外留 500ms 给输入法消费尾部；新流/取消会作废这整个回调。
+                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(shouldEndTrigger ? 500 : 0)) {
+                    self?.finishVoiceTail(generation: generation, endTrigger: shouldEndTrigger,
+                                          restoreInput: didSwitch)
+                }
             }
-            restoreWork = work
-            DispatchQueue.global().asyncAfter(deadline: .now() + 1.2, execute: work)
+        } else {
+            // Mac 麦克风路径未启动 sink，无需等待任何远端音频。
+            finishVoiceTailLocked(generation: generation, endTrigger: shouldEndTrigger,
+                                  restoreInput: didSwitch)
         }
-        sink.streamStopped()
+    }
+
+    private func finishVoiceTail(generation: UInt64, endTrigger: Bool, restoreInput: Bool) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        finishVoiceTailLocked(generation: generation, endTrigger: endTrigger, restoreInput: restoreInput)
+    }
+
+    /// 调用者持 sessionLock；检查与 VoiceTrigger.end 的入队不可被新 begin 插入。
+    private func finishVoiceTailLocked(generation: UInt64, endTrigger: Bool, restoreInput: Bool) {
+        guard generation == restoreGeneration, cleanupCount == 0 else { return }
+        if endTrigger, pendingVoiceTriggerEnd {
+            pendingVoiceTriggerEnd = false
+            VoiceTrigger.end()
+        }
+        guard restoreInput else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.sessionLock.lock()
+            defer { self.sessionLock.unlock() }
+            guard generation == self.restoreGeneration, self.cleanupCount == 0 else { return }
+            DefaultInput.restore()
+            self.inputNeedsRestore = false
+            self.restoreWork = nil
+            log("默认麦克风已还原（音频排空后）")
+        }
+        restoreWork = work
+        // VoiceTrigger 在实际 keyUp 后给 IME 4s 回填窗口；麦克风至少保留同等时间。
+        DispatchQueue.global().asyncAfter(deadline: .now() + (endTrigger ? 4.5 : 0), execute: work)
     }
 
     /// 服务停止兜底：语音会话仍在进行时按锁存状态强制收尾
@@ -624,6 +723,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
     private func prepareForceEndLocked() -> Bool {
         cleanupCount += 1
+        codexReleaseWork?.cancel()
+        codexReleaseWork = nil
         let streamToken = codexPCM.end()
         if let token = codexRecognitionToken ?? streamToken {
             DispatchQueue.main.async { CodexDictation.cancelRemoteTransport(token: token) }
@@ -634,12 +735,14 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         let hadPendingMicRestore = restoreWork != nil
         restoreWork?.cancel()
         restoreWork = nil
+        pendingVoiceTriggerEnd = false
         pendingMicSwitch = false
         pendingTrigger = false
-        let (active, didSwitch): (Bool, Bool) = {
+        let (active, didAudio, didSwitch): (Bool, Bool, Bool) = {
             cfgLock.lock(); defer { cfgLock.unlock() }
-            let r = (sessionActive, sessionSwitchedMic)
+            let r = (sessionActive, sessionRoutedRemoteAudio, sessionSwitchedMic)
             sessionActive = false
+            sessionRoutedRemoteAudio = false
             sessionSwitchedMic = false
             sessionDoubao = false
             return r
@@ -647,7 +750,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         if active {
             log("服务停止：语音会话仍在进行，强制收尾")
             onVoiceActive?(false)
-            sink.streamStopped()
+            if didAudio { sink.streamStopped() }
         }
         return didSwitch || hadPendingMicRestore || inputNeedsRestore
     }
@@ -702,6 +805,10 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             cfgLock.lock(); triggered = true; cfgLock.unlock()
             VoiceTrigger.begin(config: resolveTriggerConfig?())
         }
+        cfgLock.lock()
+        let shouldRouteAudio = sessionRoutedRemoteAudio
+        cfgLock.unlock()
+        guard shouldRouteAudio else { return }
         if let sync {
             decoder.reset(predictor: sync.predictor, stepIndex: sync.stepIndex)
         }
@@ -1027,6 +1134,16 @@ final class AppServices {
             Task { @MainActor [weak voiceApp] in
                 CodexDictation.onPhysicalHoldState = { [weak voiceApp] active in
                     voiceApp?.setCodexPhysicalHold(active: active, token: CodexDictation.remotePCMToken)
+                }
+                CodexDictation.onPhysicalHoldRelease = { [weak voiceApp] token in
+                    guard let voiceApp else {
+                        CodexDictation.endRemoteTransport(token: token)
+                        return
+                    }
+                    voiceApp.releaseCodexPhysicalHold(token: token)
+                }
+                CodexDictation.onPhysicalHoldPrepare = { [weak voiceApp] in
+                    voiceApp?.prepareCodexPhysicalHold()
                 }
             }
             let km = KeyMapperApp(config: config, verbose: options.verbose)

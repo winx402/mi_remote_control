@@ -820,7 +820,8 @@ enum CodexDictation {
             resolved = CFEqual(element, target.element) ? .matched : .changed("resolved-input-field")
         } else { resolved = .unavailable("resolved-input-field") }
         let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.04)
+        // A timeout on the system-wide element would change this process's
+        // global AX timeout, so only the private app handle is configured above.
         // Read independent witnesses even if one is unavailable: a real mismatch
         // must cancel immediately rather than enter a grace period.
         let window = compare(app, attribute: kAXFocusedWindowAttribute, expected: target.window, issue: "app-focused-window")

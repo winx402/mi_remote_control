@@ -174,6 +174,19 @@ func migrateConfigIfNeeded(_ input: MappingConfig) -> MappingConfig {
         Presets.apply(Presets.feishu, to: &cfg)
         cfg.version = 8
     }
+    if cfg.version < 9 {
+        // Only the previous semantic Codex preset's Escape slot is upgraded.
+        // Preserve custom profiles, every other back slot, and global gestures.
+        let bundle = "com.openai.codex"
+        if var profile = cfg.profiles[bundle],
+           profile["back"]?.tap == .keyStroke(key: "escape", mods: []),
+           profile["back"]?.overrideBase == true,
+           Presets.codexContextActions.allSatisfy({ key, action in profile[key.rawValue]?.tap == action }) {
+            profile["back"]?.tap = .system("codex_context_back")
+            cfg.profiles[bundle] = profile
+        }
+        cfg.version = 9
+    }
     return cfg
 }
 
@@ -480,7 +493,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         defer { sessionLock.unlock() }
         codexReleaseWork?.cancel()
         guard codexRecognitionToken == token, codexPhysicalSession else {
-            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token, reason: "hid-no-stream") }
             return
         }
         let work = DispatchWorkItem { [weak self] in
@@ -492,7 +505,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             _ = self.codexPCM.end()
             self.codexPhysicalSession = false
             self.physicalVoiceInProgress = false
-            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+            DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token, reason: "hid-release-timeout-250ms") }
         }
         codexReleaseWork = work
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
@@ -640,7 +653,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             codexReleaseWork = nil
             // BLE STOP 是兜底收音边界；映射正常 release 同样会执行 endPhysicalHold。
             if let token = codexPCM.end() {
-                DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token) }
+                DispatchQueue.main.async { CodexDictation.endRemoteTransport(token: token, reason: "atvv-stop") }
             }
             return
         }
@@ -1137,7 +1150,7 @@ final class AppServices {
                 }
                 CodexDictation.onPhysicalHoldRelease = { [weak voiceApp] token in
                     guard let voiceApp else {
-                        CodexDictation.endRemoteTransport(token: token)
+                        CodexDictation.endRemoteTransport(token: token, reason: "hid-no-service")
                         return
                     }
                     voiceApp.releaseCodexPhysicalHold(token: token)

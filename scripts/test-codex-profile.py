@@ -59,6 +59,7 @@ class CodexProfileTests(unittest.TestCase):
         self.assertEqual(profile["voice"]["tap"], {"type": "system", "value": "codex_context_focus"})
         self.assertEqual(profile["voice"]["hold"], {"type": "system", "value": "codex_context_voice_start"})
         self.assertEqual(profile["menu"]["tap"], {"type": "overlay", "value": "codex_sessions"})
+        self.assertEqual(profile["back"]["tap"], {"type": "system", "value": "codex_context_back"})
         self.assertNotIn("tv", profile)
         for key in ("up", "down", "left", "right", "back"):
             self.assertIs(profile[key]["overrideBase"], True)

@@ -111,6 +111,9 @@ final class MappingEngine: @unchecked Sendable {
     private var overlayHandler: ((ButtonEvent) -> Void)?
     private var immediateOverlayDirections = false
     private var applicationNavigationEnabled = false
+    /// The focused-editor probe is bounded and reads only AX control metadata.
+    var codexEditorFocused: () -> Bool = { CodexBackspace.hasFocusedEditor() }
+    private var codexEditingBackPress = false
     /// A saved profile opts into context navigation through its explicit actions.
     /// Existing Codex/custom profiles retain their configured behavior.
     private var codexContextActive: Bool {
@@ -638,6 +641,13 @@ final class MappingEngine: @unchecked Sendable {
         }
         if event.isDown, !independentGestures.isTracking(key) {
             gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
+            if key == .back {
+                codexEditingBackPress = activeBundleID == "com.openai.codex"
+                    && effectiveLayer == 0 && overlayHandler == nil && !MouseMode.shared.isActive
+                    && !TransientSystemUI.isMissionControlActive()
+                    && baseBackOverride?.tap == .system("codex_context_back")
+                    && codexEditorFocused()
+            }
         }
         let reserved = config.globalShortcuts?[key.rawValue]
         let localHold = overlayHandler == nil && (!MouseMode.shared.isActive || key == .voice)
@@ -646,7 +656,7 @@ final class MappingEngine: @unchecked Sendable {
         independentGestures.handle(event, policy: .init(
             doubleMs: max(0, config.settings.doubleMs),
             holdMs: max(1, reserved?.holdMs ?? config.settings.holdMs),
-            hasDouble: reserved?.double != nil,
+            hasDouble: reserved?.double != nil && !(key == .back && codexEditingBackPress),
             hasHold: reserved?.hold != nil || localHold != nil || mouseHold))
     }
 
@@ -714,6 +724,17 @@ final class MappingEngine: @unchecked Sendable {
 
     private func independentGesture(_ key: RemoteKey, _ gesture: IndependentGestures.Gesture) {
         let context = gestureContexts.removeValue(forKey: key)
+        let editingBack = key == .back && codexEditingBackPress
+        if key == .back { codexEditingBackPress = false }
+        if gesture == .tap, editingBack {
+            guard context?.0 == contextGeneration, context?.1 == MouseMode.shared.isActive,
+                  overlayHandler == nil, !MouseMode.shared.isActive,
+                  !TransientSystemUI.isMissionControlActive() else { return }
+            // Each release owns one edit. Never let a global double combine two
+            // deletes, and never reinterpret a late edit as Escape after focus loss.
+            runIndependentLocal(.system("codex_delete_backward"))
+            return
+        }
         let reserved = config.globalShortcuts?[key.rawValue]
         let globalAction: Action?
         switch gesture {
@@ -908,7 +929,9 @@ final class MappingEngine: @unchecked Sendable {
         // 长按执行“全选 + 删除”；默认关闭时仍只发送普通 Delete。
         if key == .back, effectiveLayer == 0 {
             if let custom = baseBackOverride {
-                perform(custom.hold ?? custom.tap, key: key, isHold: true)
+                let fallback = custom.tap == .system("codex_context_back")
+                    ? Action.keyStroke(key: "escape", mods: []) : custom.tap
+                perform(custom.hold ?? fallback, key: key, isHold: true)
             } else if config.settings.deleteAllOnHold == true {
                 runner.run(.macro(steps: [
                     .action(.keyStroke(key: "a", mods: ["left_cmd"])),
@@ -1683,6 +1706,49 @@ extension MappingEngine {
         guard equals([.keyStroke(key: "delete", mods: [])]) else { return false }
         event(.back, true); clock.advance(1199); event(.back, false)
         guard equals([.keyStroke(key: "delete", mods: [])]) else { return false }
+
+        // Editing owns rapid Back taps even when global Back defines a double
+        // and a tap. Outside an actual editor the saved global gestures win.
+        var editingConfig = quitConfig
+        editingConfig.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
+        editingConfig.globalShortcuts?["back"]?.tap = .system("mute")
+        editingConfig.globalShortcuts?["back"]?.double = .overlay("system_menu")
+        engine.setConfig(editingConfig)
+        engine.setActiveProfile("com.openai.codex")
+        var editorFocused = true
+        engine.codexEditorFocused = { editorFocused }
+        tap(.back); tap(.back); tap(.back)
+        guard equals(Array(repeating: .system("codex_delete_backward"), count: 3)) else { return false }
+        clock.advance(500)
+        guard equals([]) else { return false }
+        event(.back, true); event(.back, true); clock.advance(1200)
+        guard equals([.system("quit_app")]) else { return false }
+        event(.back, true); event(.back, false); clock.advance(500)
+        guard equals([]) else { return false }
+        editorFocused = false
+        twice(.back)
+        guard equals([.overlay("system_menu")]) else { return false }
+        tap(.back); clock.advance(250)
+        guard equals([.system("mute")]) else { return false }
+        editorFocused = true
+        captured.removeAll()
+        engine.setOverlayCapture { captured.append($0) }
+        tap(.back); clock.advance(250)
+        guard equals([.system("mute")]), captured.isEmpty else { return false }
+        engine.setOverlayCapture(nil)
+        editingConfig.globalShortcuts?["back"]?.tap = nil
+        editingConfig.globalShortcuts?["back"]?.double = nil
+        engine.setConfig(editingConfig)
+        captured.removeAll()
+        engine.setOverlayCapture { captured.append($0) }
+        tap(.back)
+        guard equals([]), captured.map(\.key) == [.back, .back] else { return false }
+        engine.setOverlayCapture(nil)
+        // A press revoked by foreground/capture changes must not delete elsewhere.
+        event(.back, true)
+        engine.setActiveProfile("com.example.afterEditing")
+        event(.back, false)
+        guard equals([]) else { return false }
         engine.resetInputState(reason: "test")
         event(.volUp, true); event(.volUp, false)
         return equals([.system("volume_up")])

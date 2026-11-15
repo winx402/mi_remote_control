@@ -253,6 +253,7 @@ enum SelfTest {
         expect(MappingEngine.codexContextSelfCheck(), "Codex 专用动作、长短按互斥与捕获优先")
         expect(Presets.codexContextSelfCheck(), "Codex 对话遥控预设")
         expect(CodexConversationControls.selfCheck(), "Codex 表单识别、切题、输入与提交目标")
+        expect(CodexBackspace.selfCheck(), "Codex 实际编辑焦点、普通退格与未聚焦返回")
         expect(CodexConversationScroll.selfCheck(), "Codex 对话滚动落点")
         expect(CodexDictation.selfCheck(), "Codex 听写结束动作与安全文本写入")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
@@ -1054,6 +1055,40 @@ enum SelfTest {
             let kept = migrateConfigIfNeeded(custom)
             expect(kept.profiles["com.electron.lark"]?["tv"]?.tap == .focusInput,
                    "v7→v8 用户自改的飞书 TV 绑定不被迁移覆盖")
+        }
+
+        // v8→v9 only upgrades the previous opted-in Codex Back tap.
+        do {
+            func same<T: Encodable>(_ first: T, _ second: T) -> Bool {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                guard let a = try? encoder.encode(first), let b = try? encoder.encode(second) else { return false }
+                return a == b
+            }
+            var old = defaultConfig()
+            old.version = 8
+            old.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
+            old.profiles["com.openai.codex"]?["back"] = KeyBinding(
+                tap: .keyStroke(key: "escape", mods: []), hold: .system("mute"),
+                double: .system("play_pause"), layers: ["2": .system("quit_app")], overrideBase: true)
+            let cfg = migrateConfigIfNeeded(old)
+            var expected = old.profiles["com.openai.codex"]
+            expected?["back"]?.tap = .system("codex_context_back")
+            expect(cfg.version == MappingConfig.currentVersion
+                   && same(cfg.profiles["com.openai.codex"], expected)
+                   && same(cfg.profiles["global"], old.profiles["global"])
+                   && same(cfg.globalShortcuts, old.globalShortcuts),
+                   "v8→v9 Codex 仅升级返回 tap，保留长按双击层及全局配置")
+            var custom = old
+            custom.profiles["com.openai.codex"]?["back"]?.tap = .focusInput
+            expect(same(migrateConfigIfNeeded(custom).profiles, custom.profiles),
+                   "v8→v9 保留用户自定义返回")
+            custom = old
+            custom.profiles["com.openai.codex"]?["voice"]?.tap = .focusInput
+            expect(same(migrateConfigIfNeeded(custom).profiles, custom.profiles),
+                   "v8→v9 不改未采用语义预设的旧场景")
+            expect(same(migrateConfigIfNeeded(cfg).profiles, cfg.profiles),
+                   "v8→v9 Codex 返回迁移可重复调用")
         }
 
         // v2-7. v5→v6：只清理内置支持 App 的 Home/菜单基础槽，并搬入层2。

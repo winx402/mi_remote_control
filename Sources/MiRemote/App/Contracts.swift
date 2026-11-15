@@ -213,7 +213,7 @@ struct VoiceTriggerRule: Codable, Equatable {
 }
 
 struct MappingConfig: Codable {
-    static let currentVersion = 8   // v8 = 飞书聊天/会议合并，TV 键归还控制模式
+    static let currentVersion = 9   // v9 = Codex 已聚焦编辑器的返回短按逐次退格
     struct Settings: Codable {
         var holdMs: Int = 350
         /// 双击判定窗口。默认配置存在双击绑定（如 Zoom 预设 TV 双击=摄像头），故必须 >0；

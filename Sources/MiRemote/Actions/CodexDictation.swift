@@ -34,11 +34,14 @@ enum CodexDictation {
         let target: RemoteTarget
         let config: VoiceTriggerConfig
         let sink: AudioBridge
+        let inputMethodPID: pid_t?
         var keyDown = false
+        var captureWasStoppedBeforeStart = false
     }
     @MainActor private static var useRemoteMicrophone = true
     @MainActor private static var inputEnabled = true
     @MainActor private static var physicalHoldActive = false
+    @MainActor private static var physicalHoldStartedAt: TimeInterval?
     @MainActor private static var remoteReleaseRequested = false
     @MainActor private static var remotePCMSamples = 0
     @MainActor private static var remoteGeneration: UInt64 = 0
@@ -125,6 +128,7 @@ enum CodexDictation {
         onPhysicalHoldPrepare?()
         guard useRemoteMicrophone else {
             physicalHoldActive = true
+            physicalHoldStartedAt = ProcessInfo.processInfo.systemUptime
             toggle()
             return
         }
@@ -151,6 +155,7 @@ enum CodexDictation {
             }
             remoteSession = RemoteSession(target: target, recognizer: recognizer)
             physicalHoldActive = true
+            physicalHoldStartedAt = ProcessInfo.processInfo.systemUptime
             onPhysicalHoldState?(true)
             onStateChanged?(true)
             status("引擎开始 engine=system source=remote；松开语音键结束，文字不会自动发送。")
@@ -170,6 +175,7 @@ enum CodexDictation {
 
     @MainActor static func endPhysicalHold() {
         guard physicalHoldActive else { return }
+        status("松手请求 source=hid elapsed=\(holdElapsed())s samples=\(remotePCMSamples)")
         if useRemoteMicrophone, remoteIME?.keyDown == true || remoteSession != nil {
             guard !remoteReleaseRequested else { return }
             remoteReleaseRequested = true
@@ -251,8 +257,10 @@ enum CodexDictation {
         let token = remoteGeneration
         remoteIMETransportToken = token
         let sink = AudioBridge(deviceName: bridgeDeviceName, requiresNamedDevice: true)
-        remoteIME = RemoteInputMethodSession(target: target, config: cfg, sink: sink)
+        let inputMethodPID = NSRunningApplication.runningApplications(withBundleIdentifier: prefix).first?.processIdentifier
+        remoteIME = RemoteInputMethodSession(target: target, config: cfg, sink: sink, inputMethodPID: inputMethodPID)
         physicalHoldActive = true
+        physicalHoldStartedAt = ProcessInfo.processInfo.systemUptime
         onStateChanged?(true)
         status("引擎准备 engine=wechat source=remote bridge=\(bridgeDeviceName)")
         sink.streamStarted(sampleRate: 16_000) { ready in
@@ -269,6 +277,12 @@ enum CodexDictation {
                     guard remoteTargetIsCurrent(current.target), currentInputSourceMatches(prefix: prefix),
                           DefaultInput.currentDefault() == input else {
                         stop(reason: "输入框、输入法或音源改变，微信听写未开始", restoreImmediately: true)
+                        return
+                    }
+                    let captureBefore = current.inputMethodPID.map { InputCaptureState.read(pid: $0, device: input) } ?? .unknown
+                    current.captureWasStoppedBeforeStart = captureBefore == .stopped
+                    guard captureBefore != .running else {
+                        stop(reason: "微信输入法已在采集，请先在微信语音浮层暂停后重试", restoreImmediately: true)
                         return
                     }
                     guard startHotkey(current.config) else {
@@ -357,10 +371,40 @@ enum CodexDictation {
                 }
                 pending.keyDown = false
                 remoteIMEFinishing = pending
+                status("触发键释放 engine=wechat key=\(pending.config.keyName)；等待采集停止证据")
+                // A keyUp can leave WeType in hands-free recording (observed in real
+                // CoreAudio logs). Never blindly toggle: wait for normal shutdown,
+                // then retry once only with positive evidence on this exact bridge.
+                try? await Task.sleep(for: .milliseconds(350))
+                guard remoteIMEStopID == stopID else { return }
+                var recovery = InputCaptureStopRecovery()
+                let capture = pending.inputMethodPID.flatMap { pid in
+                    bridgeInput.map { InputCaptureState.read(pid: pid, device: $0) }
+                } ?? .unknown
+                let sameContext = remoteTargetHasFocus(pending.target)
+                    && currentInputSourceMatches(prefix: "com.tencent.inputmethod.wetype")
+                    && DefaultInput.currentDefault() == bridgeInput
+                    && NSRunningApplication.runningApplications(withBundleIdentifier: "com.tencent.inputmethod.wetype")
+                        .contains(where: { $0.processIdentifier == pending.inputMethodPID })
+                if pending.config.keyName == "fn",
+                   recovery.shouldRetry(keyReleased: !pending.keyDown,
+                                        captureStartedHere: pending.captureWasStoppedBeforeStart,
+                                        contextMatches: sameContext, capture: capture) {
+                    status("结束校验 engine=wechat capture=running；原上下文补发一次 Fn 暂停")
+                    _ = tap(pending.config)
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard remoteIMEStopID == stopID else { return }
+                }
+                let stopped = pending.inputMethodPID.flatMap { pid in
+                    bridgeInput.map { InputCaptureState.read(pid: pid, device: $0) }
+                } ?? .unknown
                 remoteIMEStopID = nil
                 remoteIMEFinishingTimer?.invalidate()
                 remoteIMEFinishingTimer = nil
-                status("引擎结束 engine=wechat reason=release；已发送原触发键释放，未自动发送")
+                status("引擎收尾 engine=wechat reason=release capture=\(stopped.rawValue) recovery=\(recovery.attempted)；未自动发送")
+                if stopped == .running {
+                    notice("微信输入法仍在采集，请在微信语音浮层暂停；本次未自动发送。")
+                }
                 onStateChanged?(isActive)
                 bridgeRestoreTask = Task { @MainActor in
                     // 输入法仍可能整理最终文字；这段时间不重新聚焦，焦点改变便提前收尾。
@@ -423,9 +467,15 @@ enum CodexDictation {
         }
     }
 
-    @MainActor static func endRemoteTransport(token: UInt64) {
+    @MainActor static func endRemoteTransport(token: UInt64, reason: String = "transport") {
         guard token == remoteGeneration else { return }
+        status("传输结束 source=\(reason) hidRelease=\(remoteReleaseRequested) elapsed=\(holdElapsed())s samples=\(remotePCMSamples)")
         finishPhysicalHold()
+    }
+
+    @MainActor private static func holdElapsed() -> String {
+        guard let physicalHoldStartedAt else { return "unknown" }
+        return String(format: "%.3f", ProcessInfo.processInfo.systemUptime - physicalHoldStartedAt)
     }
 
     @MainActor static func cancelRemoteTransport(token: UInt64) {
@@ -512,6 +562,7 @@ enum CodexDictation {
         restorePasteboard()
         let hadPhysicalSession = physicalHoldActive || remoteSession != nil
         physicalHoldActive = false
+        physicalHoldStartedAt = nil
         remoteReleaseRequested = false
         remotePCMSamples = 0
         if hadPhysicalSession { onPhysicalHoldState?(false) }
@@ -1170,6 +1221,7 @@ enum CodexDictation {
     /// 纯菜单语义验收，不访问真实 Codex、不合成键盘或启动录音。
     static func selfCheck() -> Bool {
         RemotePCMHoldGate.selfCheck()
+            && InputCaptureStopRecovery.selfCheck()
             && sanitizedText("hello\r\nworld\t\u{1B}") == "hello  world"
             && insertionChangeMatches(original: CFRange(location: 2, length: 0), insertedUTF16Count: 6,
                                       selection: CFRange(location: 8, length: 0), originalCount: 10, currentCount: 16)

@@ -41,9 +41,8 @@
       },
       "back": {
         "tap": {
-          "type": "key_stroke",
-          "key": "escape",
-          "mods": []
+          "type": "system",
+          "value": "codex_context_back"
         },
         "overrideBase": true
       },

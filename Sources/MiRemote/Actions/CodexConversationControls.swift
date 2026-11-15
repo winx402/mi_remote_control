@@ -35,6 +35,7 @@ enum CodexConversationControls {
         var previous: Int?
         var next: Int?
         var submit: Int?
+        var immediateQuestion = false
     }
     private struct Snapshot {
         var pid: pid_t
@@ -51,6 +52,14 @@ enum CodexConversationControls {
         let target = snapshot.elements[index]
         lastFormRoot = snapshot.elements[form.root]
         lastOption = target
+        // Focus moves without AXPress. Clicking a mid-turn option would send it.
+        var candidate: Int? = index
+        while let item = candidate, descendant(item, of: form.root, in: snapshot.nodes) {
+            let element = snapshot.elements[item]
+            if AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+               focusedEditor(for: element, app: snapshot.app).map({ CFEqual($0, element) }) == true { break }
+            candidate = snapshot.nodes[item].parent
+        }
         answerHighlight.showAnswer(snapshot.nodes[index].rect, ordinal: ordinal)
         highlightMonitor?.invalidate()
         highlightMonitor = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
@@ -83,6 +92,8 @@ enum CodexConversationControls {
     @MainActor static func resolvedDictationField() -> AXUIElement? { verifiedDictationField }
 
     @MainActor static func resetInputTarget() {
+        questionTransition?.cancel()
+        transitioningFrom = nil
         questionRoot = nil
         composerTarget = nil
         targetWindow = nil
@@ -99,7 +110,7 @@ enum CodexConversationControls {
                                       "question-form", "questionnaire", "ask-user-question", "askuserquestion",
                                       "回答问题", "回答問題", "用户提问", "使用者提問"]
     private static let answerSubmits: Set<String> = ["submit answers", "submit answer", "send answers", "confirm answers",
-        "提交答案", "提交回答", "确认答案", "確認答案", "送出答案", "提交所有答案", "提交全部答案"]
+        "提交答案", "提交回答", "确认答案", "確認答案", "送出答案", "send update", "发送更新", "傳送更新", "提交所有答案", "提交全部答案"]
     private static let formSubmits = answerSubmits.union(["submit", "confirm", "send", "提交", "确认", "確認", "发送", "傳送", "送出"])
     private static let previousTitles: Set<String> = ["previous", "previous question", "back", "上一题", "上一題", "上一个问题", "上一個問題", "返回"]
     private static let nextTitles: Set<String> = ["next", "next question", "continue", "下一题", "下一題", "下一个问题", "下一個問題", "继续", "繼續"]
@@ -138,6 +149,7 @@ enum CodexConversationControls {
         "or write your own reply", "or write your own response", "or write your own answer",
         "write your own reply", "write your own response", "type your own answer",
         "或自行撰写回复", "或自行撰寫回覆", "或自行撰写回答", "或自行撰寫回答"]
+    private static let standaloneReplyTitles: Set<String> = ["reply…", "reply...", "回复…", "回复...", "回覆…", "回覆..."]
     private static let skipTitles: Set<String> = ["skip", "skip question", "跳过", "跳過"]
     private static let formContainers: Set<String> = ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog"]
 
@@ -183,6 +195,14 @@ enum CodexConversationControls {
     /// Some builds draw the numeric badges without exposing their numbers to AX.
     /// Bound the answer rows by the card's heading and footer in screen coordinates.
     private static func answerRows(_ members: [Int], nodes: [Node]) -> [Int] {
+        // The placeholder may disappear as soon as the user dictates. Chromium's
+        // radio group still identifies the options without relying on its text.
+        let groups = members.filter { nodes[$0].role == "AXRadioGroup" }
+        if groups.count == 1, let group = groups.first {
+            let radios = members.filter { nodes[$0].enabled && nodes[$0].role == "AXRadioButton"
+                && descendant($0, of: group, in: nodes) }
+            if !radios.isEmpty { return radios.sorted { nodes[$0].rect.midY < nodes[$1].rect.midY } }
+        }
         guard let heading = members.first(where: { matches(nodes[$0], questionTitles) && nodes[$0].rect.height > 0 }),
               let skip = members.first(where: { matches(nodes[$0], skipTitles) && nodes[$0].rect.height > 0 }),
               members.contains(where: { matches(nodes[$0], customReplyTitles) }) else { return [] }
@@ -251,9 +271,17 @@ enum CodexConversationControls {
             }) else { continue }
             let numbered = numberedOptions(members, root: root, nodes: nodes)
             let options = numbered.isEmpty ? answerRows(members, nodes: nodes) : numbered
-            guard !options.isEmpty else { continue }
             let submits = members.filter { nodes[$0].role == "AXButton" && matches(nodes[$0], formSubmits) }
             let fields = members.filter { nodes[$0].enabled && nodes[$0].editable && inputRoles.contains(nodes[$0].role) }
+            let hasHeading = members.contains { matches(nodes[$0], questionTitles) }
+            let replyField = members.contains { matches(nodes[$0], standaloneReplyTitles) }
+            let hasFooterAction = members.contains { nodes[$0].role == "AXButton"
+                && matches(nodes[$0], formSubmits.union(["next", "下一步"])) }
+            let questionPager = members.contains {
+                nodes[$0].role == "AXButton" && matches(nodes[$0], ["previous question", "next question", "上一个问题", "下一个问题", "上一個問題", "下一個問題"])
+            }
+            let standalone = hasHeading && fields.count == 1 && hasFooterAction && (replyField || questionPager)
+            guard !options.isEmpty || standalone else { continue }
             func uniqueEnabled(_ titles: Set<String>) -> Int? {
                 let controls = members.filter { nodes[$0].role == "AXButton" && nodes[$0].enabled
                     && nodes[$0].pressable && matches(nodes[$0], titles) }
@@ -261,7 +289,8 @@ enum CodexConversationControls {
             }
             cards.append(Form(root: root, options: options, fields: fields,
                               previous: uniqueEnabled(previousTitles), next: uniqueEnabled(nextTitles),
-                              submit: submits.count == 1 ? uniqueEnabled(formSubmits) : nil))
+                              submit: submits.count == 1 ? uniqueEnabled(formSubmits) : uniqueEnabled(["next", "下一步"]),
+                              immediateQuestion: hasHeading && (standalone || members.contains { matches(nodes[$0], customReplyTitles) || nodes[$0].role == "AXRadioGroup" })))
         }
         return cards.filter { outer in !cards.contains { $0.root != outer.root && descendant($0.root, of: outer.root, in: nodes) } }
     }
@@ -320,6 +349,22 @@ enum CodexConversationControls {
                 && live.contains { nodes[$0].role == "AXButton" && matches(nodes[$0], skipTitles) })
     }
 
+    private static func isQuestionInputLabel(_ label: String) -> Bool {
+        if matches(Node(parent: nil, role: "AXTextArea", label: label), customReplyTitles) { return true }
+        let replyLabels: Set<String> = ["reply", "reply…", "回复", "回复…", "回覆", "回覆…"]
+        return label.components(separatedBy: "\n").contains {
+            replyLabels.contains(normalized($0).replacingOccurrences(of: "...", with: "…"))
+        }
+    }
+
+    private static func hasComposerInputLabel(_ label: String) -> Bool {
+        let placeholders: Set<String> = ["work with codex", "和 codex 一起工作", "work with chatgpt",
+                                         "使用 chatgpt work", "working…", "处理中…"]
+        return label.components(separatedBy: "\n").contains {
+            placeholders.contains(normalized($0).replacingOccurrences(of: "...", with: "…"))
+        } || contains(label, ["composer", "chat-input", "chat_input", "chat input", "prompt-textarea"])
+    }
+
     private static func composer(_ nodes: [Node], window: CGRect, outside form: Form? = nil) -> Int? {
         guard window.height > 0, form != nil || !blocksChat(nodes) else { return nil }
         let footerY = form.flatMap { card in
@@ -328,12 +373,13 @@ enum CodexConversationControls {
         }
         let candidates = nodes.indices.filter { index in
             let n = nodes[index]
-            if matches(n, customReplyTitles) { return false }
+            if isQuestionInputLabel(n.label) { return false }
             if let form, descendant(index, of: form.root, in: nodes) || n.rect.midY < (footerY ?? nodes[form.root].rect.maxY) { return false }
             guard inputRoles.contains(n.role), n.editable, n.enabled, !historicallyInactive(index, in: nodes),
                   n.rect.width >= window.width * 0.25, n.rect.midY >= window.minY + window.height * 0.50,
                   !contains(n.label, ["search", "find", "filter", "terminal", "搜索", "查找", "过滤", "终端"]) else { return false }
-            return contains(n.label, ["composer", "message", "prompt", "chat input", "消息", "输入", "輸入", "回复", "回覆"])
+            return hasComposerInputLabel(n.label)
+                || contains(n.label, ["message", "prompt", "消息", "输入", "輸入"])
                 || n.role == "AXTextArea"
         }
         return candidates.count == 1 ? candidates[0] : nil
@@ -385,6 +431,12 @@ enum CodexConversationControls {
             else if !scrolling { unavailable("当前控件信息不完整，本次未执行确认或输入。") }
             return true
         }
+        if let from = transitioningFrom, let questionRoot, CFEqual(from, questionRoot),
+           let form = recognized, let targetWindow, CFEqual(targetWindow, snapshot.elements[0]),
+           !CFEqual(from, snapshot.elements[form.root]) {
+            self.questionRoot = snapshot.elements[form.root]
+            transitioningFrom = nil
+        }
         if let target = questionRoot, recognized.map({ CFEqual(target, snapshot.elements[$0.root]) }) != true {
             resetInputTarget()
             if scrolling { CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent) }
@@ -404,8 +456,11 @@ enum CodexConversationControls {
                 let index = choices[next]
                 previewAnswer(index, ordinal: next + 1, form: form, in: snapshot)
                 trace.notice("preview ordinal=\(next + 1)")
-            case .left: clearAnswer(); press(form.previous, in: snapshot, isCurrent: isCurrent)
-            case .right: clearAnswer(); press(form.next, in: snapshot, isCurrent: isCurrent)
+            case .left, .right:
+                guard let arrow = action == .left ? form.previous : form.next else { return true }
+                clearAnswer()
+                press(arrow, in: snapshot, isCurrent: isCurrent)
+                followQuestionChange(from: snapshot, form: form, isCurrent: isCurrent)
             case .ok:
                 if lastOption == nil, let field = preferredField(form, nodes: snapshot.nodes) {
                     _ = focus(field, in: snapshot)
@@ -415,10 +470,18 @@ enum CodexConversationControls {
                     let root = lastFormRoot
                     guard let root, CFEqual(root, snapshot.elements[form.root]),
                           let index = form.options.first(where: { CFEqual(snapshot.elements[$0], pending) }) else { return true }
+                    if form.immediateQuestion {
+                        if select(index, in: snapshot, activateEvenIfSelected: true, isCurrent: isCurrent) {
+                            clearAnswer()
+                            followQuestionChange(from: snapshot, form: form, isCurrent: isCurrent)
+                        } else { unavailable("未能点击当前选项，请重新选择。") }
+                        return true
+                    }
                     commitOption(index, form: form, snapshot: snapshot, isCurrent: isCurrent)
                     return true
                 }
                 press(form.submit, in: snapshot, isCurrent: isCurrent)
+                if form.submit != nil { followQuestionChange(from: snapshot, form: form, isCurrent: isCurrent) }
             }
         } else if lastOption != nil && action == .submit {
             clearAnswer()
@@ -445,6 +508,29 @@ enum CodexConversationControls {
             }
         }
         return true
+    }
+
+    /// Question navigation remounts the editor. Track only the transition initiated
+    /// here, within the original window, and never replay a press on the next card.
+    @MainActor private static var transitioningFrom: AXUIElement?
+    @MainActor private static var questionTransition: Task<Void, Never>?
+    @MainActor private static func followQuestionChange(from source: Snapshot, form: Form, isCurrent: @escaping () -> Bool) {
+        questionTransition?.cancel()
+        let root = source.elements[form.root]
+        transitioningFrom = root
+        questionTransition = Task { @MainActor in
+            defer { if !Task.isCancelled { transitioningFrom = nil } }
+            for delay in [180, 180, 300] {
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard !Task.isCancelled, isCurrent(), sameWindow(source),
+                      let current = questionRoot, CFEqual(root, current), lastOption == nil else { return }
+                if let live = snapshot(), live.complete, let card = activeForm(live.nodes),
+                   !CFEqual(root, live.elements[card.root]) {
+                    questionRoot = live.elements[card.root]
+                    return
+                }
+            }
+        }
     }
 
     /// Codex can give free text precedence over a button selection. Clear it through
@@ -555,42 +641,42 @@ enum CodexConversationControls {
         return form.fields.count == 1 ? form.fields[0] : nil
     }
 
-    /// The microphone tap cycles the remote target. Previewing a question never
-    /// presses an answer. Only the existing long-OK path can submit it.
+    /// The microphone tap cycles actual editor focus. Question options remain
+    /// previews only when the user explicitly navigates them with up/down.
     @MainActor static func cycleInputTarget(isCurrent: () -> Bool) {
         guard isCurrent() else { return }
         let switchingToComposer = questionRoot != nil
-        // Commit the user's intent before looking up the composer. A failed or
-        // partial scan must never leave the old question field armed for dictation.
-        if switchingToComposer { resetInputTarget() }
+        // Drop the old answer preview and dictation destination before lookup.
+        // A partial scan must never leave the previous question armed for input.
+        resetInputTarget()
         guard let first = snapshot(preferForm: !switchingToComposer), first.complete,
               sameWindow(first), isCurrent(), let window = first.elements.first else {
-            if isCurrent(), switchingToComposer { _ = focusBottomComposer(isCurrent: isCurrent) }
+            if isCurrent() { _ = focusBottomComposer(isCurrent: isCurrent) }
             return
         }
         let form = activeForm(first.nodes)
-        // A re-render may replace the AX group for the same card. Cycle by the
-        // user's selected mode, not by comparing old and new AX group handles.
         if let form, !switchingToComposer {
-            resetInputTarget()
+            guard let field = preferredField(form, nodes: first.nodes), isCurrent(),
+                  focus(field, in: first), sameWindow(first), isCurrent(),
+                  let focused = focusedEditor(for: first.elements[field], app: first.app) else {
+                unavailable("未能聚焦本题的回复输入框，请在 Codex 中检查。")
+                return
+            }
             targetWindow = window
             questionRoot = first.elements[form.root]
-            if let index = form.options.first {
-                previewAnswer(index, ordinal: 1, form: form, in: first)
-            } else if let field = preferredField(form, nodes: first.nodes) {
-                _ = focus(field, in: first)
-            }
+            verifiedDictationField = focused
             trace.notice("input selected=question")
             return
         }
         guard let field = composer(first.nodes, window: first.window, outside: form),
-              isCurrent(), focus(field, in: first), isCurrent() else {
+              isCurrent(), focus(field, in: first), sameWindow(first), isCurrent(),
+              let focused = focusedEditor(for: first.elements[field], app: first.app) else {
             if isCurrent() { _ = focusBottomComposer(isCurrent: isCurrent) }
             return
         }
-        resetInputTarget()
         targetWindow = window
         composerTarget = first.elements[field]
+        verifiedDictationField = focused
         trace.notice("input selected=composer")
     }
 
@@ -603,8 +689,10 @@ enum CodexConversationControls {
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(ax, 0.025)
             if let win = element(ax, kAXFocusedWindowAttribute as CFString), CFEqual(win, targetWindow),
-               let focused = element(ax, kAXFocusedUIElementAttribute as CFString), CFEqual(focused, savedComposer),
-               bool(focused, kAXEnabledAttribute as CFString) != false {
+               let focused = focusedEditor(for: savedComposer, app: ax),
+               inputRoles.contains(string(focused, kAXRoleAttribute as CFString) ?? ""),
+               bool(focused, kAXEnabledAttribute as CFString) != false,
+               !isQuestionInputLabel(metadata(focused)) {
                 verifiedDictationField = focused
                 trace.notice("dictation target=pinned composer")
                 return true
@@ -612,6 +700,7 @@ enum CodexConversationControls {
         }
         guard let snap = snapshot(preferForm: savedQuestion != nil && savedComposer == nil),
               snap.complete, let window = snap.elements.first, sameWindow(snap) else {
+            // An explicitly selected question cannot silently become chat input.
             return savedQuestion == nil && focusBottomComposer()
         }
         if let targetWindow, !CFEqual(targetWindow, window) { resetInputTarget(); return false }
@@ -633,7 +722,7 @@ enum CodexConversationControls {
         guard focus(field, in: snap), sameWindow(snap),
               let focused = focusedEditor(for: snap.elements[field], app: snap.app) else { return false }
         verifiedDictationField = focused
-        if savedQuestion == nil { targetWindow = window; composerTarget = focused }
+        if savedQuestion == nil { targetWindow = window; composerTarget = snap.elements[field] }
         trace.notice("dictation target=\(savedQuestion == nil ? "composer" : "question", privacy: .public)")
         return true
     }
@@ -658,13 +747,13 @@ enum CodexConversationControls {
         AXUIElementPerformAction(snapshot.elements[index], kAXPressAction as CFString)
     }
     @MainActor @discardableResult private static func select(_ index: Int, in snapshot: Snapshot,
-                                                             isCurrent: () -> Bool = { true }) -> Bool {
+                                                             activateEvenIfSelected: Bool = false, isCurrent: () -> Bool = { true }) -> Bool {
         guard isCurrent(), sameWindow(snapshot), snapshot.nodes[index].enabled else { return false }
         let target = snapshot.elements[index]
-        if !snapshot.nodes[index].selected {
+        if activateEvenIfSelected || !snapshot.nodes[index].selected {
             if actions(target).contains(kAXPressAction as String),
                AXUIElementPerformAction(target, kAXPressAction as CFString) == .success {
-                _ = focus(index, in: snapshot)
+                if !activateEvenIfSelected { _ = focus(index, in: snapshot) }
                 return true
             }
             // Chromium can expose a numbered badge as static text inside a clickable row.
@@ -758,7 +847,9 @@ enum CodexConversationControls {
                 if inputRoles.contains(role), let bounds = frame(node) {
                     let label = metadata(node)
                     guard bounds.minY > rect.minY + rect.height * 0.78, bounds.width >= rect.width * 0.25,
-                          !matches(Node(parent: nil, role: role, label: label), customReplyTitles),
+                          bool(node, kAXEnabledAttribute as CFString) != false,
+                          bool(node, "AXEditable" as CFString) != false,
+                          !isQuestionInputLabel(label), hasComposerInputLabel(label),
                           !contains(label, ["search", "terminal", "自定义", "自行", "搜索", "终端"]),
                           let window = element(node, kAXWindowAttribute as CFString), CFEqual(window, win) else { break }
                     let snap = Snapshot(pid: owner, app: ax, elements: [win, node], nodes: [
@@ -858,7 +949,7 @@ enum CodexConversationControls {
             if role == "AXStaticText" || role == "AXHeading" {
                 // Chromium may expose a badge or footer label through title/description.
                 let attributes = multipleAttributes(current, [kAXValueAttribute as CFString, kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString])
-                let fixed = questionTitles.union(customReplyTitles).union(skipTitles).union(formSubmits)
+                let fixed = questionTitles.union(customReplyTitles).union(standaloneReplyTitles).union(skipTitles).union(formSubmits).union(nextTitles).union(["下一步"])
                 label = attributes.compactMap { $0 as? String }.map(normalized).first {
                     fixed.contains($0) || Int($0).map { (1...12).contains($0) } == true
                 } ?? ""
@@ -1000,6 +1091,20 @@ enum CodexConversationControls {
         guard let screenshot = activeForm(card), screenshot.root == 2, screenshot.options == [6, 9],
               screenshot.fields == [11], screenshot.submit == nil, blocksChat(card),
               composer(card, window: window) == nil, composer(card, window: window, outside: screenshot) == 16 else { return false }
+        var freeform = card
+        freeform[6].label = ""; freeform[9].label = ""
+        freeform[11].label = "回复…"
+        freeform.append(Node(parent: 2, role: "AXButton", label: "上一个问题", pressable: true))
+        guard let second = activeForm(freeform), second.fields == [11], second.options.isEmpty,
+              second.previous == 18, second.immediateQuestion else { return false }
+        freeform[14].label = "下一步"; freeform[14].enabled = true
+        guard activeForm(freeform)?.submit == 14 else { return false }
+        var running = freeform
+        running[16].role = "AXTextField"; running[16].label = "处理中…"
+        guard let runningForm = activeForm(running),
+              composer(running, window: window, outside: runningForm) == 16 else { return false }
+        running[16].label = "Reply…"
+        guard composer(running, window: window, outside: runningForm) == nil else { return false }
         // A re-render can expose the custom field outside its old AX group.
         // Even with no usable composer, it must never be selected as chat input.
         var detached = card

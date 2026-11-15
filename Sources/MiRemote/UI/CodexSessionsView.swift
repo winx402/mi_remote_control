@@ -4,7 +4,25 @@ import SwiftUI
 struct CodexSessionsView: View {
     let snapshot: CodexSessions.Snapshot
     let list: CodexSessionList
+    let tabIndex: Int
     let selected: Int
+    let onTabSelected: (Int) -> Void
+
+    private var currentTabIndex: Int? {
+        guard !list.tabs.isEmpty else { return nil }
+        return min(max(tabIndex, 0), list.tabs.count - 1)
+    }
+
+    private var currentTab: CodexSessionList.Tab? {
+        currentTabIndex.map { list.tabs[$0] }
+    }
+
+    private var entries: [CodexSessions.Entry] { currentTab?.entries ?? [] }
+
+    private var selectedIndex: Int? {
+        guard !entries.isEmpty else { return nil }
+        return min(max(selected, 0), entries.count - 1)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -15,12 +33,15 @@ struct CodexSessionsView: View {
                 if snapshot.isLoading {
                     ProgressView().controlSize(.small)
                     Text("读取中…").font(.callout).foregroundStyle(.secondary)
-                } else if !snapshot.entries.isEmpty {
-                    Text("\(list.groups.count) 个项目 · \(selected + 1) / \(snapshot.entries.count)")
+                } else if let selectedIndex {
+                    Text("\(selectedIndex + 1) / \(entries.count)")
                         .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
-            if snapshot.entries.isEmpty {
+            if !list.tabs.isEmpty {
+                projectTabs
+            }
+            if entries.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: snapshot.error == nil ? "text.bubble" : "exclamationmark.bubble")
                         .font(.system(size: 30)).foregroundStyle(.secondary)
@@ -32,15 +53,10 @@ struct CodexSessionsView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(spacing: 4, pinnedViews: [.sectionHeaders]) {
-                            ForEach(list.groups) { group in
-                                Section {
-                                    ForEach(Array(group.entries.enumerated()), id: \.element.identityKey) { offset, entry in
-                                        row(entry, selected: group.startIndex + offset == selected).id(entry.identityKey)
-                                    }
-                                } header: {
-                                    sectionHeader(group)
-                                }
+                        LazyVStack(spacing: 4) {
+                            ForEach(Array(entries.enumerated()), id: \.element.identityKey) { index, entry in
+                                row(entry, selected: index == selectedIndex)
+                                    .id(entry.identityKey)
                             }
                         }
                         .padding(.horizontal, 4).padding(.vertical, 5)
@@ -48,7 +64,8 @@ struct CodexSessionsView: View {
                     .frame(height: 360)
                     .onAppear { scroll(proxy) }
                     .onChange(of: selected) { _, _ in scroll(proxy) }
-                    .onChange(of: snapshot.entries.map(\.identityKey)) { _, _ in scroll(proxy) }
+                    .onChange(of: currentTab?.id) { _, _ in scroll(proxy) }
+                    .onChange(of: entries.map(\.identityKey)) { _, _ in scroll(proxy) }
                 }
             }
             if let error = snapshot.error {
@@ -75,28 +92,66 @@ struct CodexSessionsView: View {
         .shadow(radius: 24, y: 8)
     }
 
-    private func scroll(_ proxy: ScrollViewProxy) {
-        guard snapshot.entries.indices.contains(selected) else { return }
-        withAnimation(Motion.select) {
-            proxy.scrollTo(snapshot.entries[selected].identityKey, anchor: .center)
+    private var projectTabs: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: 8) {
+                    ForEach(Array(list.tabs.enumerated()), id: \.element.id) { index, tab in
+                        projectTab(tab, index: index).id(tab.id)
+                    }
+                }
+                .padding(.horizontal, 4).padding(.vertical, 5)
+            }
+            .frame(height: 76)
+            .onAppear { scrollTab(proxy) }
+            .onChange(of: currentTab?.id) { _, _ in scrollTab(proxy) }
         }
     }
 
-    private func sectionHeader(_ group: CodexSessionList.Group) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: group.isRemote ? "network" : "folder")
-            Text(group.title).fontWeight(.semibold).lineLimit(1)
-            Text("\(group.entries.count)").monospacedDigit()
-            Spacer()
-            Text(group.isRemote ? "远程 · \(group.hostTitle)" : group.hostTitle)
-                .lineLimit(1).truncationMode(.middle)
-                .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(Color.secondary.opacity(0.10), in: Capsule())
+    private func projectTab(_ tab: CodexSessionList.Tab, index: Int) -> some View {
+        let isSelected = index == currentTabIndex
+        return Button {
+            onTabSelected(index)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: index == 0 ? "clock" : tab.isRemote ? "network" : "folder")
+                    Text(tab.title).fontWeight(isSelected ? .semibold : .regular)
+                        .lineLimit(1).truncationMode(.middle)
+                    Text("\(tab.entries.count)").font(.caption).monospacedDigit()
+                }
+                if let hostTitle = tab.hostTitle {
+                    Text(tab.isRemote ? "远程 · \(hostTitle)" : hostTitle)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: 220, alignment: .leading)
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+            .background(isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: Radius.small))
+            .overlay(RoundedRectangle(cornerRadius: Radius.small)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 2))
         }
-        .font(.callout).foregroundStyle(.secondary)
-        .padding(.horizontal, 12).padding(.vertical, 9)
-        .background(.regularMaterial)
+        .buttonStyle(.plain)
+        .help([tab.title, tab.isRemote ? "远程" : nil, tab.hostTitle].compactMap { $0 }.joined(separator: " · "))
         .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func scrollTab(_ proxy: ScrollViewProxy) {
+        guard let currentTab else { return }
+        withAnimation(Motion.select) {
+            proxy.scrollTo(currentTab.id, anchor: .center)
+        }
+    }
+
+    private func scroll(_ proxy: ScrollViewProxy) {
+        guard let selectedIndex else { return }
+        withAnimation(Motion.select) {
+            proxy.scrollTo(entries[selectedIndex].identityKey, anchor: .center)
+        }
     }
 
     private func row(_ entry: CodexSessions.Entry, selected: Bool) -> some View {
@@ -104,9 +159,17 @@ struct CodexSessionsView: View {
             Image(systemName: entry.isRemote ? "network" : "bubble.left")
                 .font(.body).foregroundStyle(selected ? Color.accentColor : Color.secondary)
                 .frame(width: 24)
-            Text(entry.title)
-                .font(.body.weight(selected ? .semibold : .regular))
-                .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.title)
+                    .font(.body.weight(selected ? .semibold : .regular))
+                    .lineLimit(2)
+                if currentTabIndex == 0 {
+                    Text("\(entry.groupTitle) · \(entry.isRemote ? "远程 · " : "")\(entry.hostTitle)")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             if entry.identityKey == snapshot.currentIdentityKey {
                 Text("当前会话").font(.caption.weight(.semibold))
                     .foregroundStyle(Color.accentColor)

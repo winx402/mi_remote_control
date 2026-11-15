@@ -1,56 +1,66 @@
 import Foundation
 
-/// 浮层的项目顺序与遥控导航共用同一份扁平索引，组标题不占可选位置。
 struct CodexSessionList {
-    struct Group: Identifiable {
+    struct Tab: Identifiable {
         let id: String
         let title: String
-        let hostTitle: String
+        let hostTitle: String?
         let isRemote: Bool
         let entries: [CodexSessions.Entry]
-        let startIndex: Int
     }
 
-    let groups: [Group]
-    let entries: [CodexSessions.Entry]
+    struct Selection: Equatable {
+        var tab = 0
+        var row = 0
+    }
+
+    let tabs: [Tab]
 
     init(entries: [CodexSessions.Entry]) {
-        let grouped = Dictionary(grouping: entries, by: \.groupID)
-        let ordered = grouped.values.map { CodexSessions.sorted($0) }.sorted { lhs, rhs in
-            let left = lhs.first!
-            let right = rhs.first!
-            return left.updatedAt == right.updatedAt ? left.groupID < right.groupID : left.updatedAt > right.updatedAt
+        let newest = CodexSessions.sorted(entries)
+        let recent = Tab(id: "recent", title: "最近", hostTitle: nil, isRemote: false,
+                         entries: Array(newest.prefix(10)))
+        let projects = Dictionary(grouping: newest, by: \.groupID).compactMap { id, rows -> Tab? in
+            guard let first = rows.first else { return nil }
+            return Tab(id: id, title: first.groupTitle, hostTitle: first.hostTitle,
+                       isRemote: first.isRemote, entries: rows)
+        }.sorted { lhs, rhs in
+            let names = lhs.title.localizedStandardCompare(rhs.title)
+            if names != .orderedSame { return names == .orderedAscending }
+            if lhs.isRemote != rhs.isRemote { return !lhs.isRemote }
+            let hosts = (lhs.hostTitle ?? "").localizedStandardCompare(rhs.hostTitle ?? "")
+            return hosts == .orderedSame ? lhs.id < rhs.id : hosts == .orderedAscending
         }
-        var groups: [Group] = []
-        var flattened: [CodexSessions.Entry] = []
-        for group in ordered {
-            guard let first = group.first else { continue }
-            groups.append(Group(id: first.groupID, title: first.groupTitle, hostTitle: first.hostTitle,
-                                isRemote: first.isRemote, entries: group, startIndex: flattened.count))
-            flattened.append(contentsOf: group)
-        }
-        self.groups = groups
-        self.entries = flattened
+        tabs = [recent] + projects
     }
 
-    static func grouped(_ snapshot: CodexSessions.Snapshot) -> CodexSessions.Snapshot {
-        var result = snapshot
-        result.entries = Self(entries: snapshot.entries).entries
-        return result
+    func entry(at selection: Selection) -> CodexSessions.Entry? {
+        guard tabs.indices.contains(selection.tab), tabs[selection.tab].entries.indices.contains(selection.row) else { return nil }
+        return tabs[selection.tab].entries[selection.row]
     }
 
-    func movedIndex(_ index: Int, key: RemoteKey) -> Int {
-        guard !entries.isEmpty else { return 0 }
-        let index = min(max(index, 0), entries.count - 1)
+    func moved(_ selection: Selection, key: RemoteKey) -> Selection {
         switch key {
-        case .up: return max(0, index - 1)
-        case .down: return min(entries.count - 1, index + 1)
         case .left, .right:
-            guard let groupIndex = groups.lastIndex(where: { $0.startIndex <= index }) else { return index }
-            let target = groupIndex + (key == .left ? -1 : 1)
-            return groups.indices.contains(target) ? groups[target].startIndex : index
-        default: return index
+            let next = selection.tab + (key == .left ? -1 : 1)
+            return tabs.indices.contains(next) ? Selection(tab: next) : selection
+        case .up, .down:
+            return Selection(tab: selection.tab, row: CodexSessions.movedIndex(selection.row, delta: key == .up ? -1 : 1,
+                                                                                 count: tabs[selection.tab].entries.count))
+        default: return selection
         }
+    }
+
+    /// Preserve a browsed project and thread across asynchronous catalog updates.
+    func selection(after previous: Self, prior: Selection, browsed: Bool, currentKey: String?) -> Selection {
+        guard browsed, previous.tabs.indices.contains(prior.tab),
+              let tab = tabs.firstIndex(where: { $0.id == previous.tabs[prior.tab].id }) else {
+            return Selection(tab: 0, row: tabs[0].entries.firstIndex { $0.identityKey == currentKey } ?? 0)
+        }
+        let key = previous.entry(at: prior)?.identityKey
+        let rows = tabs[tab].entries
+        let row = rows.firstIndex { $0.identityKey == key } ?? min(prior.row, max(0, rows.count - 1))
+        return Selection(tab: tab, row: row)
     }
 
     static func currentIndex(in snapshot: CodexSessions.Snapshot) -> Int? {
@@ -59,35 +69,23 @@ struct CodexSessionList {
     }
 
     static func selfCheck() -> Bool {
-        let localA = CodexSessions.Entry(id: "local-a", name: "本机会话 A", updatedAt: 9,
-                                        projectID: "one", projectName: "同名项目")
-        let localB = CodexSessions.Entry(id: "local-b", name: "本机会话 B", updatedAt: 2,
-                                        projectID: "one", projectName: "同名项目")
-        let remote = CodexSessions.Entry(id: "local-a", name: "远程会话", updatedAt: 8,
-                                        hostID: "remote", hostName: "远程电脑", projectID: "one", projectName: "同名项目")
-        let other = CodexSessions.Entry(id: "other", name: "另一项目", updatedAt: 7,
-                                       projectID: "two", projectName: "另一项目")
-        let list = Self(entries: [other, localB, remote, localA])
-        guard list.groups.count == 3, list.entries.map(\.identityKey) == [localA, localB, remote, other].map(\.identityKey),
-              list.groups.map(\.startIndex) == [0, 2, 3], list.groups[1].isRemote,
-              list.movedIndex(1, key: .down) == 2, list.movedIndex(2, key: .up) == 1,
-              list.movedIndex(1, key: .right) == 2, list.movedIndex(2, key: .right) == 3,
-              list.movedIndex(3, key: .left) == 2, list.movedIndex(2, key: .left) == 0,
-              list.movedIndex(1, key: .left) == 1, list.movedIndex(3, key: .right) == 3,
-              list.movedIndex(0, key: .up) == 0, list.movedIndex(3, key: .down) == 3,
-              Self(entries: []).movedIndex(4, key: .right) == 0 else { return false }
-        var current = CodexSessions.Snapshot(entries: list.entries, currentID: remote.id)
-        current.currentIdentityKey = remote.identityKey
-        guard Self.currentIndex(in: current) == 2 else { return false }
-        // 新页面插入/组排序变化时，以宿主与会话身份保留用户正在浏览的行。
-        let newest = CodexSessions.Entry(id: "newest", name: "新会话", updatedAt: 12,
-                                        projectID: "two", projectName: "另一项目")
-        var loaded = Self.grouped(CodexSessions.Snapshot(entries: list.entries + [newest], currentID: remote.id))
-        loaded.currentIdentityKey = remote.identityKey
-        let selected = loaded.selection(after: current, index: 1, userMoved: true)
-        let anchored = loaded.selection(after: current, index: 1, userMoved: false)
-        return loaded.entries[selected].identityKey == localB.identityKey
-            && loaded.entries[anchored].identityKey == remote.identityKey
-            && Self.currentIndex(in: CodexSessions.Snapshot(entries: list.entries)) == nil
+        let empty = Self(entries: [])
+        let local = (1...12).map { index in
+            CodexSessions.Entry(id: String(index), name: nil, updatedAt: Double(index), projectID: "p", projectName: "Beta")
+        }
+        let remote = CodexSessions.Entry(id: "12", name: nil, updatedAt: 14, hostID: "host", hostName: "Remote", projectID: "p", projectName: "Beta")
+        let list = Self(entries: local + [remote])
+        guard empty.tabs.count == 1, empty.entry(at: Selection()) == nil,
+              list.tabs.count == 3, list.tabs[0].entries.map(\.updatedAt) == [14,12,11,10,9,8,7,6,5,4],
+              list.tabs[1].entries.count == 12, list.tabs[2].isRemote,
+              list.moved(Selection(tab: 0, row: 9), key: .down) == Selection(tab: 0, row: 9),
+              list.moved(Selection(tab: 0, row: 9), key: .right) == Selection(tab: 1),
+              list.entry(at: Selection(tab: 2))?.identityKey == remote.identityKey else { return false }
+        let earlier = CodexSessions.Entry(id: "extra", name: nil, updatedAt: 15, projectID: "a", projectName: "Alpha")
+        let fresh = Self(entries: local + [remote, earlier])
+        let kept = fresh.selection(after: list, prior: Selection(tab: 2), browsed: true, currentKey: nil)
+        return kept.tab == 3 && fresh.entry(at: kept)?.identityKey == remote.identityKey
+            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: remote.identityKey) == Selection(tab: 0, row: 1)
+            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == Selection()
     }
 }

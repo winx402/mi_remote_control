@@ -144,7 +144,7 @@ final class OverlayUIState: ObservableObject {
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexList = CodexSessionList(entries: [])
-    @Published var codexIndex = 0
+    @Published var codexSelection = CodexSessionList.Selection()
     @Published var powerMenu = PowerMenuState()
     @Published var televisionPowerStatus: String?
     @Published var powerConfirmingID: String?
@@ -228,7 +228,7 @@ final class OverlayCenter {
     private let codexSessions = CodexSessions()
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexList = CodexSessionList(entries: [])
-    private var codexIndex = 0
+    private var codexSelection = CodexSessionList.Selection()
     private var browsedSessions = false
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
@@ -418,19 +418,17 @@ final class OverlayCenter {
         case .codexSessions:
             let identity = CodexSessionIdentity.capture()
             browsedSessions = false
-            codexIndex = 0
+            codexSelection = CodexSessionList.Selection()
             codexSnapshot = CodexSessions.Snapshot(isLoading: true)
             codexList = CodexSessionList(entries: [])
             showPanel()
             codexSessions.load(identity: identity) { [weak self] incoming in
                 guard let self, self.active == .codexSessions else { return }
                 let list = CodexSessionList(entries: incoming.entries)
-                var snapshot = incoming
-                snapshot.entries = list.entries
+                self.codexSelection = list.selection(after: self.codexList, prior: self.codexSelection,
+                                                     browsed: self.browsedSessions, currentKey: incoming.currentIdentityKey)
                 self.codexList = list
-                self.codexIndex = snapshot.selection(after: self.codexSnapshot, index: self.codexIndex,
-                                                     userMoved: self.browsedSessions)
-                self.codexSnapshot = snapshot
+                self.codexSnapshot = incoming
                 self.sync(animated: false)
             }
         }
@@ -473,7 +471,7 @@ final class OverlayCenter {
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexList = CodexSessionList(entries: [])
-        codexIndex = 0
+        codexSelection = CodexSessionList.Selection()
         engine?.setOverlayCapture(nil)
         if let escMonitor { NSEvent.removeMonitor(escMonitor) }
         escMonitor = nil
@@ -975,7 +973,15 @@ final class OverlayCenter {
     private func codexStep(_ key: RemoteKey) {
         guard !codexSnapshot.entries.isEmpty else { return }
         browsedSessions = true
-        codexIndex = codexList.movedIndex(codexIndex, key: key)
+        codexSelection = codexList.moved(codexSelection, key: key)
+        restartOverlayIdleTimer()
+        sync()
+    }
+
+    private func selectCodexTab(_ index: Int) {
+        guard active == .codexSessions, codexList.tabs.indices.contains(index), index != codexSelection.tab else { return }
+        browsedSessions = true
+        codexSelection = CodexSessionList.Selection(tab: index)
         restartOverlayIdleTimer()
         sync()
     }
@@ -986,8 +992,7 @@ final class OverlayCenter {
             codexStep(key)
             startRepeat(key) { [weak self] in self?.codexStep(key) }
         case .ok:
-            guard codexSnapshot.entries.indices.contains(codexIndex) else { return }
-            let target = codexSnapshot.entries[codexIndex]
+            guard let target = codexList.entry(at: codexSelection) else { return }
             if CodexSessions.open(target) {
                 close()
             } else {
@@ -1024,7 +1029,7 @@ final class OverlayCenter {
             uiState.wheelIndex = wheelIndex
             uiState.codexSnapshot = codexSnapshot
             uiState.codexList = codexList
-            uiState.codexIndex = codexIndex
+            uiState.codexSelection = codexSelection
             uiState.powerMenu = powerMenu
             uiState.televisionPowerStatus = televisionPowerStatus
             uiState.powerConfirmingID = powerConfirmingID
@@ -1054,6 +1059,7 @@ final class OverlayCenter {
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.contentView = NSHostingView(rootView: OverlayRootView(state: uiState,
             onDismiss: { [weak self] in self?.close() },
+            onCodexTabSelected: { [weak self] in self?.selectCodexTab($0) },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
             onMenuActivate: { [weak self] in self?.activateMenuEntry($0, confirmed: true) },
             onPowerSelect: { [weak self] in self?.selectPowerChoice($0) },
@@ -1444,6 +1450,7 @@ struct HintBarView: View {
 private struct OverlayRootView: View {
     @ObservedObject var state: OverlayUIState
     let onDismiss: () -> Void
+    let onCodexTabSelected: (Int) -> Void
     let onMenuSelect: (Int) -> Void
     let onMenuActivate: (Int) -> Void
     let onPowerSelect: (PowerMenuState.Choice) -> Void
@@ -1472,7 +1479,8 @@ private struct OverlayRootView: View {
                 case .appWheel:
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
                 case .codexSessions:
-                    CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, selected: state.codexIndex)
+                    CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, tabIndex: state.codexSelection.tab,
+                                      selected: state.codexSelection.row, onTabSelected: onCodexTabSelected)
                 case .computerPower:
                     let generation = state.powerGeneration
                     let inputGeneration = state.confirmationInputGeneration

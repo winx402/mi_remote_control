@@ -94,6 +94,10 @@ enum ActionSummary {
     private static let baseSystemNames: [(value: String, display: String)] = [
         ("app_mru_back", "回到上一个 App"),
         ("remote_reset", "退出所有遥控模式"),
+        ("codex_context_up", "向上读对话／上一选项"), ("codex_context_down", "向下读对话／下一选项"),
+        ("codex_context_left", "上一题"), ("codex_context_right", "下一题"),
+        ("codex_context_ok", "选择或聚焦回答"), ("codex_context_submit", "发送消息或提交答案"),
+        ("codex_context_dictate", "开始／结束语音输入"),
         ("codex_scroll_up", "Codex 向上滚动回复"), ("codex_scroll_down", "Codex 向下滚动回复"),
         ("codex_previous_chat", "Codex 上一个会话"), ("codex_next_chat", "Codex 下一个会话"),
         ("volume_up", "音量 ＋"), ("volume_down", "音量 －"), ("mute", "静音"),

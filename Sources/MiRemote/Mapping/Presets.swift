@@ -176,19 +176,27 @@ enum Presets {
         ]
     )
 
+    /// These actions explicitly opt a Codex profile into semantic context routing.
+    static let codexContextActions: [RemoteKey: Action] = [
+        .up: .system("codex_context_up"), .down: .system("codex_context_down"),
+        .left: .system("codex_context_left"), .right: .system("codex_context_right"),
+        .ok: .system("codex_context_ok"), .voice: .system("codex_context_dictate"),
+    ]
+
     static let codexDesktop = Preset(
         id: "ai_codex_desktop",
         displayName: "Codex 桌面版",
-        note: "上下选择，左右切任务标签，OK=确认，返回=Esc；控制模式内 Home 聚焦输入框。",
+        note: "上下按当前区域浏览，左右调整当前控件；OK=选择/进入输入，长按OK=发送一次；菜单=会话列表，语音短按=输入框听写，返回=Esc。",
         bundleID: "com.openai.codex",
         bindings: [
-            "left": KeyBinding(tap: .tabJump(dir: -1, index: nil)),
-            "right": KeyBinding(tap: .tabJump(dir: 1, index: nil)),
-            "up": KeyBinding(tap: ks("up_arrow")),
-            "down": KeyBinding(tap: ks("down_arrow")),
-            "ok": KeyBinding(tap: ks("return")),
-            "back": KeyBinding(tap: ks("escape")),
-            "home": KeyBinding(layers: ["2": .focusInput]),
+            "up": KeyBinding(tap: .system("codex_context_up"), overrideBase: true),
+            "down": KeyBinding(tap: .system("codex_context_down"), overrideBase: true),
+            "left": KeyBinding(tap: .system("codex_context_left"), overrideBase: true),
+            "right": KeyBinding(tap: .system("codex_context_right"), overrideBase: true),
+            "ok": KeyBinding(tap: .system("codex_context_ok"), hold: .system("codex_context_submit")),
+            "back": KeyBinding(tap: ks("escape"), overrideBase: true),
+            "menu": KeyBinding(tap: .overlay("codex_sessions")),
+            "voice": KeyBinding(tap: .system("codex_context_dictate"), hold: .voice),
         ]
     )
 
@@ -427,6 +435,8 @@ enum Presets {
         if let v = src.tap,    force || dst.tap == nil    { dst.tap = v }
         if let v = src.hold,   force || dst.hold == nil   { dst.hold = v }
         if let v = src.double, force || dst.double == nil { dst.double = v }
+        if let v = src.overrideBase, force || dst.overrideBase == nil { dst.overrideBase = v }
+        if let v = src.holdMs, force || dst.holdMs == nil { dst.holdMs = v }
         if let g = src.gesture {
             var merged = dst.gesture ?? [:]
             for (dir, act) in g where force || merged[dir] == nil { merged[dir] = act }
@@ -437,6 +447,31 @@ enum Presets {
             for (layer, act) in l where force || merged[layer] == nil { merged[layer] = act }
             dst.layers = merged
         }
+    }
+
+    static func codexContextSelfCheck() -> Bool {
+        let bindings = codexDesktop.bindings
+        guard codexContextActions.allSatisfy({ key, action in bindings[key.rawValue]?.tap == action }),
+              bindings["ok"]?.hold == .system("codex_context_submit"),
+              bindings["menu"]?.tap == .overlay("codex_sessions"),
+              bindings["back"]?.overrideBase == true,
+              bindings["back"]?.tap == .keyStroke(key: "escape", mods: []),
+              ["up", "down", "left", "right"].allSatisfy({ bindings[$0]?.overrideBase == true }),
+              bindings["home"] == nil, bindings["tv"] == nil,
+              !bindings.values.flatMap({ actions(in: $0) }).contains(where: {
+                  if case .tabJump = $0 { return true }
+                  return false
+              }) else { return false }
+        var config = MappingConfig()
+        config.profiles["global"] = ["left": KeyBinding(tap: ks("left_arrow"))]
+        config.profiles["com.example.other"] = ["ok": KeyBinding(tap: ks("space"))]
+        apply(codexDesktop, to: &config)
+        guard config.profiles["com.openai.codex"]?["left"]?.overrideBase == true,
+              config.profiles["com.example.other"]?["ok"]?.tap == ks("space"),
+              config.profiles["global"]?["left"]?.tap == ks("left_arrow") else { return false }
+        config.profiles["com.openai.codex"]?["left"]?.tap = .system("mute")
+        apply(codexDesktop, to: &config)
+        return config.profiles["com.openai.codex"]?["left"]?.tap == .system("mute")
     }
 
     // MARK: - selfCheck 支撑：遍历预设内所有 Action

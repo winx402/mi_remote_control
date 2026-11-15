@@ -1332,13 +1332,11 @@ enum HintBarCatalog {
     }
 
     static func hintsForCodex() -> [Hint] {
-        [Hint(keys: [.up, .down], text: "原生方向键"),
-         Hint(keys: [.left, .right], text: "单击会话 · 双击 ⌃← / ⌃→"),
-         Hint(keys: [.home], text: "单击列表 · 长按新建 · 双击桌面"),
-         Hint(keys: [.menu], text: "单击命令 · 长按 Dock"),
-         Hint(keys: [.tv], text: "长按模型"),
-         Hint(keys: [.voice], text: "单击聚焦"),
-         Hint(keys: [.back], text: "长按 1.2 秒退出当前应用")]
+        [Hint(keys: [.up, .down], text: "阅读对话／选择答案"),
+         Hint(keys: [.left, .right], text: "切换题目"),
+         Hint(keys: [.menu], text: "会话列表"),
+         Hint(keys: [.voice], text: "开始／结束听写"),
+         Hint(keys: [.ok], text: "单击选择 · 长按发送")]
     }
 
     static func hintsForMouse(status: String = "鼠标模式") -> [Hint] {
@@ -1353,7 +1351,7 @@ enum HintBarCatalog {
     /// 只列 profile 显式声明且基础态确实生效的槽位；Back 必须额外 opt-in，
     /// 与 MappingEngine 的保护保持一致，避免提示条许诺引擎不认的绑定。
     static func hints(forBaseProfile bundleID: String, config: MappingConfig) -> [Hint] {
-        if bundleID == "com.openai.codex" { return hintsForCodex() }
+        if bundleID == "com.openai.codex", config.profiles[bundleID]?["ok"]?.hold == .system("codex_context_submit") { return hintsForCodex() }
         var hints: [Hint] = []
         if let action = config.profiles[bundleID]?["ok"]?.tap {
             hints.append(Hint(keys: [.ok], text: ActionSummary.describe(action)))

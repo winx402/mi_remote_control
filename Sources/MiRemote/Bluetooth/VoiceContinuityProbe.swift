@@ -6,6 +6,8 @@ final class VoiceContinuityProbe {
     struct Statistics: Sendable {
         fileprivate(set) var notifications = 0
         fileprivate(set) var bytes = 0
+        fileprivate(set) var exactPlainNotifications = 0
+        fileprivate(set) var unknownLayoutNotifications = 0
         fileprivate(set) var lateNotifications = 0
         fileprivate(set) var lateBytes = 0
         fileprivate(set) var lateFrames = 0
@@ -20,6 +22,10 @@ final class VoiceContinuityProbe {
         fileprivate var lastEnergyNs: UInt64?
 
         var pcmSeconds: Double { Double(pcmSamples) / 16_000 }
+        /// 仅确认协商帧长相符的传输，绝不等同于 PCM 或有声。
+        var hasPlainTransportBaseline: Bool {
+            exactPlainNotifications >= 3 && unknownLayoutNotifications == 0
+        }
         var rms: Double { pcmSamples == 0 ? 0 : sqrt(squareSum / Double(pcmSamples)) }
         var signalSpanSeconds: Double {
             guard let firstEnergyNs, let lastEnergyNs else { return 0 }
@@ -33,7 +39,7 @@ final class VoiceContinuityProbe {
         }
 
         var summary: String {
-            "raw \(notifications)包/\(bytes)B；1秒后 \(lateNotifications)包/\(lateBytes)B、" +
+            "raw \(notifications)包/\(bytes)B（整120B \(exactPlainNotifications)包）；1秒后 \(lateNotifications)包/\(lateBytes)B、" +
             "组帧\(lateFrames)、有效PCM \(validPCMFrames)帧；" +
             String(format: "PCM %.2fs、峰值%d、RMS %.1f、非静音跨度%.2fs",
                    pcmSeconds, pcmPeak, rms, signalSpanSeconds)
@@ -53,6 +59,8 @@ final class VoiceContinuityProbe {
         let duplicateStarts: Int
         let hostOpenAttempted: Bool
         let detail: String
+        /// 聚合诊断元数据；不保存任何语音内容或原始音频字节。
+        var decoderSummary: String = "解码状态未提供"
 
         /// Confirms only sustained non-silent PCM in this bounded experiment.
         /// It does not certify speech content, long recording, toggle UX, or WeType.
@@ -75,7 +83,8 @@ final class VoiceContinuityProbe {
             }
             let b = hostOpenAttempted ? "\nB：\(phaseB.summary)" : "\nB：未执行"
             return "\(result)。\(detail)\n" +
-                "按住基线：\(baseline.notifications)包/\(baseline.bytes)B，有效PCM \(baseline.validPCMFrames)帧；同会话重复开始\(duplicateStarts)次\n" +
+                "按住基线：\(baseline.notifications)包/\(baseline.bytes)B，整120B \(baseline.exactPlainNotifications)包，有效PCM \(baseline.validPCMFrames)帧；同会话重复开始\(duplicateStarts)次\n" +
+                "\(decoderSummary)\n" +
                 "A：\(phaseA.summary)\(b)\n" +
                 "仅验证本次短窗口的帧与能量；未保存、播放或识别音频，未验收长期收音或微信输入法。"
         }
@@ -112,6 +121,10 @@ final class VoiceContinuityProbe {
     private var hostStarted = false
     private var requestedPhysicalOpen = false
     private var decodeNote = "尚未收到可验证的同步PCM"
+    private var syncReceived = 0
+    private var syncAccepted = 0
+    private var syncRejected = 0
+    private var syncOutsideStream = 0
 
     var isFinished: Bool { phase == .finished }
 
@@ -130,8 +143,8 @@ final class VoiceContinuityProbe {
         case .physical:
             return finish(.timedOut, "实体语音流开始15秒后仍未观察到松键；请松开语音键。")
         case .afterRelease:
-            guard baseline.validPCMFrames > 0 else {
-                return finish(.inconclusive, "按住阶段未取得有效PCM，不能判断松手行为，未主动重开麦克风。")
+            guard baseline.validPCMFrames > 0 || (supportsPlainSync && baseline.hasPlainTransportBaseline) else {
+                return finish(.inconclusive, "按住阶段既无有效PCM，也无足够的协商裸帧传输基线，未主动重开麦克风。")
             }
             if phaseA.hasSustainedSignal {
                 return finish(.signalAfterRelease, "A窗口6秒；已排除最初1秒。")
@@ -141,7 +154,7 @@ final class VoiceContinuityProbe {
             deadlineNs = nowNs + 300_000_000
             resetDecode()
             return [.closeMicrophone,
-                    .update("A未检测到持续有效声音。关闭旧流后，仅主动开麦一次观察5秒；请保持语音键松开并说话。")]
+                    .update("A未确认持续声音（\(phaseA.notifications == 0 ? "松手后0传输包" : "收到传输包但声音证据不足")）。关闭旧流后，仅主动开麦一次观察5秒；请保持语音键松开并说话。")]
         case .closingPhysical:
             phase = .host
             phaseStartNs = nowNs
@@ -155,8 +168,10 @@ final class VoiceContinuityProbe {
                 return finish(.signalAfterHostOpen, "B窗口5秒；已排除主动开麦后的最初1秒。")
             }
             let hasUnverifiedData = phaseA.lateBytes > 0 || phaseB.lateBytes > 0
-            return finish(hasUnverifiedData ? .inconclusive : .noSignal,
-                          "\(decodeNote)。开麦写入或STREAM_START不作为声音证据。")
+            let aTransport = phaseA.notifications == 0 ? "A松手后0传输包" : "A收到\(phaseA.notifications)个传输包"
+            let bTransport = phaseB.notifications == 0 ? "B主动开麦后0传输包" : "B收到\(phaseB.notifications)个传输包"
+            return finish(hasUnverifiedData || baseline.validPCMFrames == 0 ? .inconclusive : .noSignal,
+                          "\(aTransport)；\(bTransport)。\(decodeNote)。传输、开麦写入或STREAM_START均不作为声音证据。")
         case .finished: return []
         }
     }
@@ -224,17 +239,31 @@ final class VoiceContinuityProbe {
     }
 
     func sync(predictor: Int16, stepIndex: Int) {
-        guard phase == .physical || phase == .afterRelease || (phase == .host && hostStarted) else { return }
+        syncReceived += 1
+        guard phase == .physical || phase == .afterRelease || (phase == .host && hostStarted) else {
+            syncOutsideStream += 1
+            return
+        }
         partial.removeAll(keepingCapacity: false)
         partialStartNs = nil
         guard supportsPlainSync, (0...88).contains(stepIndex), !framingUnknown else {
+            syncRejected += 1
             synchronized = false
             decodeNote = "同步或帧格式无法验证，有效PCM未知"
             return
         }
         decoder.reset(predictor: predictor, stepIndex: stepIndex)
+        syncAccepted += 1
         synchronized = true
         decodeNote = "已使用合法AUDIO_SYNC解码v1.0裸120字节帧"
+    }
+
+    /// 已见 0x0A，但其布局不足以解析 predictor / stepIndex。
+    func malformedSync() {
+        syncReceived += 1
+        syncRejected += 1
+        synchronized = false
+        decodeNote = "AUDIO_SYNC字段不完整，有效PCM未知"
     }
 
     func audio(_ data: Data, nowNs: UInt64) -> [Effect] {
@@ -292,6 +321,8 @@ final class VoiceContinuityProbe {
     private func observeRaw(_ stats: inout Statistics, data: Data, eligible: Bool, nowNs: UInt64) {
         stats.notifications += 1
         stats.bytes += data.count
+        if supportsPlainSync && data.count == frameSize { stats.exactPlainNotifications += 1 }
+        else { stats.unknownLayoutNotifications += 1 }
         if eligible {
             stats.lateNotifications += 1
             stats.lateBytes += data.count
@@ -337,11 +368,13 @@ final class VoiceContinuityProbe {
     }
 
     private func finish(_ outcome: Report.Outcome, _ detail: String) -> [Effect] {
+        let summary = "AUDIO_SYNC收到\(syncReceived)次、接受\(syncAccepted)次、拒绝\(syncRejected)次、流外\(syncOutsideStream)次；\(decodeNote)"
         phase = .finished
         resetDecode()
         return [.finished(Report(outcome: outcome, phaseA: phaseA, phaseB: phaseB,
                                  baseline: baseline, duplicateStarts: duplicateStarts,
-                                 hostOpenAttempted: hostOpenAttempted, detail: detail))]
+                                 hostOpenAttempted: hostOpenAttempted, detail: detail,
+                                 decoderSummary: summary))]
     }
 
     /// Pure state and fake-effect checks. No CB/CG, input method, file or sound I/O.
@@ -379,6 +412,66 @@ final class VoiceContinuityProbe {
         guard let missing = report(absent.advance(nowNs: 6_000_000_100)),
               missing.outcome == .inconclusive, !missing.hostOpenAttempted,
               missing.baseline.notifications == 0 else { return false }
+
+        // Real diagnostic shape: 241 aligned 120-byte notifications, no SYNC.
+        // Missing decoder initialization must not block the transport-only B test,
+        // nor may arbitrary encoded-looking bytes be reported as audible PCM.
+        let unsynchronized = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = unsynchronized.streamStarted(nowNs: 1, sessionID: 9)
+        for index in 0..<241 {
+            _ = unsynchronized.audio(Data(repeating: 0x77, count: 120),
+                                     nowNs: 10 + UInt64(index) * 15_000_000)
+        }
+        let release: UInt64 = 4_000_000_000
+        _ = unsynchronized.streamStopped(nowNs: release)
+        let closeUnsynced = unsynchronized.advance(nowNs: release + 6_000_000_000)
+        guard closeUnsynced.contains(where: { if case .closeMicrophone = $0 { return true }; return false }),
+              case .openMicrophone? = unsynchronized.advance(nowNs: release + 6_300_000_000).first else { return false }
+        _ = unsynchronized.streamStarted(nowNs: release + 6_400_000_000, sessionID: 10)
+        guard let noTransport = report(unsynchronized.advance(nowNs: release + 11_300_000_000)),
+              noTransport.hostOpenAttempted, !noTransport.isSupportConfirmed,
+              noTransport.outcome == .inconclusive,
+              noTransport.baseline.bytes == 28_920, noTransport.baseline.validPCMFrames == 0,
+              noTransport.baseline.exactPlainNotifications == 241,
+              noTransport.phaseA.notifications == 0, noTransport.phaseB.notifications == 0,
+              noTransport.detail.contains("A松手后0传输包"),
+              noTransport.detail.contains("B主动开麦后0传输包"),
+              noTransport.decoderSummary.contains("AUDIO_SYNC收到0次") else { return false }
+
+        let rawOnly = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = rawOnly.streamStarted(nowNs: 1)
+        for index in 0..<3 {
+            _ = rawOnly.audio(Data(repeating: 0x77, count: 120), nowNs: UInt64(index) + 2)
+        }
+        rawOnly.malformedSync()
+        _ = rawOnly.streamStopped(nowNs: 100)
+        for index in 0..<90 {
+            _ = rawOnly.audio(Data(repeating: 0x77, count: 120),
+                              nowNs: 1_100_000_100 + UInt64(index) * 15_000_000)
+        }
+        _ = rawOnly.advance(nowNs: 6_000_000_100)
+        _ = rawOnly.advance(nowNs: 6_300_000_100)
+        _ = rawOnly.streamStarted(nowNs: 6_400_000_100)
+        for index in 0..<90 {
+            _ = rawOnly.audio(Data(repeating: 0x77, count: 120),
+                              nowNs: 7_400_000_100 + UInt64(index) * 15_000_000)
+        }
+        guard let unknownPCM = report(rawOnly.advance(nowNs: 11_300_000_100)),
+              unknownPCM.outcome == .inconclusive, !unknownPCM.isSupportConfirmed,
+              unknownPCM.phaseA.lateNotifications == 90, unknownPCM.phaseB.lateNotifications == 90,
+              unknownPCM.phaseA.validPCMFrames == 0, unknownPCM.phaseB.validPCMFrames == 0,
+              unknownPCM.decoderSummary.contains("拒绝1次") else { return false }
+
+        // Unknown packet layouts do not qualify as a trustworthy raw baseline.
+        let badLayout = VoiceContinuityProbe(version: 0x0100, frameSize: 120, nowNs: 0)
+        _ = badLayout.streamStarted(nowNs: 1)
+        for index in 0..<3 {
+            _ = badLayout.audio(Data(repeating: 0, count: 126), nowNs: UInt64(index) + 2)
+        }
+        _ = badLayout.streamStopped(nowNs: 100)
+        guard let invalidLayout = report(badLayout.advance(nowNs: 6_000_000_100)),
+              !invalidLayout.hostOpenAttempted, invalidLayout.outcome == .inconclusive,
+              invalidLayout.baseline.unknownLayoutNotifications == 3 else { return false }
 
         // Same-session START echoes do not reset state or extend the deadline.
         // A genuinely different session still invalidates the experiment.

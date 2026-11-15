@@ -385,6 +385,9 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// GUI 开关与 ATVV 回调串行化。不得持锁调用会等待主线程 TIS 的 shutdown。
     private let sessionLock = NSLock()
     private var deliveryGate = VoiceDeliveryGate()
+    /// Codex 两按听写使用真实默认麦克风；本次物理按住不能另开旧 ATVV 听写链路。
+    private var suppressPhysicalSession = false
+    private var physicalVoiceInProgress = false
     private var cleanupCount = 0
     private var _switchInput: Bool
     private var _doubao: Bool
@@ -429,6 +432,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     var onVoiceActive: ((Bool) -> Void)?
     /// GUI 注入：在一次语音会话开始时，按最近的前台 App 解析快捷键。
     var resolveTriggerConfig: (() -> VoiceTriggerConfig)?
+    /// 仅查询锁保护的配置／前台快照，不得在 ATVV 队列读取 AppKit UI。
+    var shouldSuppressPhysicalVoice: (() -> Bool)?
 
     /// 语音会话期间默认麦克风的切换目标（前缀匹配；默认 BlackHole，配置可换）。
     private let micDeviceName: String
@@ -468,6 +473,12 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func atvvVoiceStarted() {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        guard !physicalVoiceInProgress else { return }
+        physicalVoiceInProgress = true
+        if shouldSuppressPhysicalVoice?() == true {
+            suppressPhysicalSession = true
+            return
+        }
         let delay = minimumHoldMs
         deliveryGate.begin(nowNs: DispatchTime.now().uptimeNanoseconds, holdMs: delay,
                            actionsEnabled: switchInput || doubao)
@@ -512,6 +523,11 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func atvvVoiceStopped() {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        physicalVoiceInProgress = false
+        if suppressPhysicalSession {
+            suppressPhysicalSession = false
+            return
+        }
         guard deliveryGate.end() else { return }
         log("语音结束")
         onVoiceActive?(false)
@@ -597,7 +613,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func atvvAudioFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
-        guard cleanupCount == 0 else { return }
+        guard cleanupCount == 0, !suppressPhysicalSession else { return }
         guard let delivery = deliveryGate.receive(.init(data: frame, sync: sync),
                                               nowNs: DispatchTime.now().uptimeNanoseconds) else { return }
         switch delivery {
@@ -695,6 +711,11 @@ final class KeyMapperApp: HIDEngineDelegate, MappingEngineDelegate {
     init(config: MappingConfig, verbose: Bool) {
         self.verbose = verbose
         engine = MappingEngine(config: config, runner: runner, delegate: self)
+        runner.codexInputGeneration = { [weak engine] in
+            guard let engine, !engine.isSuspended, !engine.tapRoute.uiCapture,
+                  engine.tapRoute.effectiveLayer == 0 else { return nil }
+            return engine.inputGeneration
+        }
         // 启动时用当前前台 app seed（忽略自己）。
         let myPid = ProcessInfo.processInfo.processIdentifier
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != myPid {
@@ -751,9 +772,14 @@ private final class VoiceRuleStore: @unchecked Sendable {
     private let lock = NSLock()
     private var rules: [String: VoiceTriggerRule]?
     private var bundleID: String?
+    private var codexTwoPressDictation = false
 
     func update(config: MappingConfig) {
-        lock.lock(); rules = config.voiceProfiles; lock.unlock()
+        lock.lock()
+        rules = config.voiceProfiles
+        codexTwoPressDictation = config.profiles["com.openai.codex"]?["voice"]?.tap
+            == .system(CodexDictation.actionName)
+        lock.unlock()
     }
 
     func update(bundleID: String?) {
@@ -766,6 +792,11 @@ private final class VoiceRuleStore: @unchecked Sendable {
         let snapshotBundle = bundleID
         lock.unlock()
         return VoiceTriggerRouting.resolve(snapshotRules, bundleID: snapshotBundle)
+    }
+
+    func suppressPhysicalVoice() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return codexTwoPressDictation && bundleID == "com.openai.codex"
     }
 }
 
@@ -917,6 +948,9 @@ final class AppServices {
         if options.keys {
             let config = loadOrCreateConfig(at: options.configPath)
             voiceRuleStore.update(config: config)
+            voiceApp.shouldSuppressPhysicalVoice = { [weak voiceRuleStore] in
+                voiceRuleStore?.suppressPhysicalVoice() ?? false
+            }
             let km = KeyMapperApp(config: config, verbose: options.verbose)
             voiceRuleStore.update(bundleID: km.lastExternalApplication?.bundleIdentifier)
             km.onActiveApplication = { [weak voiceRuleStore] bundleID in

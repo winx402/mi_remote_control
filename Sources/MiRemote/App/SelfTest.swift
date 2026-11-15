@@ -240,6 +240,10 @@ enum SelfTest {
         expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局长按⌃方向键、一次触发与释放")
         expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
+        expect(MappingEngine.codexContextSelfCheck(), "Codex 专用动作、长短按互斥与捕获优先")
+        expect(Presets.codexContextSelfCheck(), "Codex 对话遥控预设")
+        expect(CodexConversationControls.selfCheck(), "Codex 表单识别、切题、输入与提交目标")
+        expect(CodexDictation.selfCheck(), "Codex 两次短按听写的收音前提与结束动作")
         expect(CodexNavigation.selfCheck(), "Codex 语义菜单及回复区域判定")
         expect(PowerMenuState.selfCheck(), "控制中心默认软件焦点、网格导航与明确确认（假执行器）")
         expect(PowerMenuCatalog.selfCheck(), "电视、Mac 与应用操作目录及禁用状态")
@@ -916,7 +920,7 @@ enum SelfTest {
                 expect(combo == nil, "默认配置零同按组合（无手势/无瞬时层入口）", combo ?? "")
             }
             let baseNavigationOverride = cfg.profiles.first { profile, keys in
-                guard profile != "global" else { return false }
+                guard profile != "global", profile != "com.openai.codex" else { return false }
                 return ["home", "menu"].contains { key in
                     guard let b = keys[key] else { return false }
                     return b.tap != nil || b.hold != nil || b.double != nil
@@ -925,10 +929,10 @@ enum SelfTest {
             expect(baseNavigationOverride == nil,
                    "支持 App 默认不覆盖 Home/菜单基础语义",
                    baseNavigationOverride?.key ?? "")
-            expect(cfg.profiles["com.openai.codex"]?["home"]?.layers?["2"] == .focusInput
+            expect(cfg.profiles["com.openai.codex"]?["menu"]?.tap == .overlay("codex_sessions")
                    && cfg.profiles["com.colliderli.iina"]?["menu"]?.layers?["2"]
                         == .keyStroke(key: "s", mods: ["left_ctrl", "left_shift"]),
-                   "App 专属 Home/菜单动作改放控制模式")
+                   "Codex 菜单打开会话列表，IINA 控制层保留字幕动作")
             expect(g?["volUp"]?.tap == .system("volume_up")
                    && g?["volDown"]?.tap == .system("volume_down"),
                    "默认配置 v2：音量±=系统音量")
@@ -1076,7 +1080,7 @@ enum SelfTest {
             for p in Presets.all {
                 if p.bindings["home"]?.tap != nil || p.bindings["home"]?.hold != nil
                     || p.bindings["home"]?.double != nil { bad = "\(p.id).home.base"; break }
-                if p.bindings["menu"]?.tap != nil { bad = "\(p.id).menu.tap"; break }
+                if let tap = p.bindings["menu"]?.tap, !(p.id == Presets.codexDesktop.id && tap == .overlay("codex_sessions")) { bad = "\(p.id).menu.tap"; break }
                 if p.bindings["menu"]?.hold != nil || p.bindings["menu"]?.double != nil {
                     bad = "\(p.id).menu.base"; break
                 }

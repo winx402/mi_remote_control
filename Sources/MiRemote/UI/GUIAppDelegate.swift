@@ -86,6 +86,9 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 CodexNavigation.showNotice(message)
             }
         }
+        CodexConversationControls.onUnavailable = { message in CodexNavigation.showNotice(message) }
+        CodexDictation.onNotice = { message in CodexNavigation.showNotice(message) }
+        CodexDictation.configure(triggerConfig: VoiceTriggerRouting.resolve(model.config.voiceProfiles, bundleID: "com.openai.codex"))
         ActionRunner.onOverlay = { [weak self] name in
             // ActionRunner 已切主线程投递
             MainActor.assumeIsolated { self?.openOverlay(name) }
@@ -176,6 +179,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        CodexDictation.shutdown()
         applicationNavigation.stop()
         dockNavigation.close()
         services?.bridge.cancelVoiceContinuityProbe()
@@ -211,6 +215,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func openOverlay(_ name: String, wakeTelevision: Bool = false) {
+        CodexDictation.cancel(reason: "打开遥控面板")
         if name == "dock_picker" {
             overlayCenter?.close()
             if !dockNavigation.isActive { dockReturnApplication = NSWorkspace.shared.frontmostApplication }
@@ -219,6 +224,15 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             dockNavigation.close()
             overlayCenter?.open(name, wakeTelevision: wakeTelevision)
         }
+    }
+
+    private func configureApplicationNavigation(_ profiles: [String: AppNavigationProfile]) {
+        var effective = profiles
+        let codex = "com.openai.codex"
+        if model.config.profiles[codex]?["ok"]?.hold == .system("codex_context_submit") {
+            effective.removeValue(forKey: codex)
+        }
+        applicationNavigation.configure(effective)
     }
 
     private func updateNavigationSuspension() {
@@ -417,9 +431,11 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     mode: self.applicationNavigation.isEnabled ? self.applicationNavigation.navigationMode : nil,
                     editing: self.applicationNavigation.isEditing)
             }
-            self.applicationNavigation.configure(self.model.config.appNavigationProfiles ?? [:])
+            self.configureApplicationNavigation(self.model.config.appNavigationProfiles ?? [:])
             self.model.onApplicationNavigationConfigChanged = { [weak self] profiles in
-                self?.applicationNavigation.configure(profiles)
+                guard let self else { return }
+                self.configureApplicationNavigation(profiles)
+                CodexDictation.configure(triggerConfig: VoiceTriggerRouting.resolve(self.model.config.voiceProfiles, bundleID: "com.openai.codex"))
             }
             FocusInput.onDidFocusInput = { [weak self] in
                 MainActor.assumeIsolated { self?.applicationNavigation.enterEditing() }
@@ -427,6 +443,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let previousSuspend = km.engine.onSuspendChanged
             km.engine.onSuspendChanged = { [weak self] suspended in
                 previousSuspend?(suspended)
+                if suspended { CodexDictation.cancel(reason: "遥控暂停") }
                 if suspended { DispatchQueue.main.async { self?.dockNavigation.close() } }
                 DispatchQueue.main.async { self?.updateNavigationSuspension() }
             }
@@ -434,6 +451,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let previousRemoved = hid.onDeviceRemoved
                 hid.onDeviceRemoved = { [weak self] in
                     previousRemoved?()
+                    CodexDictation.cancel(reason: "遥控断开")
                     DispatchQueue.main.async { self?.dockNavigation.close() }
                     DispatchQueue.main.async { self?.applicationNavigation.invalidateSelection() }
                 }
@@ -450,6 +468,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 MainActor.assumeIsolated {
                     self?.dockNavigation.close()
                     self?.applicationNavigation.invalidateSelection()
+                    CodexDictation.shutdown()
                     if self?.voiceProbeRunning == true { self?.cancelVoiceProbe() }
                     self?.overlayCenter?.escapeHatch()
                 }
@@ -502,6 +521,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let previousActiveApp = km.onActiveApplication
             km.onActiveApplication = { [weak self] bundleID in
                 previousActiveApp?(bundleID)
+                if bundleID != "com.openai.codex" { CodexDictation.cancel(reason: "切换应用") }
                 DispatchQueue.main.async { self?.overlayCenter?.noteProfileSwitch(bundleID) }
             }
             km.onButtonEvent = { [weak self] ev in

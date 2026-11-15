@@ -197,7 +197,48 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
     }
 
     // MARK: - system
+    // A slow accessibility query must not build up wheel events or delay a submit
+    // until a different question is visible.
+    var codexInputGeneration: (() -> UInt64?)?
+    private static let pendingCodexDirection = OSAllocatedUnfairLock(initialState: false)
+    private func dispatchCodexControl(_ name: String) {
+        let readGeneration = codexInputGeneration
+        let generation = readGeneration?()
+        guard readGeneration == nil || generation != nil else { return }
+        let current = { readGeneration?() == generation }
+        let direction = ["codex_context_up", "codex_context_down", "codex_context_left", "codex_context_right"].contains(name)
+        if direction {
+            let admitted = Self.pendingCodexDirection.withLock { pending in
+                if pending { return false }
+                pending = true
+                return true
+            }
+            guard admitted else { return }
+        }
+        let issued = ContinuousClock.now
+        DispatchQueue.main.async {
+            defer { if direction { Self.pendingCodexDirection.withLock { $0 = false } } }
+            guard current(), issued.duration(to: .now) < .milliseconds(500) else { return }
+            if name == "codex_context_submit", CodexDictation.isActive {
+                CodexNavigation.showNotice("请再按一次语音键结束输入，然后长按 OK 发送。")
+                return
+            }
+            if name == CodexDictation.actionName {
+                CodexDictation.toggleIfCurrent()
+                return
+            }
+            CodexConversationControls.perform(name, isCurrent: current)
+        }
+    }
+
     private func system(_ name: String) {
+        switch name {
+        case "codex_context_up", "codex_context_down", "codex_context_left", "codex_context_right",
+             "codex_context_ok", "codex_context_submit", "codex_context_dictate":
+            dispatchCodexControl(name)
+            return
+        default: break
+        }
         if CodexNavigation.perform(name) { return }
         switch name {
         case "tv_volume_up": runTelevision(.volumeUp)

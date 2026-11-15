@@ -111,6 +111,34 @@ final class MappingEngine: @unchecked Sendable {
     private var overlayHandler: ((ButtonEvent) -> Void)?
     private var immediateOverlayDirections = false
     private var applicationNavigationEnabled = false
+    /// A saved profile opts into context navigation through its explicit actions.
+    /// Existing Codex/custom profiles retain their configured behavior.
+    private var codexContextActive: Bool {
+        activeBundleID == "com.openai.codex" && effectiveLayer == 0
+            && Presets.codexContextActions.contains { key, action in overlayDeclared(key)?.tap == action }
+    }
+    private var applicationNavigationActive: Bool { applicationNavigationEnabled && !codexContextActive }
+    private func codexContextKey(_ key: RemoteKey) -> Bool {
+        guard codexContextActive,
+              overlayDeclared(key)?.tap == Presets.codexContextActions[key] else { return false }
+        if key == .ok { return overlayDeclared(key)?.hold == .system("codex_context_submit") }
+        return isDirection(key)
+    }
+    private lazy var codexContextGestures: CodexContextGestures = {
+        let gestures = CodexContextGestures(schedule: scheduleAfter)
+        gestures.onDirection = { [weak self] key in
+            guard let self, self.codexContextActive, self.overlayHandler == nil,
+                  !MouseMode.shared.isActive, !TransientSystemUI.isMissionControlActive() else { return }
+            self.runIndependentLocal(self.overlayDeclared(key)?.tap)
+        }
+        gestures.onConfirm = { [weak self] hold in
+            guard let self, self.codexContextActive, self.overlayHandler == nil,
+                  !MouseMode.shared.isActive, !TransientSystemUI.isMissionControlActive() else { return }
+            let binding = self.overlayDeclared(.ok)
+            self.runIndependentLocal(hold ? binding?.hold : binding?.tap)
+        }
+        return gestures
+    }()
     var onApplicationNavigation: ((RemoteKey, Bool) -> Void)?
     var onApplicationNavigationReservedDirection: ((RemoteKey, ApplicationNavigationReservedPhase) -> Void)?
     private lazy var applicationNavigationGestures: ApplicationNavigationGestures = {
@@ -217,8 +245,9 @@ final class MappingEngine: @unchecked Sendable {
         // 其余方向继续直接改写，保留系统原生 autorepeat 与零延迟。
         let directions: Set<RemoteKey> = [.up, .down, .left, .right]
         let native = Set(directions.filter { key in
-            !applicationNavigationEnabled && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
+            !applicationNavigationActive && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
                 && (!independent || overlayDeclared(key)?.overrideBase != true)
+                && !codexContextKey(key)
         })
         let route = TapRoute(effectiveLayer: effectiveLayer,
                              okDown: okPhysicallyDown,
@@ -340,6 +369,7 @@ final class MappingEngine: @unchecked Sendable {
     private func _setConfig(_ config: MappingConfig) {
         invalidateInputSession()
         applicationNavigationGestures.reset()
+        codexContextGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
@@ -369,6 +399,7 @@ final class MappingEngine: @unchecked Sendable {
     private func _setActiveProfile(_ bundleID: String?) {
         invalidateInputSession()
         applicationNavigationGestures.reset()
+        codexContextGestures.reset()
         reservedDirectionGestures.reset()
         CodexNavigation.cancelScrolling()
         contextGeneration &+= 1
@@ -386,6 +417,7 @@ final class MappingEngine: @unchecked Sendable {
     private func _resetInputState(_ reason: String, preserveReservedPresses: Bool = true) {
         invalidateInputSession()
         applicationNavigationGestures.reset(preservePressed: preserveReservedPresses)
+        codexContextGestures.reset(preservePressed: preserveReservedPresses)
         reservedDirectionGestures.reset(preservePressed: preserveReservedPresses)
         CodexNavigation.cancelScrolling()
         independentGestures.reset()
@@ -417,7 +449,8 @@ final class MappingEngine: @unchecked Sendable {
         // A hold/context change consumes that physical press through release,
         // even if its global action focuses another app or opens a new panel.
         if applicationNavigationGestures.consumeSuppressed(event)
-            || reservedDirectionGestures.consumeSuppressed(event) { return }
+            || reservedDirectionGestures.consumeSuppressed(event)
+            || codexContextGestures.consumeSuppressed(event) { return }
         if independent {
             handleIndependent(event)
             return
@@ -457,7 +490,11 @@ final class MappingEngine: @unchecked Sendable {
             }
             return
         }
-        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0,
+        if !TransientSystemUI.isMissionControlActive(), codexContextKey(event.key) {
+            codexContextGestures.handle(event, holdMs: overlayDeclared(.ok)?.holdMs ?? config.settings.holdMs)
+            return
+        }
+        if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0,
            isDirection(event.key) || event.key == .ok {
             applicationNavigationGestures.handle(event)
             return
@@ -481,7 +518,7 @@ final class MappingEngine: @unchecked Sendable {
             mainDispatch { overlayHandler(event) }
             return
         }
-        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(),
+        if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(),
            overlayHandler == nil, !MouseMode.shared.isActive,
            isDirection(key) || key == .ok {
             applicationNavigationGestures.handle(event, holdMs: reservedDirectionAction(key) == nil
@@ -527,6 +564,10 @@ final class MappingEngine: @unchecked Sendable {
             }
             if let handler = overlayHandler { mainDispatch { handler(event) }; return }
             if MouseMode.shared.handle(key: key, isDown: event.isDown) { return }
+            if !TransientSystemUI.isMissionControlActive(), codexContextKey(key) {
+                codexContextGestures.handle(event, holdMs: config.settings.holdMs)
+                return
+            }
             if event.isDown {
                 guard independentHeld.insert(key).inserted else { return }
                 repeatTokens[key, default: 0] &+= 1
@@ -545,6 +586,12 @@ final class MappingEngine: @unchecked Sendable {
         if key == .ok {
             if let handler = overlayHandler { mainDispatch { handler(event) }; return }
             if MouseMode.shared.handle(key: key, isDown: event.isDown) { return }
+            // Explicit Codex submit owns OK hold/double locally. Panels and mouse
+            // capture above still receive physical down/up before this decision.
+            if !TransientSystemUI.isMissionControlActive(), codexContextKey(key) {
+                codexContextGestures.handle(event, holdMs: overlayDeclared(.ok)?.holdMs ?? config.settings.holdMs)
+                return
+            }
         }
         if event.isDown, !independentGestures.isTracking(key) {
             gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
@@ -647,7 +694,7 @@ final class MappingEngine: @unchecked Sendable {
                 let consumed = MouseMode.shared.handle(key: key, isDown: true)
                 _ = MouseMode.shared.handle(key: key, isDown: false)
                 if !consumed { runIndependentLocal(independentTapAction(key)) }
-            } else if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), key == .back {
+            } else if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(), key == .back {
                 forwardApplicationNavigation(key, true)
                 forwardApplicationNavigation(key, false)
             } else {
@@ -693,6 +740,7 @@ final class MappingEngine: @unchecked Sendable {
     private func runIndependentGlobal(_ action: Action) {
         guard action != .none else { return }
         applicationNavigationGestures.reset()
+        codexContextGestures.reset()
         switch action {
         case .keyStroke, .overlay, .openApp, .mouseMode, .system("remote_reset"), .system("app_mru_back"),
              .system("space_left"), .system("space_right"), .system("show_desktop"), .system("quit_app"):
@@ -783,6 +831,11 @@ final class MappingEngine: @unchecked Sendable {
     /// → 强制通知 layerChanged(0)（层本就是 0 时 recomputeLayer 去重不发，这里补发，
     /// UI 依此关 HUD/角标）→ 主线程通知 UI 侧关闭所有浮层。
     private func fireEscapeHatch() {
+        // Escape revokes pending Codex navigation/submit immediately, including
+        // an OK press that began after the legacy menu hold was already running.
+        invalidateInputSession()
+        contextGeneration &+= 1
+        codexContextGestures.reset()
         overlayHandler = nil
         MouseMode.shared.deactivate()   // 迷路兜底：鼠标模式一并退出
         lockedLayer = 0
@@ -893,14 +946,14 @@ final class MappingEngine: @unchecked Sendable {
 
     /// 短按分发：层激活时优先 `layers["\(层)"]`，缺失退回 `tap`。
     private func fireTap(_ key: RemoteKey) {
-        if applicationNavigationEnabled, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0, key == .back {
+        if applicationNavigationActive, !TransientSystemUI.isMissionControlActive(), effectiveLayer == 0, key == .back {
             forwardApplicationNavigation(key, true)
             forwardApplicationNavigation(key, false)
             return
         }
         // 从 MiRemote 打开 Mission Control 后，Home/菜单的首要语义是退出该系统态。
         // 发 Esc 比再次 open Mission Control.app 可靠，并且只消费一次。
-        if effectiveLayer == 0, (key == .menu || key == .home || (applicationNavigationEnabled && key == .back)),
+        if effectiveLayer == 0, (key == .menu || key == .home || (applicationNavigationActive && key == .back)),
            TransientSystemUI.consumeMissionControlExit() {
             runner.run(.keyStroke(key: "escape", mods: []))
             log("\(key) 退出 Mission Control")
@@ -1083,6 +1136,114 @@ final class MappingEngine: @unchecked Sendable {
 // MARK: - 纯逻辑自测
 
 extension MappingEngine {
+
+    /// New context actions are opt-in, work with both configuration generations,
+    /// and never let autorepeat or a stale press submit twice.
+    static func codexContextSelfCheck() -> Bool {
+        var passed = true
+        func expect(_ condition: Bool, _ message: String) {
+            if !condition { passed = false; print("[MappingEngine.codexContextSelfCheck] FAIL: \(message)") }
+        }
+        for independentMode in [false, true] {
+            let clock = ManualClock()
+            let runner = RecordingRunner()
+            var config = MappingConfig()
+            config.settings.holdMs = 600
+            config.settings.doubleMs = 250
+            config.profiles["global"] = ["voice": KeyBinding(tap: .voice)]
+            config.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
+            config.profiles["com.openai.codex"]?["ok"]?.holdMs = 750
+            if independentMode {
+                config.globalShortcuts = [
+                    "left": KeyBinding(hold: .system("space_left"), holdMs: 650),
+                    "right": KeyBinding(hold: .system("space_right"), holdMs: 650),
+                    "ok": KeyBinding(tap: .system("mute"), hold: .system("quit_app"),
+                                     double: .overlay("system_menu"), holdMs: 100),
+                    "menu": KeyBinding(hold: .overlay("dock_picker"), double: .overlay("system_menu")),
+                ]
+            }
+            let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) })
+            var navigation: [RemoteKey] = []
+            engine.onApplicationNavigation = { key, _ in navigation.append(key) }
+            engine.setActiveProfile("com.openai.codex")
+            engine.setApplicationNavigationEnabled(true) // stale saved geometric mode cannot win
+            func event(_ key: RemoteKey, _ down: Bool) {
+                engine.handle(ButtonEvent(key: key, isDown: down, timeNs: 0))
+            }
+            func tap(_ key: RemoteKey) { event(key, true); clock.advance(10); event(key, false) }
+            func take() -> [Action] { let result = runner.actions; runner.actions.removeAll(); return result }
+            expect(engine.tapRoute.nativeDirections.isEmpty, "context directions enter engine")
+            for key in [RemoteKey.up, .down, .left, .right] { tap(key) }
+            expect(take() == [.system("codex_context_up"), .system("codex_context_down"),
+                              .system("codex_context_left"), .system("codex_context_right")]
+                   && navigation.isEmpty, "all four directions bypass geometric navigation")
+            event(.up, true); clock.advance(349); event(.up, true)
+            expect(take() == [.system("codex_context_up")], "raw down cannot accelerate navigation")
+            clock.advance(1)
+            expect(take() == [.system("codex_context_up")], "held up repeats after 350ms")
+            clock.advance(159); expect(take().isEmpty, "vertical repeat is time throttled")
+            clock.advance(1); event(.up, false)
+            expect(take() == [.system("codex_context_up")], "vertical interval is 160ms")
+            clock.advance(1000); expect(take().isEmpty, "release stops navigation")
+            tap(.ok); tap(.ok)
+            expect(take() == [.system("codex_context_ok"), .system("codex_context_ok")],
+                   "rapid OK taps are local confirmations without global double")
+            event(.ok, true); clock.advance(749); event(.ok, true)
+            expect(take().isEmpty, "local threshold beats global OK hold")
+            clock.advance(1); event(.ok, true); clock.advance(2000); event(.ok, false)
+            expect(take() == [.system("codex_context_submit")], "hold submits once, release has no tap")
+            tap(.menu); clock.advance(300); tap(.voice)
+            expect(take() == [.overlay("codex_sessions"), .system("codex_context_dictate")],
+                   "menu opens sessions and short voice dictates")
+            if independentMode {
+                event(.left, true); clock.advance(650); event(.left, false)
+                expect(take() == [.system("space_left")], "global Left hold remains reserved")
+                event(.menu, true); clock.advance(600); event(.menu, false)
+                expect(take() == [.overlay("dock_picker")], "global menu hold remains reserved")
+            }
+            var captured: [ButtonEvent] = []
+            engine.setOverlayCapture({ captured.append($0) }, immediateDirections: true)
+            tap(.left); tap(.down); event(.ok, true); clock.advance(900); event(.ok, false)
+            expect(captured.map(\.key) == [.left, .left, .down, .down, .ok, .ok] && take().isEmpty,
+                   "Dock/panel captures directions and physical OK before context")
+            engine.setOverlayCapture(nil)
+            event(.ok, true); clock.advance(100)
+            engine.setOverlayCapture({ captured.append($0) })
+            clock.advance(900); event(.ok, true); event(.ok, false)
+            expect(take().isEmpty, "opening panel cancels pending submit through physical release")
+            engine.setOverlayCapture(nil)
+            event(.ok, true); engine.setActiveProfile("com.example.other")
+            clock.advance(1000); event(.ok, true); event(.ok, false)
+            expect(take().isEmpty && navigation.isEmpty, "focus change cancels hold without replay")
+            engine.setApplicationNavigationEnabled(false)
+            tap(.up)
+            expect(take() == [.keyStroke(key: "up_arrow", mods: [])], "other applications retain arrows")
+            engine.setActiveProfile("com.openai.codex")
+            event(.down, true); expect(take() == [.system("codex_context_down")], "new context press begins")
+            engine.setConfig(config); clock.advance(1000); event(.down, true); event(.down, false)
+            expect(take().isEmpty, "reload cancels repeat and consumes held key")
+            if !independentMode {
+                var escaped = false
+                engine.onEscapeHatch = { escaped = true }
+                event(.menu, true); clock.advance(900); event(.ok, true)
+                let generation = engine.inputGeneration
+                clock.advance(600) // menu escape wins before the newer OK hold
+                expect(escaped && engine.inputGeneration != generation,
+                       "legacy escape immediately revokes the input session")
+                clock.advance(1000); event(.ok, true); event(.ok, false); event(.menu, false)
+                expect(take().isEmpty, "escape cancels pending submit through OK release")
+            }
+            // A legacy/custom profile has not opted into semantic interception.
+            config.profiles["com.openai.codex"] = ["ok": KeyBinding(tap: .keyStroke(key: "return", mods: []))]
+            config.globalShortcuts = nil
+            engine.setConfig(config); engine.setApplicationNavigationEnabled(true)
+            tap(.ok); tap(.up)
+            expect(take().isEmpty && navigation == [.ok, .ok, .up, .up],
+                   "old/custom profiles retain existing geometric navigation")
+        }
+        return passed
+    }
 
     static func applicationNavigationSelfCheck() -> Bool {
         let clock = ManualClock()

@@ -382,7 +382,8 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             phaseA: report.phaseA, phaseB: report.phaseB,
             baseline: report.baseline, duplicateStarts: report.duplicateStarts,
             hostOpenAttempted: report.hostOpenAttempted,
-            detail: report.detail + (closeAttempted ? " 已请求关闭麦克风。" : " 断连导致关闭命令无法送达。"))
+            detail: report.detail + (closeAttempted ? " 已请求关闭麦克风。" : " 断连导致关闭命令无法送达。"),
+            decoderSummary: report.decoderSummary)
         clearVoiceFrameState()
         publishProbeUpdate("诊断采样已结束，正在关闭麦克风并恢复普通语音。")
         let token = probeGeneration
@@ -853,7 +854,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             case 0x0A:
                 if let sync = Self.parseSync(b) {
                     probe.sync(predictor: sync.predictor, stepIndex: sync.stepIndex)
-                }
+                } else { probe.malformedSync() }
             case 0x0B:
                 if Self.parseCapabilities(b) != Capabilities(version: protocolVersion,
                     codecMask: codecMask, frameSize: capsFrameLen) {

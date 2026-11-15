@@ -1,220 +1,67 @@
 {
-  "settings": {
-    "holdMs": 600,
-    "doubleMs": 250
-  },
-  "globalShortcuts": {
-    "power": {
-      "tap": {
-        "type": "overlay",
-        "value": "computer_power"
-      },
-      "hold": {
-        "type": "none"
-      }
-    },
-    "home": {
-      "double": {
-        "type": "system",
-        "value": "show_desktop"
-      }
-    },
-    "menu": {
-      "double": {
-        "type": "overlay",
-        "value": "system_menu"
-      },
-      "hold": {
-        "type": "overlay",
-        "value": "dock_picker"
-      }
-    },
-    "tv": {
-      "tap": {
-        "type": "open_app",
-        "value": "com.openai.codex"
-      },
-      "double": {
-        "type": "system",
-        "value": "app_mru_back"
-      }
-    },
-    "back": {
-      "hold": {
-        "type": "system",
-        "value": "quit_app"
-      },
-      "holdMs": 1200
-    },
-    "volUp": {
-      "tap": {
-        "type": "system",
-        "value": "volume_up"
-      }
-    },
-    "volDown": {
-      "tap": {
-        "type": "system",
-        "value": "volume_down"
-      }
-    },
-    "left": {
-      "hold": {
-        "type": "system",
-        "value": "space_left"
-      },
-      "holdMs": 650
-    },
-    "right": {
-      "hold": {
-        "type": "system",
-        "value": "space_right"
-      },
-      "holdMs": 650
-    }
-  },
   "profiles": {
-    "global": {
-      "power": {
-        "tap": {
-          "type": "none"
-        },
-        "hold": {
-          "type": "none"
-        }
-      },
-      "home": {
-        "tap": {
-          "type": "none"
-        },
-        "hold": {
-          "type": "none"
-        }
-      },
-      "menu": {
-        "tap": {
-          "type": "none"
-        },
-        "hold": {
-          "type": "none"
-        }
-      },
-      "tv": {
-        "tap": {
-          "type": "none"
-        },
-        "hold": {
-          "type": "none"
-        }
-      },
-      "voice": {
-        "tap": {
-          "type": "voice"
-        },
-        "hold": {
-          "type": "voice"
-        }
-      }
-    },
     "com.openai.codex": {
       "up": {
         "tap": {
-          "type": "key_stroke",
-          "key": "up_arrow",
-          "mods": []
-        }
+          "type": "system",
+          "value": "codex_context_up"
+        },
+        "overrideBase": true
       },
       "down": {
         "tap": {
-          "type": "key_stroke",
-          "key": "down_arrow",
-          "mods": []
-        }
+          "type": "system",
+          "value": "codex_context_down"
+        },
+        "overrideBase": true
       },
       "left": {
-        "overrideBase": true,
         "tap": {
           "type": "system",
-          "value": "codex_previous_chat"
-        }
+          "value": "codex_context_left"
+        },
+        "overrideBase": true
       },
       "right": {
-        "overrideBase": true,
         "tap": {
           "type": "system",
-          "value": "codex_next_chat"
-        }
+          "value": "codex_context_right"
+        },
+        "overrideBase": true
       },
       "ok": {
         "tap": {
-          "type": "key_stroke",
-          "key": "return",
-          "mods": []
+          "type": "system",
+          "value": "codex_context_ok"
         },
         "hold": {
-          "type": "none"
+          "type": "system",
+          "value": "codex_context_submit"
         }
       },
       "back": {
-        "overrideBase": true,
         "tap": {
           "type": "key_stroke",
           "key": "escape",
           "mods": []
-        }
-      },
-      "home": {
-        "tap": {
-          "type": "overlay",
-          "value": "codex_sessions"
         },
-        "hold": {
-          "type": "key_stroke",
-          "key": "n",
-          "mods": [
-            "left_cmd"
-          ]
-        }
+        "overrideBase": true
       },
       "menu": {
         "tap": {
-          "type": "key_stroke",
-          "key": "p",
-          "mods": [
-            "left_cmd",
-            "left_shift"
-          ]
-        }
-      },
-      "tv": {
-        "hold": {
-          "type": "key_stroke",
-          "key": "m",
-          "mods": [
-            "left_ctrl",
-            "left_shift"
-          ]
+          "type": "overlay",
+          "value": "codex_sessions"
         }
       },
       "voice": {
         "tap": {
-          "type": "focus_input"
+          "type": "system",
+          "value": "codex_context_dictate"
         },
         "hold": {
           "type": "voice"
         }
       }
-    }
-  },
-  "appNavigationProfiles": {
-    "com.openai.codex": {"mode": "buttons", "layout": "chat"},
-    "com.bytedance.douyin.desktop": {"mode": "buttons", "layout": "video"}
-  },
-  "voiceProfiles": {
-    "global": {
-      "keyName": "fn",
-      "mode": "hold",
-      "imeBundlePrefix": "com.tencent.inputmethod.wetype"
     }
   }
 }

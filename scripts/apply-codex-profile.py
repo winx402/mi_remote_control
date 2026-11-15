@@ -11,22 +11,13 @@ import subprocess
 import tempfile
 
 
-def merge(target, patch):
-    for key, value in patch.items():
-        # 动作是一个完整值：跨动作递归会把旧 mods/steps 等残留到新动作。
-        if isinstance(value, dict) and "type" not in value and isinstance(target.get(key), dict):
-            merge(target[key], value)
-        else:
-            target[key] = copy.deepcopy(value)
-
-
 def apply_preset(config, patch):
-    # 用户已确认整套替换；清掉本套装旧的模式/双击槽，其他 App 配置仍保留。
-    merge(config, {key: value for key, value in patch.items() if key not in ("profiles", "globalShortcuts")})
-    config["globalShortcuts"] = copy.deepcopy(patch["globalShortcuts"])
-    for key, value in patch["profiles"]["global"].items():
-        config["profiles"]["global"][key] = copy.deepcopy(value)
-    config["profiles"]["com.openai.codex"] = copy.deepcopy(patch["profiles"]["com.openai.codex"])
+    """Replace only the opted-in Codex profile; device/global choices stay local."""
+    profile = patch["profiles"]["com.openai.codex"]
+    config.setdefault("profiles", {})["com.openai.codex"] = copy.deepcopy(profile)
+    navigation = config.get("appNavigationProfiles")
+    if isinstance(navigation, dict):
+        navigation.pop("com.openai.codex", None)
     return config
 
 
@@ -36,7 +27,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("/Applications/MiRemote.app/Contents/MacOS/miremote"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if subprocess.run(["/usr/bin/pgrep", "-x", "miremote"], stdout=subprocess.DEVNULL).returncode == 0:
+    if not args.dry_run and subprocess.run(["/usr/bin/pgrep", "-x", "miremote"], stdout=subprocess.DEVNULL).returncode == 0:
         parser.error("请先退出 MiRemote，避免运行中的 App 覆盖配置。")
     if not args.binary.is_file():
         parser.error("请先构建或安装 MiRemote，或用 --binary 指定构建产物。")
@@ -53,7 +44,6 @@ def main():
     patch_path = Path(__file__).resolve().parent.parent / "Resources/codex-profile.patch.json"
     patch = json.loads(patch_path.read_text())
     apply_preset(config, patch)
-    config.setdefault("settings", {})["doubleMs"] = 250
     payload = (json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
 
     args.config.parent.mkdir(parents=True, exist_ok=True)
@@ -64,7 +54,8 @@ def main():
             handle.write(payload)
         subprocess.run([str(args.binary), "--validate-config", str(temporary)], check=True)
         if args.dry_run:
-            print("预览通过：应用独立全局快捷键和已确认的 Codex 套装，保留其他应用配置，不写入配置。")
+            print("预览通过：仅替换 Codex 按键预设并移除其旧几何导航；全局快捷键、设备参数、语音和其他应用配置保持原值，不写入配置。")
+            print(json.dumps(patch, ensure_ascii=False, indent=2, sort_keys=True))
             return
         if original == payload:
             print("Codex 预设已应用，无需修改。")

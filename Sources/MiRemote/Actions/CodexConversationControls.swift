@@ -135,6 +135,48 @@ enum CodexConversationControls {
         return numbers.compactMap { choices[$0] }
     }
 
+    /// Some builds draw the numeric badges without exposing their numbers to AX.
+    /// Bound the answer rows by the card's heading and footer in screen coordinates.
+    private static func answerRows(_ members: [Int], nodes: [Node]) -> [Int] {
+        guard let heading = members.first(where: { matches(nodes[$0], questionTitles) && nodes[$0].rect.height > 0 }),
+              let skip = members.first(where: { matches(nodes[$0], skipTitles) && nodes[$0].rect.height > 0 }),
+              members.contains(where: { matches(nodes[$0], customReplyTitles) }) else { return [] }
+        let top = nodes[heading].rect.maxY
+        let footer = nodes[skip].rect
+        let left = nodes[heading].rect.minX
+        let excluded = formSubmits.union(skipTitles).union(previousTitles).union(nextTitles).union(customReplyTitles)
+        let candidates = members.filter { index in
+            let n = nodes[index], r = n.rect
+            return n.enabled && r.height >= 10 && r.minY >= top && r.maxY <= footer.minY + 2
+                && r.midX >= left - 35 && r.minX <= footer.maxX && !matches(n, excluded)
+        }
+        // Start with actual controls. Include focusable rows and Chromium's generic
+        // AXPress groups, whose labels can contain only the answer itself.
+        let controls = candidates.filter {
+            let n = nodes[$0]
+            return n.pressable || ["AXButton", "AXRadioButton", "AXCheckBox", "AXRow"].contains(n.role)
+        }.sorted { nodes[$0].rect.midY < nodes[$1].rect.midY }
+        var rows: [Int] = []
+        for index in controls {
+            if let last = rows.last, abs(nodes[index].rect.midY - nodes[last].rect.midY) < 5 { continue }
+            rows.append(index)
+        }
+        if (2...12).contains(rows.count) { return rows }
+
+        // An unlabelled badge and its answer can also be plain siblings. The body
+        // copy starts at the heading margin; answer text is indented past the badge.
+        let text = candidates.filter {
+            let n = nodes[$0]
+            return n.role == "AXStaticText" && n.rect.minX >= left + 2
+                && n.rect.minX <= left + 75 && n.rect.width > 20
+        }
+        let aligned = text.filter { i in text.contains { j in
+            i != j && abs(nodes[i].rect.minX - nodes[j].rect.minX) < 4
+                && abs(nodes[i].rect.midY - nodes[j].rect.midY) > 12
+        } }.sorted { nodes[$0].rect.midY < nodes[$1].rect.midY }
+        return (2...12).contains(aligned.count) ? aligned : []
+    }
+
     /// The current question card has no dedicated AX identifier in some Codex builds.
     /// Its fixed UI anchors, numbered choices and local footer provide the boundary.
     /// Disabled Send is part of the structure but is never an actionable submission.
@@ -162,7 +204,8 @@ enum CodexConversationControls {
                     || (node.editable && inputRoles.contains(node.role)
                         && matches(node, ["message", "prompt", "消息", "输入消息", "輸入訊息"]))
             }) else { continue }
-            let options = numberedOptions(members, root: root, nodes: nodes)
+            let numbered = numberedOptions(members, root: root, nodes: nodes)
+            let options = numbered.isEmpty ? answerRows(members, nodes: nodes) : numbered
             guard !options.isEmpty else { continue }
             let submits = members.filter { nodes[$0].role == "AXButton" && matches(nodes[$0], formSubmits) }
             let fields = members.filter { nodes[$0].enabled && nodes[$0].editable && inputRoles.contains(nodes[$0].role) }
@@ -614,7 +657,7 @@ enum CodexConversationControls {
             if rect.width > 0, rect.height > 0, !windowRect.intersects(rect) { continue }
             if values[4] as? Bool == true { continue }
             let editable = inputRoles.contains(role) && values[5] as? Bool != false
-            let actionable = ["AXButton", "AXRadioButton", "AXCheckBox"].contains(role)
+            let actionable = ["AXButton", "AXRadioButton", "AXCheckBox", "AXRow"].contains(role) || (local && role == "AXGroup" && (12...75).contains(rect.height))
             let readMetadata = actionable || editable || ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog", "AXSheet", "AXScrollArea", "AXWebArea", "AXListBox"].contains(role)
             var label = readMetadata ? metadata(current) : ""
             if role == "AXStaticText" || role == "AXHeading" {
@@ -743,6 +786,16 @@ enum CodexConversationControls {
             Node(parent: 15, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true), // 16
             Node(parent: 15, role: "AXButton", label: "Send", pressable: true)         // 17
         ]
+        var unnumbered = card
+        unnumbered[3].rect = CGRect(x: 350, y: 247, width: 32, height: 18)
+        unnumbered[13].rect = CGRect(x: 850, y: 426, width: 40, height: 21)
+        unnumbered[6].label = ""; unnumbered[9].label = ""
+        unnumbered[5].role = "AXButton"; unnumbered[8].role = "AXButton"
+        guard activeForm(unnumbered)?.options == [5, 8], activeForm(unnumbered)?.submit == nil else { return false }
+        unnumbered[5].role = "AXGroup"; unnumbered[8].role = "AXGroup"
+        unnumbered[7].rect = CGRect(x: 386, y: 310, width: 83, height: 18)
+        unnumbered[10].rect = CGRect(x: 386, y: 360, width: 42, height: 18)
+        guard activeForm(unnumbered)?.options == [7, 10] else { return false }
         var missingPlaceholder = card
         missingPlaceholder[11].label = ""
         guard activeForm(missingPlaceholder)?.options == [6, 9] else { return false }

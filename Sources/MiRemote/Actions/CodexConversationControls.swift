@@ -1,10 +1,13 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import os
 
 /// 前台 Codex 的上下文控件。只读取控件元数据；不读取输入值、消息正文或会话文件。
 /// OK 从不发送；只有独立的 submit 动作能压下经确认的发送/提交按钮。
 enum CodexConversationControls {
+    private static let trace = Logger(subsystem: "com.miremote.controller", category: "CodexQuestion")
+
     enum Action: String, CaseIterable {
         case up = "codex_context_up", down = "codex_context_down"
         case left = "codex_context_left", right = "codex_context_right"
@@ -137,7 +140,7 @@ enum CodexConversationControls {
     /// Disabled Send is part of the structure but is never an actionable submission.
     private static func questionCards(_ nodes: [Node]) -> [Form] {
         var roots = Set<Int>()
-        for title in nodes.indices where matches(nodes[title], questionTitles) {
+        for title in nodes.indices where matches(nodes[title], questionTitles.union(customReplyTitles).union(skipTitles)) {
             var parent: Int? = title
             for _ in 0..<32 {
                 guard let value = parent else { break }
@@ -150,7 +153,7 @@ enum CodexConversationControls {
             guard !historicallyInactive(root, in: nodes) else { continue }
             let members = nodes.indices.filter { descendant($0, of: root, in: nodes) }
             guard members.count <= 160,
-                  members.contains(where: { matches(nodes[$0], customReplyTitles) }),
+                  members.contains(where: { matches(nodes[$0], customReplyTitles.union(questionTitles)) }),
                   members.contains(where: { nodes[$0].role == "AXButton" && matches(nodes[$0], skipTitles) }) else { continue }
             // An ancestor spanning the ordinary composer is not a local card. This
             // also stops a missing card footer from borrowing the chat's Send.
@@ -264,6 +267,7 @@ enum CodexConversationControls {
 
     @MainActor @discardableResult static func perform(_ name: String, isCurrent: () -> Bool = { true }) -> Bool {
         guard let action = Action(rawValue: name) else { return false }
+        trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
         let scrolling = action == .up || action == .down
         guard let snapshot = snapshot(budget: scrolling ? 0.16 : 0.65) else {
@@ -273,12 +277,18 @@ enum CodexConversationControls {
             return true
         }
         guard isCurrent(), sameWindow(snapshot) else { return true }
+        let recognized = activeForm(snapshot.nodes)
+        let heading = snapshot.nodes.contains { matches($0, questionTitles) }
+        let skip = snapshot.nodes.contains { matches($0, skipTitles) }
+        let custom = snapshot.nodes.contains { matches($0, customReplyTitles) }
+        let numbers = snapshot.nodes.filter { optionNumber($0) != nil }.count
+        trace.notice("nodes=\(snapshot.nodes.count) complete=\(snapshot.complete) heading=\(heading) skip=\(skip) custom=\(custom) numbers=\(numbers) options=\(recognized?.options.count ?? 0)")
         guard snapshot.complete else {
             if scrolling && !blocksChat(snapshot.nodes) { fallbackScroll(action == .up, snapshot: snapshot, isCurrent: isCurrent) }
             else if !scrolling { unavailable("当前控件信息不完整，本次未执行确认或输入。") }
             return true
         }
-        if let form = activeForm(snapshot.nodes) {
+        if let form = recognized {
             switch action {
             case .up, .down:
                 let choices = form.options
@@ -292,7 +302,9 @@ enum CodexConversationControls {
                     }
                 let next = current.map { min(choices.count - 1, max(0, $0 + (action == .up ? -1 : 1))) }
                     ?? (action == .up ? choices.count - 1 : 0)
-                if select(choices[next], in: snapshot, isCurrent: isCurrent) {
+                let applied = select(choices[next], in: snapshot, isCurrent: isCurrent)
+                trace.notice("selected ordinal=\(next + 1) dispatched=\(applied)")
+                if applied {
                     lastFormRoot = snapshot.elements[form.root]
                     lastOption = snapshot.elements[choices[next]]
                 }
@@ -544,7 +556,7 @@ enum CodexConversationControls {
         guard let window = element(ax, kAXFocusedWindowAttribute as CFString), let windowRect = frame(window) else { return nil }
         // Locate the live card independently of the size of the conversation history.
         // Sample points only discover candidate ancestors. No action uses these points.
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.12
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.32
         var visited = Set<AXUIElement>()
         for fraction in [0.76, 0.63, 0.84] {
             let point = CGPoint(x: windowRect.minX + windowRect.width * 0.61,
@@ -558,7 +570,7 @@ enum CodexConversationControls {
                    bounds.width >= windowRect.width * 0.25, bounds.height >= 100,
                    bounds.height <= windowRect.height * 0.70,
                    let local = project(ax, window: window, rect: windowRect, root: candidate,
-                                       pid: app.processIdentifier, budget: 0.12),
+                                       pid: app.processIdentifier, budget: 0.22),
                    local.complete, activeForm(local.nodes) != nil { return local }
                 guard let parent = element(candidate, kAXParentAttribute as CFString), !CFEqual(parent, window) else { break }
                 candidate = parent
@@ -597,10 +609,16 @@ enum CodexConversationControls {
             let actionable = ["AXButton", "AXRadioButton", "AXCheckBox"].contains(role)
             let readMetadata = actionable || editable || ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog", "AXSheet", "AXScrollArea", "AXWebArea", "AXListBox"].contains(role)
             var label = readMetadata ? metadata(current) : ""
-            if (role == "AXStaticText" || role == "AXHeading"), rect.width > 0, (local || rect.width < 220) {
-                let value = string(current, kAXValueAttribute as CFString) ?? ""
-                if Int(value).map({ (1...99).contains($0) }) == true || questionTitles.contains(normalized(value)) || customReplyTitles.contains(normalized(value)) {
-                    label = value
+            if role == "AXStaticText" || role == "AXHeading" {
+                // Chromium may expose a badge or footer label through title/description.
+                let attributes = multipleAttributes(current, [kAXValueAttribute as CFString, kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString])
+                let fixed = questionTitles.union(customReplyTitles).union(skipTitles).union(formSubmits)
+                label = attributes.compactMap { $0 as? String }.map(normalized).first {
+                    fixed.contains($0) || Int($0).map { (1...12).contains($0) } == true
+                } ?? ""
+                // Promote a fixed label to its enclosing button if AX omitted its name.
+                if !label.isEmpty, let parent, nodes[parent].role == "AXButton", nodes[parent].label.isEmpty {
+                    nodes[parent].label = label
                 }
             }
             let enabled = values[3] as? Bool != false
@@ -717,6 +735,12 @@ enum CodexConversationControls {
             Node(parent: 15, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true), // 16
             Node(parent: 15, role: "AXButton", label: "Send", pressable: true)         // 17
         ]
+        var missingPlaceholder = card
+        missingPlaceholder[11].label = ""
+        guard activeForm(missingPlaceholder)?.options == [6, 9] else { return false }
+        missingPlaceholder[11].label = "或自行撰写回复"
+        missingPlaceholder[3].label = ""
+        guard activeForm(missingPlaceholder)?.options == [6, 9] else { return false }
         guard let screenshot = activeForm(card), screenshot.root == 2, screenshot.options == [6, 9],
               screenshot.fields == [11], screenshot.submit == nil, blocksChat(card),
               composer(card, window: window) == nil else { return false }

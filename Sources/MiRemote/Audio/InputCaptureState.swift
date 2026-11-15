@@ -54,6 +54,31 @@ enum InputCaptureState: String {
     }
 }
 
+/// The hotkey being posted does not establish that WeType has opened BlackHole.
+/// Positive capture evidence opens immediately; unavailable evidence gets a
+/// bounded grace period. Verified stopped capture keeps waiting within the
+/// caller's existing total startup deadline, including first-launch startup.
+enum InputCaptureStartWait {
+    enum Decision { case wait, ready, unconfirmed }
+
+    static func decision(capture: InputCaptureState, elapsedNs: UInt64) -> Decision {
+        switch capture {
+        case .running: return .ready
+        case .unknown: return elapsedNs >= 500_000_000 ? .unconfirmed : .wait
+        case .stopped: return .wait
+        }
+    }
+
+    static func selfCheck() -> Bool {
+        decision(capture: .running, elapsedNs: 0) == .ready
+            && decision(capture: .stopped, elapsedNs: 250_000_000) == .wait
+            && decision(capture: .unknown, elapsedNs: 499_999_999) == .wait
+            && decision(capture: .unknown, elapsedNs: 500_000_000) == .unconfirmed
+            && decision(capture: .stopped, elapsedNs: 999_999_999) == .wait
+            && decision(capture: .stopped, elapsedNs: 7_999_999_999) == .wait
+    }
+}
+
 /// Recovery is permitted once, only after the original key was released and
 /// the same input context still has positive evidence of lingering capture.
 struct InputCaptureStopRecovery {

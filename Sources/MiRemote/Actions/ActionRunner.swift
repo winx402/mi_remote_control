@@ -44,7 +44,7 @@ final class ShellProcessRegistry: @unchecked Sendable {
 
 /// 动作执行器：把 Action 落成真正的系统事件/命令。
 /// MappingEngine 在主线程调用 run(_:)。语音/层动作不由此处理（映射层负责）。
-final class ActionRunner: ActionRunning, @unchecked Sendable {
+final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sendable {
 
     // MARK: - 键名 → keycode（ANSI 虚拟键码，来自 <HIToolbox/Events.h> kVK_*）
     // 覆盖遥控器默认配置常用键；用户自定义时按需扩展。
@@ -201,7 +201,30 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
     // until a different question is visible.
     var codexInputGeneration: (() -> UInt64?)?
     private static let pendingCodexDirection = OSAllocatedUnfairLock(initialState: false)
+
+    func prepareCodexBackspace() -> CodexBackspace.Press? {
+        prepareCodexBackspace(allowsEscape: true)
+    }
+
+    private func prepareCodexBackspace(allowsEscape: Bool) -> CodexBackspace.Press? {
+        let readGeneration = codexInputGeneration
+        let generation = readGeneration?()
+        guard readGeneration == nil || generation != nil,
+              let request = CodexBackspace.capture(allowsEscape: allowsEscape) else { return nil }
+        let current = { readGeneration?() == generation }
+        guard current() else { return nil }
+        return .init(editorFocused: request.editor != nil, perform: {
+            DispatchQueue.main.async {
+                CodexBackspace.perform(request, isCurrent: current)
+            }
+        })
+    }
+
     private func dispatchCodexControl(_ name: String) {
+        if name == "codex_context_back" || name == "codex_delete_backward" {
+            prepareCodexBackspace(allowsEscape: name == "codex_context_back")?.perform()
+            return
+        }
         let readGeneration = codexInputGeneration
         let generation = readGeneration?()
         guard readGeneration == nil || generation != nil else { return }
@@ -219,10 +242,6 @@ final class ActionRunner: ActionRunning, @unchecked Sendable {
         DispatchQueue.main.async {
             defer { if direction { Self.pendingCodexDirection.withLock { $0 = false } } }
             guard current() else { return }
-            if name == "codex_context_back" || name == "codex_delete_backward" {
-                CodexBackspace.perform(allowsEscape: name == "codex_context_back", isCurrent: current)
-                return
-            }
             guard issued.duration(to: .now) < .milliseconds(500) else { return }
             if name == "codex_context_submit", CodexDictation.isActive {
                 CodexNavigation.showNotice("请先结束听写，等文字出现在输入框后再长按 OK 发送。")

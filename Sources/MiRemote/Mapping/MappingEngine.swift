@@ -111,8 +111,9 @@ final class MappingEngine: @unchecked Sendable {
     private var overlayHandler: ((ButtonEvent) -> Void)?
     private var immediateOverlayDirections = false
     private var applicationNavigationEnabled = false
-    /// The focused-editor probe is bounded and reads only AX control metadata.
-    var codexEditorFocused: () -> Bool = { CodexBackspace.hasFocusedEditor() }
+    /// Snapshot the real editor on physical down; release must never pick a new one.
+    var prepareCodexBackspace: () -> CodexBackspace.Press? = { nil }
+    private var codexBackPress: CodexBackspace.Press?
     private var codexEditingBackPress = false
     /// A saved profile opts into context navigation through its explicit actions.
     /// Existing Codex/custom profiles retain their configured behavior.
@@ -221,6 +222,13 @@ final class MappingEngine: @unchecked Sendable {
 
     private func invalidateInputSession() {
         inputGenerationLock.withLock { $0 &+= 1 }
+        if codexBackPress != nil, var state = states[.back], state.phase != .idle {
+            state.seq &+= 1
+            state.phase = .consumed
+            states[.back] = state
+        }
+        codexBackPress = nil
+        codexEditingBackPress = false
         if let handler = onInputReset { mainDispatch { handler() } }
     }
 
@@ -334,6 +342,13 @@ final class MappingEngine: @unchecked Sendable {
         self.reservedMouseHandle = reservedMouseHandle
         self.reservedMouseDeactivate = reservedMouseDeactivate
         self.globalProfile = config.profiles["global"] ?? [:]
+        if let preparer = runner as? CodexBackspacePreparing {
+            prepareCodexBackspace = { [weak preparer] in preparer?.prepareCodexBackspace() }
+        } else {
+            prepareCodexBackspace = { [weak runner] in
+                .init(editorFocused: false, perform: { runner?.run(.system("codex_context_back")) })
+            }
+        }
         publishTapRoute()
     }
 
@@ -483,8 +498,8 @@ final class MappingEngine: @unchecked Sendable {
     private func _handle(_ event: ButtonEvent) {
         // 暂停态：遥控完全惰性——不进状态机、不追踪逃生、不喂浮层。
         if suspendedLock.withLock({ $0 }) { return }
-        if event.key == .voice, states[.voice]?.phase == .consumed {
-            if !event.isDown { handleUp(.voice) }
+        if event.key == .voice || event.key == .back, states[event.key]?.phase == .consumed {
+            if !event.isDown { handleUp(event.key) }
             return
         }
         // A hold/context change consumes that physical press through release,
@@ -642,11 +657,7 @@ final class MappingEngine: @unchecked Sendable {
         if event.isDown, !independentGestures.isTracking(key) {
             gestureContexts[key] = (contextGeneration, MouseMode.shared.isActive)
             if key == .back {
-                codexEditingBackPress = activeBundleID == "com.openai.codex"
-                    && effectiveLayer == 0 && overlayHandler == nil && !MouseMode.shared.isActive
-                    && !TransientSystemUI.isMissionControlActive()
-                    && baseBackOverride?.tap == .system("codex_context_back")
-                    && codexEditorFocused()
+                captureCodexBackPress()
             }
         }
         let reserved = config.globalShortcuts?[key.rawValue]
@@ -724,15 +735,16 @@ final class MappingEngine: @unchecked Sendable {
 
     private func independentGesture(_ key: RemoteKey, _ gesture: IndependentGestures.Gesture) {
         let context = gestureContexts.removeValue(forKey: key)
+        let backPress = key == .back ? codexBackPress : nil
         let editingBack = key == .back && codexEditingBackPress
-        if key == .back { codexEditingBackPress = false }
+        if key == .back { codexEditingBackPress = false; codexBackPress = nil }
         if gesture == .tap, editingBack {
             guard context?.0 == contextGeneration, context?.1 == MouseMode.shared.isActive,
                   overlayHandler == nil, !MouseMode.shared.isActive,
                   !TransientSystemUI.isMissionControlActive() else { return }
             // Each release owns one edit. Never let a global double combine two
             // deletes, and never reinterpret a late edit as Escape after focus loss.
-            runIndependentLocal(.system("codex_delete_backward"))
+            backPress?.perform()
             return
         }
         let reserved = config.globalShortcuts?[key.rawValue]
@@ -762,7 +774,7 @@ final class MappingEngine: @unchecked Sendable {
                 forwardApplicationNavigation(key, true)
                 forwardApplicationNavigation(key, false)
             } else {
-                runIndependentLocal(independentTapAction(key))
+                runIndependentLocal(independentTapAction(key), backPress: backPress)
             }
         } else if gesture == .hold {
             if MouseMode.shared.isActive, key == .tv {
@@ -793,8 +805,25 @@ final class MappingEngine: @unchecked Sendable {
         return binding(for: key)?.tap
     }
 
-    private func runIndependentLocal(_ action: Action?) {
+    private func captureCodexBackPress() {
+        codexBackPress = nil
+        codexEditingBackPress = false
+        guard activeBundleID == "com.openai.codex", effectiveLayer == 0,
+              overlayHandler == nil, !MouseMode.shared.isActive,
+              !TransientSystemUI.isMissionControlActive(),
+              baseBackOverride?.tap == .system("codex_context_back") else { return }
+        // A failed capture is a consumed press, never permission to retry later
+        // against an editor that became focused after physical down.
+        codexBackPress = prepareCodexBackspace() ?? .init(editorFocused: false, perform: {})
+        codexEditingBackPress = codexBackPress?.editorFocused == true
+    }
+
+    private func runIndependentLocal(_ action: Action?, backPress: CodexBackspace.Press? = nil) {
         guard let action else { return }
+        if action == .system("codex_context_back"), let backPress {
+            backPress.perform()
+            return
+        }
         switch action {
         case .layerMomentary, .layerToggle, .voice, .none: return
         default: runner.run(action)
@@ -841,6 +870,9 @@ final class MappingEngine: @unchecked Sendable {
 
     private func handleDown(_ key: RemoteKey) {
         var st = states[key] ?? KeyState()
+        if key == .back, st.phase != .down, st.phase != .waitingDouble {
+            captureCodexBackPress()
+        }
 
         // 1) 手势：OK 整个物理按住期间都有效。不能把判定窗口卡在 holdMs 内，
         //    否则用户自然地“按稳 OK 再按方向”时，手势会被长按抢走。
@@ -1047,7 +1079,13 @@ final class MappingEngine: @unchecked Sendable {
         } else {
             action = b?.tap
         }
-        perform(action, key: key, isHold: false)
+        if key == .back, action == .system("codex_context_back"), let press = codexBackPress {
+            codexBackPress = nil
+            codexEditingBackPress = false
+            press.perform()
+        } else {
+            perform(action, key: key, isHold: false)
+        }
     }
 
     /// 统一动作执行：层动作由引擎内部消化，其余交给 runner。
@@ -1716,7 +1754,12 @@ extension MappingEngine {
         engine.setConfig(editingConfig)
         engine.setActiveProfile("com.openai.codex")
         var editorFocused = true
-        engine.codexEditorFocused = { editorFocused }
+        engine.prepareCodexBackspace = {
+            let editing = editorFocused
+            return .init(editorFocused: editing, perform: {
+                runner.run(.system(editing ? "codex_delete_backward" : "codex_context_back"))
+            })
+        }
         tap(.back); tap(.back); tap(.back)
         guard equals(Array(repeating: .system("codex_delete_backward"), count: 3)) else { return false }
         clock.advance(500)
@@ -1751,7 +1794,93 @@ extension MappingEngine {
         guard equals([]) else { return false }
         engine.resetInputState(reason: "test")
         event(.volUp, true); event(.volUp, false)
-        return equals([.system("volume_up")])
+        return equals([.system("volume_up")]) && codexBackPressSelfCheck()
+    }
+
+    /// Drive both gesture modes with a queued fake key sink. No AX or real keys.
+    private static func codexBackPressSelfCheck() -> Bool {
+        for independentMode in [false, true] {
+            let clock = ManualClock()
+            let runner = RecordingRunner()
+            var config = MappingConfig()
+            config.settings.holdMs = 600
+            config.profiles["com.openai.codex"] = Presets.codexDesktop.bindings
+            config.globalShortcuts = independentMode ? ["back": KeyBinding(hold: .system("quit_app"))] : nil
+            let engine = MappingEngine(config: config, runner: runner, delegate: nil,
+                dispatch: { $0() }, scheduleAfter: { clock.schedule($0, $1) })
+            engine.setActiveProfile("com.openai.codex")
+            var focusedEditor: Int? = 1
+            var captureAvailable = true
+            var captures = 0
+            var queued: [() -> Void] = []
+            engine.prepareCodexBackspace = {
+                captures += 1
+                guard captureAvailable else { return nil }
+                let editor = focusedEditor
+                let generation = engine.inputGeneration
+                return .init(editorFocused: editor != nil, perform: {
+                    queued.append {
+                        guard editor == focusedEditor, generation == engine.inputGeneration else { return }
+                        runner.run(.system(editor == nil ? "codex_context_back" : "codex_delete_backward"))
+                    }
+                })
+            }
+            func event(_ down: Bool) {
+                engine.handle(ButtonEvent(key: .back, isDown: down, timeNs: 0))
+            }
+            func drain() { while !queued.isEmpty { queued.removeFirst()() } }
+            func expect(_ condition: Bool, _ message: String) -> Bool {
+                if !condition { print("[codexBackPress] FAIL mode=\(independentMode): \(message)") }
+                return condition
+            }
+
+            event(true); event(true)
+            focusedEditor = 2
+            event(false); drain()
+            guard expect(captures == 1 && runner.actions.isEmpty, "focus change before release revokes the original editor") else { return false }
+
+            focusedEditor = 1
+            event(true); event(false)
+            focusedEditor = 2
+            drain()
+            guard expect(runner.actions.isEmpty, "focus change after release revokes the queued edit") else { return false }
+
+            focusedEditor = 1
+            event(true); event(false)
+            focusedEditor = 2
+            event(true); event(false)
+            drain()
+            guard expect(runner.actions == [.system("codex_delete_backward")], "rapid presses retain separate editor snapshots") else { return false }
+            runner.actions.removeAll()
+
+            focusedEditor = nil
+            event(true)
+            focusedEditor = 1
+            event(false); drain()
+            guard expect(runner.actions.isEmpty, "a non-editor press cannot become a deletion") else { return false }
+
+            captureAvailable = false
+            event(true)
+            captureAvailable = true
+            event(false); drain()
+            guard expect(runner.actions.isEmpty, "failed capture cannot retry against a later editor") else { return false }
+
+            event(true); event(false)
+            engine.resetInputState(reason: "queued backspace")
+            drain()
+            guard expect(runner.actions.isEmpty, "reset revokes queued edits") else { return false }
+
+            event(true)
+            engine.setActiveProfile("com.example.afterEditing")
+            event(true); event(false); drain()
+            guard expect(runner.actions.isEmpty, "foreground change consumes repeated down and the old release") else { return false }
+            engine.setActiveProfile("com.openai.codex")
+
+            focusedEditor = nil
+            event(true); event(false); drain()
+            guard expect(runner.actions == [.system("codex_context_back")], "non-editor Back preserves Escape behavior") else { return false }
+        }
+        return true
     }
 
     /// 记录 runner 收到的动作，供断言。

@@ -27,6 +27,10 @@ struct RemotePCMHoldGate {
     }
 
     mutating func deactivate() {
+        // A new BLE START can precede the next HID hold while the old startup
+        // session is being cancelled. Its unclaimed pre-roll belongs to that new
+        // physical stream, not the old recognizer being deactivated.
+        guard token != nil else { return }
         token = nil
         buffered.removeAll()
         if physical { discarded = true }
@@ -70,6 +74,10 @@ struct RemotePCMHoldGate {
         guard gate.activate(token: 10) == nil else { return false }
         gate.begin()
         guard gate.receive(frame)?.token == 10, gate.end() == 10 else { return false }
-        return gate.receive(frame) == nil
+        guard gate.receive(frame) == nil else { return false }
+        gate.begin()
+        guard gate.receive(frame) == nil else { return false }
+        gate.deactivate() // Cancelling the old startup must preserve the new pre-roll.
+        return gate.activate(token: 11)?.frames.count == 1 && gate.end() == 11
     }
 }

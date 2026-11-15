@@ -114,7 +114,7 @@ enum CodexConversationControls {
     private static let formSubmits = answerSubmits.union(["submit", "confirm", "send", "提交", "确认", "確認", "发送", "傳送", "送出"])
     private static let previousTitles: Set<String> = ["previous", "previous question", "back", "上一题", "上一題", "上一个问题", "上一個問題", "返回"]
     private static let nextTitles: Set<String> = ["next", "next question", "continue", "下一题", "下一題", "下一个问题", "下一個問題", "继续", "繼續"]
-    private static let sendTitles: Set<String> = ["send", "send message", "send prompt", "submit message", "发送", "发送消息", "发送提示", "傳送", "傳送訊息", "送出訊息"]
+    private static let sendTitles: Set<String> = ["send", "send message", "send prompt", "submit message", "steer", "queue", "引导", "引導", "排队", "排隊", "发送", "发送消息", "发送提示", "傳送", "傳送訊息", "送出訊息"]
 
     private static func normalized(_ text: String) -> String {
         text.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
@@ -385,17 +385,25 @@ enum CodexConversationControls {
         return candidates.count == 1 ? candidates[0] : nil
     }
 
+    private static func isComposerSubmit(_ button: Node) -> Bool {
+        button.role == "AXButton" && matches(button, sendTitles) &&
+            !matches(button, ["stop", "stop generating", "stop response", "停止", "停止生成", "停止响应", "停止回應"])
+    }
+
     private static func composerSend(_ field: Int, nodes: [Node]) -> Int? {
         let input = nodes[field]
         var parent = input.parent
         // Require a local composer container, not an arbitrary Send elsewhere in the window.
-        for _ in 0..<3 {
-            guard let root = parent, !["AXWindow", "AXWebArea", "AXScrollArea"].contains(nodes[root].role) else { break }
+        for _ in 0..<8 {
+            guard let root = parent, !["AXWindow", "AXWebArea", "AXScrollArea", "AXDialog", "AXSheet"].contains(nodes[root].role),
+                  nodes[root].rect.height <= input.rect.height + 145 else { break }
+            guard !nodes.indices.contains(where: { $0 != field && nodes[$0].enabled && nodes[$0].editable &&
+                inputRoles.contains(nodes[$0].role) && descendant($0, of: root, in: nodes) }) else { break }
             let result = nodes.indices.filter { index in
                 let n = nodes[index]
-                return n.enabled && n.pressable && n.role == "AXButton" && matches(n, sendTitles)
+                return n.enabled && n.pressable && isComposerSubmit(n)
                     && descendant(index, of: root, in: nodes)
-                    && n.rect.midY >= input.rect.minY - 50 && n.rect.midY <= input.rect.maxY + 80
+                    && n.rect.midY >= input.rect.minY && n.rect.midY <= input.rect.maxY + 80
             }
             if result.count == 1 { return result[0] }
             if result.count > 1 { return nil }
@@ -404,10 +412,61 @@ enum CodexConversationControls {
         return nil
     }
 
+    /// A restored draft may have a new AX editor, even within the same window.
+    /// Resolve the currently focused composer and its local submit control together.
+    @MainActor private static func submitFocusedComposer(isCurrent: () -> Bool) -> Bool {
+        guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == "com.openai.codex",
+              AXIsProcessTrusted() else { return false }
+        let app = AXUIElementCreateApplication(front.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.025)
+        guard let window = element(app, kAXFocusedWindowAttribute as CFString), let bounds = frame(window),
+              let editor = element(app, kAXFocusedUIElementAttribute as CFString),
+              inputRoles.contains(string(editor, kAXRoleAttribute as CFString) ?? ""),
+              hasComposerInputLabel(metadata(editor)), !isQuestionInputLabel(metadata(editor)),
+              let editorBounds = frame(editor), bounds.intersects(editorBounds) else { return false }
+
+        var ancestor = element(editor, kAXParentAttribute as CFString)
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.35
+        for _ in 0..<8 {
+            guard let group = ancestor, !CFEqual(group, window), ProcessInfo.processInfo.systemUptime < deadline,
+                  isCurrent() else { break }
+            // Do not expand beyond the editor toolbar into the conversation history.
+            if let rect = frame(group), rect.height > editorBounds.height + 145 { break }
+            if let local = project(app, window: window, rect: bounds, root: group,
+                                   pid: front.processIdentifier, budget: 0.08), local.complete,
+               let field = local.elements.firstIndex(where: { CFEqual($0, editor) }),
+               let button = composerSend(field, nodes: local.nodes) {
+                guard let live = element(app, kAXFocusedUIElementAttribute as CFString),
+                      CFEqual(live, editor), sameWindow(local), isCurrent() else { return true }
+                submitComposerButton(button, in: local, isCurrent: isCurrent)
+                return true
+            }
+            ancestor = element(group, kAXParentAttribute as CFString)
+        }
+        if isCurrent() { unavailable("当前输入框的发送按钮尚不可用。") }
+        return true
+    }
+
+    @MainActor private static func submitComposerButton(_ button: Int?, in snapshot: Snapshot, isCurrent: () -> Bool) {
+        guard sameWindow(snapshot), isCurrent() else { return }
+        guard let button else { unavailable("当前输入框的发送按钮尚不可用。"); return }
+        let target = snapshot.elements[button]
+        // The toolbar reuses a button when its action changes from Send to Stop.
+        guard isComposerSubmit(Node(parent: nil, role: string(target, kAXRoleAttribute as CFString) ?? "", label: metadata(target, includeHelp: true))),
+              bool(target, kAXEnabledAttribute as CFString) != false,
+              actions(target).contains(kAXPressAction as String),
+              AXUIElementPerformAction(target, kAXPressAction as CFString) == .success else {
+            unavailable("当前输入框的发送动作已变化，请再试一次。")
+            return
+        }
+        trace.notice("submitted using live composer button")
+    }
+
     @MainActor @discardableResult static func perform(_ name: String, isCurrent: @escaping () -> Bool = { true }) -> Bool {
         guard let action = Action(rawValue: name) else { return false }
         trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
+        if action == .submit, submitFocusedComposer(isCurrent: isCurrent) { return true }
         let scrolling = action == .up || action == .down
         if scrolling && questionRoot == nil {
             CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent)
@@ -429,6 +488,15 @@ enum CodexConversationControls {
         guard snapshot.complete else {
             if scrolling { unavailable("未能读取当前问题框，请短按语音键切换输入位置。") }
             else if !scrolling { unavailable("当前控件信息不完整，本次未执行确认或输入。") }
+            return true
+        }
+        // The editable element can be rebuilt without a placeholder when a draft
+        // is restored. The live focus and a button in its own toolbar identify it.
+        if action == .submit,
+           let field = composer(snapshot.nodes, window: snapshot.window, outside: recognized),
+           focusedEditor(for: snapshot.elements[field], app: snapshot.app) != nil,
+           let button = composerSend(field, nodes: snapshot.nodes) {
+            submitComposerButton(button, in: snapshot, isCurrent: isCurrent)
             return true
         }
         if let from = transitioningFrom, let questionRoot, CFEqual(from, questionRoot),
@@ -488,7 +556,7 @@ enum CodexConversationControls {
             return true
         } else if let target = composerTarget, let field = composer(snapshot.nodes, window: snapshot.window, outside: recognized),
                   CFEqual(target, snapshot.elements[field]) {
-            if action == .submit { press(composerSend(field, nodes: snapshot.nodes), in: snapshot, isCurrent: isCurrent) }
+            if action == .submit { submitComposerButton(composerSend(field, nodes: snapshot.nodes), in: snapshot, isCurrent: isCurrent) }
             if action == .ok { _ = focus(field, in: snapshot) }
         } else if blocksChat(snapshot.nodes) {
             clearAnswer()
@@ -503,7 +571,7 @@ enum CodexConversationControls {
                       let button = composerSend(field, nodes: snapshot.nodes) else {
                     unavailable("未找到输入框关联的可用发送按钮，本次未发送。") ; return true
                 }
-                press(button, in: snapshot, isCurrent: isCurrent)
+                submitComposerButton(button, in: snapshot, isCurrent: isCurrent)
             case .left, .right: break
             }
         }
@@ -945,7 +1013,7 @@ enum CodexConversationControls {
             let editable = inputRoles.contains(role) && values[5] as? Bool != false
             let actionable = ["AXButton", "AXRadioButton", "AXCheckBox", "AXRow"].contains(role) || (local && role == "AXGroup" && (12...75).contains(rect.height))
             let readMetadata = actionable || editable || ["AXGroup", "AXForm", "AXRadioGroup", "AXDialog", "AXSheet", "AXScrollArea", "AXWebArea", "AXListBox"].contains(role)
-            var label = readMetadata ? metadata(current) : ""
+            var label = readMetadata ? metadata(current, includeHelp: role == "AXButton") : ""
             if role == "AXStaticText" || role == "AXHeading" {
                 // Chromium may expose a badge or footer label through title/description.
                 let attributes = multipleAttributes(current, [kAXValueAttribute as CFString, kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString])
@@ -995,9 +1063,11 @@ enum CodexConversationControls {
         guard AXUIElementCopyActionNames(node, &result) == .success else { return [] }
         return result as? [String] ?? []
     }
-    private static func metadata(_ node: AXUIElement) -> String {
-        multipleAttributes(node, [kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString, kAXIdentifierAttribute as CFString,
-         "AXPlaceholderValue" as CFString]).compactMap { $0 as? String }.joined(separator: "\n")
+    private static func metadata(_ node: AXUIElement, includeHelp: Bool = false) -> String {
+        var names = [kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString,
+                     kAXIdentifierAttribute as CFString, "AXPlaceholderValue" as CFString]
+        if includeHelp { names.append(kAXHelpAttribute as CFString) }
+        return multipleAttributes(node, names).compactMap { $0 as? String }.joined(separator: "\n")
     }
     private static func multipleAttributes(_ node: AXUIElement, _ names: [CFString]) -> [CFTypeRef?] {
         var result: CFArray?
@@ -1050,6 +1120,17 @@ enum CodexConversationControls {
                     Node(parent: 1, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true),
                     Node(parent: 1, role: "AXButton", label: "Send message", rect: CGRect(x: 900, y: 700, width: 40, height: 40), pressable: true),
                     Node(parent: 0, role: "AXButton", label: "Send message", pressable: true)]
+        var restored = chat
+        for title in ["引导", "排队", "Steer", "Queue"] {
+            restored[3].label = title
+            guard composerSend(2, nodes: restored) == 3 else { return false }
+        }
+        // A queued message above the restored draft can have its own Steer button.
+        restored.append(Node(parent: 1, role: "AXButton", label: "引导",
+                             rect: CGRect(x: 900, y: 620, width: 32, height: 24), pressable: true))
+        guard composerSend(2, nodes: restored) == 3 else { return false }
+        restored[3].label = "停止\n发送"
+        guard composerSend(2, nodes: restored) == nil else { return false }
         // Screenshot layout: a question card above the independent chat composer.
         // Question / answer prose is intentionally absent from the metadata projection.
         var card = [

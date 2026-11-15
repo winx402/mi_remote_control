@@ -35,7 +35,7 @@ struct MenuFavoriteAppsSettingsView: View {
                 }
             }
 
-            Text(custom ? "最多收藏 6 个 App；已运行的软件始终显示在前。" : "收藏默认跟随 Dock，最多 6 个；已运行的软件显示在前。")
+            Text(custom ? "最多收藏 6 个 App，按这里的顺序置顶，其余已运行的软件排在后面。" : "默认按 Dock 顺序置顶最多 6 个 App，其余已运行的软件排在后面。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

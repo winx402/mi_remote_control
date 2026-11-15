@@ -152,7 +152,7 @@ struct PowerMenuView: View {
                 Text("常用软件").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 let runningCount = section.choices.filter { running($0) }.count
-                Text("已运行 \(runningCount)  ·  其他常用 \(section.choices.count - runningCount)")
+                Text("共 \(section.choices.count) 个  ·  已运行 \(runningCount) 个")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(height: 18)

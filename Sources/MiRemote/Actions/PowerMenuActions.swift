@@ -1,10 +1,10 @@
 import AppKit
 
 enum PowerMenuCatalog {
-    /// 运行中 App 优先，收藏补齐；保留首个 ID 的大小写并稳定去重，不限制运行数量。
+    /// 按收藏顺序排列，再补齐其余运行中 App；保留首个 ID 的大小写并稳定去重，不限制运行数量。
     static func orderedAppIDs(running: [String], favorites: [String]) -> [String] {
         var seen: Set<String> = []
-        return (running + favorites).compactMap { rawID in
+        return (favorites + running).compactMap { rawID in
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, seen.insert(id.lowercased()).inserted else { return nil }
             return id
@@ -69,8 +69,8 @@ enum PowerMenuCatalog {
         let launchChoices = withApps.filter { $0.command?.isAppLaunch == true }
         let runningIDs = (0..<23).map { "running.\($0)" }
         return orderedAppIDs(running: ["", "  ", "App.A", "app.a", " App.B "],
-                             favorites: ["APP.B", "app.C", "", "APP.A", "app.c"]) == ["App.A", "App.B", "app.C"]
-            && orderedAppIDs(running: runningIDs, favorites: ["RUNNING.0", "favorite"]) == runningIDs + ["favorite"]
+                             favorites: ["APP.B", "app.C", "", "APP.A", "app.c"]) == ["APP.B", "app.C", "APP.A"]
+            && orderedAppIDs(running: runningIDs, favorites: ["RUNNING.0", "favorite"]) == ["RUNNING.0", "favorite"] + Array(runningIDs.dropFirst())
             && orderedAppIDs(running: [], favorites: []) == []
             && launchChoices.count == appList.count
             && launchChoices.map(\.id) == appList.map { "launch.\($0.id)" }

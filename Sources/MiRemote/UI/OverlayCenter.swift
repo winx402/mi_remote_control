@@ -143,6 +143,7 @@ final class OverlayUIState: ObservableObject {
     @Published var wheelEntries: [AppWheelView.Entry] = []
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
+    @Published var codexList = CodexSessionList(entries: [])
     @Published var codexIndex = 0
     @Published var powerMenu = PowerMenuState()
     @Published var televisionPowerStatus: String?
@@ -226,6 +227,7 @@ final class OverlayCenter {
     private var wheelIdleTimer: Timer?
     private let codexSessions = CodexSessions()
     private var codexSnapshot = CodexSessions.Snapshot()
+    private var codexList = CodexSessionList(entries: [])
     private var codexIndex = 0
     private var browsedSessions = false
     private var powerMenu = PowerMenuState()
@@ -418,9 +420,14 @@ final class OverlayCenter {
             browsedSessions = false
             codexIndex = 0
             codexSnapshot = CodexSessions.Snapshot(isLoading: true)
+            codexList = CodexSessionList(entries: [])
             showPanel()
-            codexSessions.load(identity: identity) { [weak self] snapshot in
+            codexSessions.load(identity: identity) { [weak self] incoming in
                 guard let self, self.active == .codexSessions else { return }
+                let list = CodexSessionList(entries: incoming.entries)
+                var snapshot = incoming
+                snapshot.entries = list.entries
+                self.codexList = list
                 self.codexIndex = snapshot.selection(after: self.codexSnapshot, index: self.codexIndex,
                                                      userMoved: self.browsedSessions)
                 self.codexSnapshot = snapshot
@@ -465,6 +472,7 @@ final class OverlayCenter {
         else if abandoningTV { XiaomiTVController.shared.abandonMenuNavigation(matching: televisionConfiguration) }
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
+        codexList = CodexSessionList(entries: [])
         codexIndex = 0
         engine?.setOverlayCapture(nil)
         if let escMonitor { NSEvent.removeMonitor(escMonitor) }
@@ -962,13 +970,12 @@ final class OverlayCenter {
         }
     }
 
-    // MARK: Codex 本地会话列表
+    // MARK: Codex 项目会话列表
 
-    private func codexStep(_ delta: Int) {
+    private func codexStep(_ key: RemoteKey) {
         guard !codexSnapshot.entries.isEmpty else { return }
         browsedSessions = true
-        codexIndex = CodexSessions.movedIndex(codexIndex, delta: delta,
-                                             count: codexSnapshot.entries.count)
+        codexIndex = codexList.movedIndex(codexIndex, key: key)
         restartOverlayIdleTimer()
         sync()
     }
@@ -976,9 +983,8 @@ final class OverlayCenter {
     private func handleCodexKey(_ key: RemoteKey) {
         switch key {
         case .up, .down, .left, .right:
-            let delta = key == .up ? -1 : key == .down ? 1 : key == .left ? -6 : 6
-            codexStep(delta)
-            startRepeat(key) { [weak self] in self?.codexStep(delta) }
+            codexStep(key)
+            startRepeat(key) { [weak self] in self?.codexStep(key) }
         case .ok:
             guard codexSnapshot.entries.indices.contains(codexIndex) else { return }
             let target = codexSnapshot.entries[codexIndex]
@@ -1017,6 +1023,7 @@ final class OverlayCenter {
             }
             uiState.wheelIndex = wheelIndex
             uiState.codexSnapshot = codexSnapshot
+            uiState.codexList = codexList
             uiState.codexIndex = codexIndex
             uiState.powerMenu = powerMenu
             uiState.televisionPowerStatus = televisionPowerStatus
@@ -1307,7 +1314,7 @@ enum HintBarCatalog {
             return [Hint(keys: [.home, .back, .ok], text: "关闭教程")]
         case .codexSessions:
             return [Hint(keys: [.up, .down], text: "选会话（按住加速）"),
-                    Hint(keys: [.left, .right], text: "翻页"),
+                    Hint(keys: [.left, .right], text: "切项目"),
                     Hint(keys: [.ok], text: "打开"),
                     Hint(keys: [.back, .home, .tv], text: "取消")]
         case .computerPower:
@@ -1465,7 +1472,7 @@ private struct OverlayRootView: View {
                 case .appWheel:
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
                 case .codexSessions:
-                    CodexSessionsView(snapshot: state.codexSnapshot, selected: state.codexIndex)
+                    CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, selected: state.codexIndex)
                 case .computerPower:
                     let generation = state.powerGeneration
                     let inputGeneration = state.confirmationInputGeneration

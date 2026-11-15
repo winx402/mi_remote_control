@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// 只呈现用户设置的会话名和更新时间，不把提示词预览或完整路径带进浮层。
+/// 只呈现项目、宿主、用户设置的会话名和更新时间。
 struct CodexSessionsView: View {
     let snapshot: CodexSessions.Snapshot
+    let list: CodexSessionList
     let selected: Int
 
     var body: some View {
@@ -15,7 +16,7 @@ struct CodexSessionsView: View {
                     ProgressView().controlSize(.small)
                     Text("读取中…").font(.callout).foregroundStyle(.secondary)
                 } else if !snapshot.entries.isEmpty {
-                    Text("\(selected + 1) / \(snapshot.entries.count)")
+                    Text("\(list.groups.count) 个项目 · \(selected + 1) / \(snapshot.entries.count)")
                         .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
@@ -23,17 +24,23 @@ struct CodexSessionsView: View {
                 VStack(spacing: 10) {
                     Image(systemName: snapshot.error == nil ? "text.bubble" : "exclamationmark.bubble")
                         .font(.system(size: 30)).foregroundStyle(.secondary)
-                    Text(snapshot.isLoading ? "正在读取本地会话…"
-                         : snapshot.error == nil ? "没有可打开的本地会话" : "无法读取会话")
+                    Text(snapshot.isLoading ? "正在读取会话…"
+                         : snapshot.error == nil ? "没有可打开的会话" : "无法读取会话")
                         .font(.body)
                 }
                 .frame(maxWidth: .infinity).frame(height: 150)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(spacing: 4) {
-                            ForEach(Array(snapshot.entries.enumerated()), id: \.element.id) { index, entry in
-                                row(entry, selected: index == selected).id(entry.id)
+                        LazyVStack(spacing: 4, pinnedViews: [.sectionHeaders]) {
+                            ForEach(list.groups) { group in
+                                Section {
+                                    ForEach(Array(group.entries.enumerated()), id: \.element.identityKey) { offset, entry in
+                                        row(entry, selected: group.startIndex + offset == selected).id(entry.identityKey)
+                                    }
+                                } header: {
+                                    sectionHeader(group)
+                                }
                             }
                         }
                         .padding(.horizontal, 4).padding(.vertical, 5)
@@ -41,7 +48,7 @@ struct CodexSessionsView: View {
                     .frame(height: 360)
                     .onAppear { scroll(proxy) }
                     .onChange(of: selected) { _, _ in scroll(proxy) }
-                    .onChange(of: snapshot.entries.map(\.id)) { _, _ in scroll(proxy) }
+                    .onChange(of: snapshot.entries.map(\.identityKey)) { _, _ in scroll(proxy) }
                 }
             }
             if let error = snapshot.error {
@@ -52,7 +59,12 @@ struct CodexSessionsView: View {
                 Text(notice).font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("↑↓ 选择 · 按住连续移动 · ←→ 翻页 · OK 打开 · 返回 / Home / TV 取消")
+            if let currentIndex = CodexSessionList.currentIndex(in: snapshot) {
+                let current = snapshot.entries[currentIndex]
+                Label("当前：\(current.groupTitle) · \(current.title)", systemImage: "location.fill")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Text("↑↓ 选择 · 按住连续移动 · ←→ 切项目 · OK 打开 · 返回 / Home / TV 取消")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(Spacing.sheetPadding)
@@ -66,19 +78,36 @@ struct CodexSessionsView: View {
     private func scroll(_ proxy: ScrollViewProxy) {
         guard snapshot.entries.indices.contains(selected) else { return }
         withAnimation(Motion.select) {
-            proxy.scrollTo(snapshot.entries[selected].id, anchor: .center)
+            proxy.scrollTo(snapshot.entries[selected].identityKey, anchor: .center)
         }
+    }
+
+    private func sectionHeader(_ group: CodexSessionList.Group) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: group.isRemote ? "network" : "folder")
+            Text(group.title).fontWeight(.semibold).lineLimit(1)
+            Text("\(group.entries.count)").monospacedDigit()
+            Spacer()
+            Text(group.isRemote ? "远程 · \(group.hostTitle)" : group.hostTitle)
+                .lineLimit(1).truncationMode(.middle)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Color.secondary.opacity(0.10), in: Capsule())
+        }
+        .font(.callout).foregroundStyle(.secondary)
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .background(.regularMaterial)
+        .accessibilityElement(children: .combine)
     }
 
     private func row(_ entry: CodexSessions.Entry, selected: Bool) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "bubble.left")
+            Image(systemName: entry.isRemote ? "network" : "bubble.left")
                 .font(.body).foregroundStyle(selected ? Color.accentColor : Color.secondary)
                 .frame(width: 24)
             Text(entry.title)
                 .font(.body.weight(selected ? .semibold : .regular))
                 .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-            if entry.id == snapshot.currentID {
+            if entry.identityKey == snapshot.currentIdentityKey {
                 Text("当前会话").font(.caption.weight(.semibold))
                     .foregroundStyle(Color.accentColor)
                     .padding(.horizontal, 8).padding(.vertical, 3)

@@ -60,6 +60,7 @@ enum CodexConversationControls {
                focusedEditor(for: element, app: snapshot.app).map({ CFEqual($0, element) }) == true { break }
             candidate = snapshot.nodes[item].parent
         }
+        focusAfterPreview = element(snapshot.app, kAXFocusedUIElementAttribute as CFString)
         answerHighlight.showTarget(snapshot.nodes[index].rect)
         highlightMonitor?.invalidate()
         highlightMonitor = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { _ in
@@ -80,6 +81,7 @@ enum CodexConversationControls {
         highlightMonitor?.invalidate()
         highlightMonitor = nil
         highlightedAnswer = nil
+        focusAfterPreview = nil
         lastFormRoot = nil
         answerHighlight.hide()
     }
@@ -101,6 +103,7 @@ enum CodexConversationControls {
         clearAnswer()
     }
 
+    @MainActor private static var focusAfterPreview: AXUIElement?
     @MainActor private static var highlightedAnswer: AXUIElement?
     @MainActor private static var lastFormRoot: AXUIElement?
     @MainActor private static var accessibilityPID: pid_t?
@@ -462,17 +465,89 @@ enum CodexConversationControls {
         trace.notice("submitted using live composer button")
     }
 
+    private static func questionContainingFocus(_ index: Int, in nodes: [Node]) -> Form? {
+        guard let card = activeForm(nodes), descendant(index, of: card.root, in: nodes) else { return nil }
+        return card
+    }
+
+    /// Resolve the focused control within its own window. The question may be in
+    /// any part of a long thread, so walk up from AX focus instead of scanning history.
+    @MainActor private static func syncFocusedInput() -> Snapshot? {
+        guard let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier == "com.openai.codex",
+              AXIsProcessTrusted() else { return nil }
+        let app = accessibilityApplication(front.processIdentifier)
+        guard let window = element(app, kAXFocusedWindowAttribute as CFString), let bounds = frame(window),
+              let focused = element(app, kAXFocusedUIElementAttribute as CFString),
+              let role = string(focused, kAXRoleAttribute as CFString) else { return nil }
+        let inputLabel = inputRoles.contains(role) ? metadata(focused) : ""
+        if hasComposerInputLabel(inputLabel), !isQuestionInputLabel(inputLabel) {
+            if questionRoot != nil || targetWindow.map({ !CFEqual($0, window) }) == true { resetInputTarget() }
+            targetWindow = window
+            composerTarget = focused
+            return nil
+        }
+        if ["AXWindow", "AXWebArea", "AXApplication"].contains(role) {
+            // Chromium can briefly report only the window while switching questions.
+            return nil
+        }
+
+        func adopt(_ local: Snapshot) -> Bool {
+            guard local.complete, let index = local.elements.firstIndex(where: { CFEqual($0, focused) }),
+                  let card = questionContainingFocus(index, in: local.nodes),
+                  let current = element(app, kAXFocusedUIElementAttribute as CFString), CFEqual(current, focused),
+                  sameWindow(local) else { return false }
+            let root = local.elements[card.root]
+            if questionRoot.map({ CFEqual($0, root) }) != true {
+                resetInputTarget()
+                questionRoot = root
+            } else if let focusAfterPreview, !CFEqual(focusAfterPreview, focused) {
+                clearAnswer()
+            }
+            targetWindow = window
+            composerTarget = nil
+            return true
+        }
+        var ancestor: AXUIElement? = focused
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.22
+        for _ in 0..<24 {
+            guard let candidate = ancestor, !CFEqual(window, candidate),
+                  ProcessInfo.processInfo.systemUptime < deadline else { break }
+            if let rect = frame(candidate), rect.width >= 160, rect.height >= 64,
+               rect.height < bounds.height * 0.92, formContainers.contains(string(candidate, kAXRoleAttribute as CFString) ?? ""),
+               let local = project(app, window: window, rect: bounds, root: candidate, pid: front.processIdentifier, budget: 0.09),
+               adopt(local) { return local }
+            ancestor = element(candidate, kAXParentAttribute as CFString)
+        }
+        if isQuestionInputLabel(inputLabel), let visible = snapshot(), adopt(visible) { return visible }
+        if questionRoot != nil, transitioningFrom == nil {
+            resetInputTarget()
+        }
+        return nil
+    }
+
+    @MainActor private static func accessibilityApplication(_ pid: pid_t) -> AXUIElement {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.025)
+        if accessibilityPID != pid {
+            AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            accessibilityPID = pid
+        }
+        return app
+    }
+
     @MainActor @discardableResult static func perform(_ name: String, isCurrent: @escaping () -> Bool = { true }) -> Bool {
         guard let action = Action(rawValue: name) else { return false }
         trace.notice("remote action=\(name, privacy: .public)")
         guard isCurrent() else { return true }
-        if action == .submit, submitFocusedComposer(isCurrent: isCurrent) { return true }
+        let focusedCard = syncFocusedInput()
+        if action == .submit, focusedCard == nil, submitFocusedComposer(isCurrent: isCurrent) { return true }
         let scrolling = action == .up || action == .down
         if scrolling && questionRoot == nil {
             CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent)
             return true
         }
-        guard let snapshot = snapshot(budget: 0.65, preferForm: composerTarget == nil) else {
+        guard let snapshot = focusedCard ?? snapshot(budget: 0.65, preferForm: composerTarget == nil) else {
             // A large Chromium tree must not make normal wheel input unusable.
             if scrolling && isCurrent() { resetInputTarget(); CodexConversationScroll.scroll(up: action == .up, isCurrent: isCurrent) }
             else { unavailable("无法确认前台 Codex 的可用控件，本次未执行。") }
@@ -736,6 +811,7 @@ enum CodexConversationControls {
     /// previews only when the user explicitly navigates them with up/down.
     @MainActor static func cycleInputTarget(isCurrent: () -> Bool) {
         guard isCurrent() else { return }
+        _ = syncFocusedInput()
         let switchingToComposer = questionRoot != nil
         // Drop the old answer preview and dictation destination before lookup.
         // A partial scan must never leave the previous question armed for input.
@@ -772,6 +848,7 @@ enum CodexConversationControls {
     }
 
     @MainActor static func focusForDictation() -> Bool {
+        let focusedCard = syncFocusedInput()
         verifiedDictationField = nil
         let savedComposer = composerTarget
         let savedQuestion = questionRoot
@@ -789,7 +866,7 @@ enum CodexConversationControls {
                 return true
             }
         }
-        guard let snap = snapshot(preferForm: savedQuestion != nil && savedComposer == nil),
+        guard let snap = focusedCard ?? snapshot(preferForm: savedQuestion != nil && savedComposer == nil),
               snap.complete, let window = snap.elements.first, sameWindow(snap) else {
             // An explicitly selected question cannot silently become chat input.
             return savedQuestion == nil && focusBottomComposer()
@@ -965,13 +1042,7 @@ enum CodexConversationControls {
     @MainActor private static func snapshot(budget: TimeInterval = 0.65, preferForm: Bool = true) -> Snapshot? {
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == "com.openai.codex",
               AXIsProcessTrusted() else { return nil }
-        let ax = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(ax, 0.025)
-        if accessibilityPID != app.processIdentifier {
-            AXUIElementSetAttributeValue(ax, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(ax, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-            accessibilityPID = app.processIdentifier
-        }
+        let ax = accessibilityApplication(app.processIdentifier)
         guard let window = element(ax, kAXFocusedWindowAttribute as CFString), let windowRect = frame(window) else { return nil }
         // Locate the live card independently of the size of the conversation history.
         // Sample points only discover candidate ancestors. No action uses these points.
@@ -1179,6 +1250,9 @@ enum CodexConversationControls {
             Node(parent: 15, role: "AXTextArea", label: "Message", rect: CGRect(x: 350, y: 650, width: 600, height: 80), editable: true), // 16
             Node(parent: 15, role: "AXButton", label: "Send", pressable: true)         // 17
         ]
+        guard questionContainingFocus(11, in: card)?.root == 2,
+              questionContainingFocus(6, in: card)?.root == 2,
+              questionContainingFocus(16, in: card) == nil else { return false }
         var unnumbered = card
         unnumbered[3].rect = CGRect(x: 350, y: 247, width: 32, height: 18)
         unnumbered[13].rect = CGRect(x: 850, y: 426, width: 40, height: 21)

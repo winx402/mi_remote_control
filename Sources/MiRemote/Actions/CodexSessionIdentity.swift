@@ -6,9 +6,11 @@ import SQLite3
 /// and selected-sidebar metadata; never asks AX for conversation text or input values.
 struct CodexSessionIdentity: Sendable {
     private let ids: Set<String>
+    private let hostIDs: Set<String>
     private let titles: Set<String>
 
-    private init(ids: Set<String>, titles: Set<String>) {
+    private init(ids: Set<String>, titles: Set<String>, hostIDs: Set<String> = []) {
+        self.hostIDs = hostIDs
         self.ids = ids
         self.titles = titles
     }
@@ -24,19 +26,33 @@ struct CodexSessionIdentity: Sendable {
     /// A title cannot establish uniqueness while more pages are still outstanding.
     /// An explicit ID can be selected as soon as its page arrives.
     func resolve(in entries: [CodexSessions.Entry], complete: Bool) -> String? {
+        resolveEntry(in: entries, complete: complete)?.id
+    }
+
+    func resolveIdentityKey(in entries: [CodexSessions.Entry], complete: Bool) -> String? {
+        resolveEntry(in: entries, complete: complete)?.identityKey
+    }
+
+    private func resolveEntry(in entries: [CodexSessions.Entry], complete: Bool) -> CodexSessions.Entry? {
+        guard hostIDs.count <= 1 else { return nil }
+        let candidates = entries.filter { entry in
+            hostIDs.first.map { (entry.hostID ?? "local") == $0 } ?? true
+        }
+        let matches: [CodexSessions.Entry]
         if !ids.isEmpty {
             guard ids.count == 1, let id = ids.first else { return nil }
-            return entries.contains(where: { $0.id == id }) ? id : nil
+            matches = candidates.filter { $0.id == id }
+        } else {
+            guard complete, titles.count == 1, let title = titles.first else { return nil }
+            matches = candidates.filter { Self.fullTitle($0.name) == title }
         }
-        guard complete, titles.count == 1, let title = titles.first else { return nil }
-        let matches = Set(entries.filter { Self.fullTitle($0.name) == title }.map(\.id))
-        return matches.count == 1 ? matches.first : nil
+        return matches.count == 1 ? matches[0] : nil
     }
 
     /// Background-only, read-only lookup. This covers an active thread outside the bounded
     /// app-server list and verifies title uniqueness across the entire local index.
     nonisolated func lookupInIndex() -> CodexSessions.Entry? {
-        guard !Thread.isMainThread, ids.count <= 1,
+        guard !Thread.isMainThread, ids.count <= 1, hostIDs.isSubset(of: ["local"]),
               let lookup = indexLookup(), let database = Self.indexDatabase() else { return nil }
         var connection: OpaquePointer?
         guard sqlite3_open_v2(database.path, &connection, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
@@ -107,15 +123,22 @@ struct CodexSessionIdentity: Sendable {
         return normalized
     }
 
-    nonisolated private static func threadID(_ value: String) -> String? {
-        if let url = URL(string: value), url.scheme?.lowercased() == "codex",
-           url.host?.lowercased() == "threads", url.query == nil, url.fragment == nil {
-            let path = url.path.dropFirst()
-            if !path.isEmpty, !path.contains("/"), path.count <= 512,
-               path.rangeOfCharacter(from: .controlCharacters) == nil { return String(path) }
+    nonisolated private static func threadReference(_ value: String) -> (id: String, hostID: String?)? {
+        if let url = URLComponents(string: value), url.scheme?.lowercased() == "codex",
+           url.host?.lowercased() == "threads", url.fragment == nil, url.path.hasPrefix("/") {
+            let path = String(url.path.dropFirst())
+            let hosts = (url.queryItems ?? []).filter { $0.name == "hostId" }
+            guard !path.isEmpty, !path.contains("/"), path.count <= 512,
+                  path.rangeOfCharacter(from: .controlCharacters) == nil, hosts.count <= 1 else { return nil }
+            if let item = hosts.first {
+                guard let hostID = item.value, !hostID.isEmpty, hostID.count <= 512,
+                      hostID.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
+                return (path, hostID)
+            }
+            return (path, nil)
         }
-        let stripped = value.hasPrefix("thread:") ? String(value.dropFirst(7)) : value
-        return UUID(uuidString: stripped) != nil ? stripped.lowercased() : nil
+        let id = value.hasPrefix("thread:") ? String(value.dropFirst(7)) : value
+        return UUID(uuidString: id) == nil ? nil : (id.lowercased(), nil)
     }
 
     /// Pure fixtures: no AX objects, workspace, index, messages, or real sessions are read.
@@ -125,6 +148,13 @@ struct CodexSessionIdentity: Sendable {
         let title = CodexSessionIdentity(ids: [], titles: ["让 Apple TV 遥控器控制 Mac"])
         let explicit = CodexSessionIdentity(ids: ["current"], titles: ["另一个会话"])
         let duplicate = CodexSessions.Entry(id: "duplicate", name: current.name, updatedAt: 3)
+        let remote = CodexSessions.Entry(id: current.id, name: current.name, updatedAt: 5, hostID: "test:remote")
+        let remoteIdentity = CodexSessionIdentity(ids: [current.id], titles: [], hostIDs: ["test:remote"])
+        guard remoteIdentity.resolveIdentityKey(in: [current, remote], complete: false) == remote.identityKey,
+              explicit.resolveIdentityKey(in: [current, remote], complete: true) == nil,
+              title.resolveIdentityKey(in: [current, remote], complete: true) == nil,
+              threadReference("codex://threads/current?hostId=test%3Aremote")?.hostID == "test:remote",
+              threadReference("codex://threads/current?hostId=a&hostId=b") == nil else { return false }
         return title.resolve(in: [newest, current], complete: true) == "current"
             && title.resolve(in: [newest, current], complete: false) == nil
             && title.resolve(in: [current, duplicate], complete: true) == nil
@@ -135,8 +165,8 @@ struct CodexSessionIdentity: Sendable {
             && fullTitle("  让 Apple TV\n遥控器控制 Mac  ") == current.name
             && fullTitle("让 Apple TV…") == nil && fullTitle("Codex") == nil
             && fullTitle("ChatGPT Work") == nil && fullTitle("Codex Desktop") == nil
-            && threadID("codex://threads/current") == "current"
-            && threadID("codex://threads/a/b") == nil && threadID("https://example.com/current") == nil
+            && threadReference("codex://threads/current")?.id == "current"
+            && threadReference("codex://threads/a/b") == nil && threadReference("https://example.com/current") == nil
             && title.indexLookup()?.column == "title" && explicit.indexLookup()?.value == "current"
     }
 
@@ -145,6 +175,7 @@ struct CodexSessionIdentity: Sendable {
         private let pid: pid_t
         private let deadline = ProcessInfo.processInfo.systemUptime + 0.65
         private var calls = 0
+        private var hostIDs = Set<String>()
         private var ids = Set<String>()
         private var titles = Set<String>()
         private var headerTitles: [(x: CGFloat, title: String)] = []
@@ -188,7 +219,7 @@ struct CodexSessionIdentity: Sendable {
                   let latestValue, CFGetTypeID(latestValue) == AXUIElementGetTypeID(), CFEqual(window, latestValue),
                   NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
                   !ids.isEmpty || !titles.isEmpty else { return nil }
-            return CodexSessionIdentity(ids: ids, titles: titles)
+            return CodexSessionIdentity(ids: ids, titles: titles, hostIDs: hostIDs)
         }
 
         private var permitted: Bool { calls < 450 && ProcessInfo.processInfo.systemUptime < deadline }
@@ -256,7 +287,10 @@ struct CodexSessionIdentity: Sendable {
             for name in [kAXURLAttribute, kAXDocumentAttribute, "AXIdentifier"] {
                 let value = attribute(owner, name)
                 let text = (value as? URL)?.absoluteString ?? (value as? String)
-                if let text, let id = CodexSessionIdentity.threadID(text) { ids.insert(id) }
+                if let text, let ref = CodexSessionIdentity.threadReference(text) {
+                    ids.insert(ref.id)
+                    if let hostID = ref.hostID { hostIDs.insert(hostID) }
+                }
             }
             guard title, let role = string(owner, kAXRoleAttribute),
                   ["AXStaticText", "AXHeading", "AXButton", "AXLink", "AXRow"].contains(role) else { return }

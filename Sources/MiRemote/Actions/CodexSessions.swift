@@ -2,25 +2,46 @@ import AppKit
 import Darwin
 import os
 
-/// 只读本地会话元数据；不恢复会话，也不向模型发送请求。
+/// 只读本地及桌面已同步的远程会话元数据；不恢复会话，也不向模型发送请求。
 @MainActor
 final class CodexSessions {
     struct Entry: Identifiable, Decodable, Sendable, Equatable {
         let id: String
         let name: String?
         let updatedAt: Double
+        let hostID: String?
+        let hostName: String?
+        let projectID: String?
+        let projectName: String?
+        let cwd: String?
+
+        var isRemote: Bool { hostID != nil }
+        var identityKey: String { Self.key(hostID ?? "local", id) }
+        var groupID: String { Self.key(hostID ?? "local", projectID ?? "") }
+        var groupTitle: String { projectName ?? "未分组" }
+        var hostTitle: String { hostName ?? (isRemote ? "远程电脑" : "本机") }
+        private static func key(_ host: String, _ item: String) -> String {
+            "\(host.utf8.count):\(host)\(item)"
+        }
 
         var title: String {
             let normalized = name?.split(whereSeparator: \.isWhitespace).joined(separator: " ") ?? ""
             return normalized.isEmpty ? "未命名会话" : String(normalized.prefix(180))
         }
 
-        private enum CodingKeys: String, CodingKey { case id, name, updatedAt }
+        private enum CodingKeys: String, CodingKey { case id, name, updatedAt, cwd, projectID = "projectId" }
 
-        init(id: String, name: String?, updatedAt: Double) {
+        init(id: String, name: String?, updatedAt: Double, hostID: String? = nil,
+             hostName: String? = nil, projectID: String? = nil, projectName: String? = nil,
+             cwd: String? = nil) {
             self.id = id
             self.name = name
             self.updatedAt = updatedAt
+            self.hostID = hostID
+            self.hostName = hostName
+            self.projectID = projectID
+            self.projectName = projectName
+            self.cwd = cwd
         }
 
         init(from decoder: Decoder) throws {
@@ -28,20 +49,28 @@ final class CodexSessions {
             id = try values.decode(String.self, forKey: .id)
             name = try values.decodeIfPresent(String.self, forKey: .name)
             updatedAt = try values.decodeIfPresent(Double.self, forKey: .updatedAt) ?? 0
+            hostID = nil
+            hostName = nil
+            projectID = try values.decodeIfPresent(String.self, forKey: .projectID)
+            projectName = nil
+            cwd = try values.decodeIfPresent(String.self, forKey: .cwd)
         }
     }
 
     struct Snapshot: Sendable {
         var entries: [Entry] = []
         var currentID: String?
+        var currentIdentityKey: String?
         var isLoading = false
         var notice: String?
         var error: String?
 
         func selection(after previous: Snapshot, index: Int, userMoved: Bool) -> Int {
-            let prior = previous.entries.indices.contains(index) ? previous.entries[index].id : nil
-            let anchor = userMoved ? prior : currentID ?? prior
-            if let anchor, let found = entries.firstIndex(where: { $0.id == anchor }) { return found }
+            let prior = previous.entries.indices.contains(index) ? previous.entries[index].identityKey : nil
+            let anchor = userMoved ? prior : currentIdentityKey ?? currentID.flatMap { id in
+                let matches = entries.filter { $0.id == id }; return matches.count == 1 ? matches[0].identityKey : nil
+            } ?? prior
+            if let anchor, let found = entries.firstIndex(where: { $0.identityKey == anchor }) { return found }
             return min(max(index, 0), max(0, entries.count - 1))
         }
     }
@@ -67,6 +96,8 @@ final class CodexSessions {
     @MainActor private final class LoadState {
         var latest = Snapshot(isLoading: true)
         var indexed: Entry?
+        var desktop = CodexSessionCatalog.Result()
+        var catalogLoading = true
     }
 
     func load(identity: CodexSessionIdentity?, onUpdate: @escaping @MainActor @Sendable (Snapshot) -> Void) {
@@ -76,17 +107,29 @@ final class CodexSessions {
         let publish: @MainActor () -> Void = { [weak self] in
             guard self?.generation.accepts(token) == true else { return }
             var result = state.latest
-            if let indexed = state.indexed {
-                if !result.entries.contains(where: { $0.id == indexed.id }) {
-                    result.entries = Self.sorted(result.entries + [indexed])
-                }
-                result.currentID = indexed.id
-            } else {
-                result.currentID = identity?.resolve(in: result.entries,
-                    complete: !result.isLoading && result.notice == nil && result.error == nil)
+            if let indexed = state.indexed,
+               !result.entries.contains(where: { $0.identityKey == indexed.identityKey }) {
+                result.entries.append(indexed)
+            }
+            result.entries = state.desktop.merge(result.entries)
+            result.isLoading = result.isLoading || state.catalogLoading
+            result.currentIdentityKey = identity?.resolveIdentityKey(in: result.entries,
+                complete: !result.isLoading && result.notice == nil && result.error == nil && state.desktop.isComplete)
+            result.currentID = result.currentIdentityKey.flatMap { key in
+                result.entries.first(where: { $0.identityKey == key })?.id
+            }
+            if let notice = state.desktop.notice {
+                result.notice = [result.notice, notice].compactMap { $0 }.joined(separator: "\n")
             }
             if !result.isLoading { Self.trace.notice("identity=\(identity != nil) match=\(result.currentID != nil)") }
             onUpdate(result)
+        }
+        Task {
+            let desktop = await Task.detached(priority: .userInitiated) { CodexSessionCatalog.read() }.value
+            guard generation.accepts(token) else { return }
+            state.desktop = desktop
+            state.catalogLoading = false
+            publish()
         }
         if let identity {
             Task {
@@ -112,25 +155,31 @@ final class CodexSessions {
         worker = nil
     }
 
-    nonisolated static func url(for id: String) -> URL? {
+    nonisolated static func url(for id: String, hostID: String? = nil) -> URL? {
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               id.count <= 512,
               id.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
         // thread ID 是单一路径段，必须编码斜杠、百分号和 URL 分隔符。
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#%"))
         guard let encoded = id.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
-        return URL(string: "codex://threads/" + encoded)
+        guard var components = URLComponents(string: "codex://threads/" + encoded) else { return nil }
+        if let hostID {
+            guard !hostID.isEmpty, hostID.count <= 512,
+                  hostID.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
+            components.queryItems = [URLQueryItem(name: "hostId", value: hostID)]
+        }
+        return components.url
     }
 
     @discardableResult
     static func open(_ entry: Entry) -> Bool {
-        guard let url = url(for: entry.id) else { return false }
+        guard let url = url(for: entry.id, hostID: entry.hostID) else { return false }
         return NSWorkspace.shared.open(url)
     }
 
     nonisolated static func sorted(_ entries: [Entry]) -> [Entry] {
         entries.sorted {
-            $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt
+            $0.updatedAt == $1.updatedAt ? $0.identityKey < $1.identityKey : $0.updatedAt > $1.updatedAt
         }
     }
 
@@ -146,7 +195,7 @@ final class CodexSessions {
 
     nonisolated static func selfCheck() -> Bool {
         let fixture = #"{"data":[{"id":"older","name":"  第一个\n会话  ","updatedAt":1,"preview":"PRIVATE PREVIEW","cwd":"/private/example"},{"id":"newer","name":null,"updatedAt":3},{"id":"same-time","name":"   ","updatedAt":3}],"nextCursor":"next-page"}"#
-        guard CodexSessionIdentity.selfCheck() else { return false }
+        guard CodexSessionIdentity.selfCheck(), CodexSessionCatalog.selfCheck() else { return false }
         guard let page = try? JSONDecoder().decode(Page.self, from: Data(fixture.utf8)),
               page.data.count == 3, page.nextCursor == "next-page",
               page.data[0].title == "第一个 会话",

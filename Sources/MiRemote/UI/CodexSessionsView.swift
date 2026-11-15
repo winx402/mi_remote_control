@@ -114,7 +114,7 @@ struct CodexSessionsView: View {
             onTabSelected(index)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
                     Image(systemName: index == 0 ? "clock" : tab.isRemote ? "network" : "folder")
                     Text(tab.title).fontWeight(isSelected ? .semibold : .regular)
                         .lineLimit(1).truncationMode(.middle)
@@ -124,7 +124,7 @@ struct CodexSessionsView: View {
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, 7)
             .frame(width: 130, height: 52, alignment: .leading)
             .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
             .background(isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08),

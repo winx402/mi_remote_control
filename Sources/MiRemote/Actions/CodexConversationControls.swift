@@ -71,8 +71,8 @@ enum CodexConversationControls {
     }
     private static func descendant(_ index: Int, of root: Int, in nodes: [Node]) -> Bool {
         var current: Int? = index
-        for _ in 0..<32 {
-            guard let value = current else { return false }
+        while let value = current {
+            guard nodes.indices.contains(value) else { return false }
             if value == root { return true }
             current = nodes[value].parent
         }
@@ -142,8 +142,7 @@ enum CodexConversationControls {
         var roots = Set<Int>()
         for title in nodes.indices where matches(nodes[title], questionTitles.union(customReplyTitles).union(skipTitles)) {
             var parent: Int? = title
-            for _ in 0..<32 {
-                guard let value = parent else { break }
+            while let value = parent {
                 if formContainers.contains(nodes[value].role) { roots.insert(value) }
                 parent = nodes[value].parent
             }
@@ -556,44 +555,53 @@ enum CodexConversationControls {
         guard let window = element(ax, kAXFocusedWindowAttribute as CFString), let windowRect = frame(window) else { return nil }
         // Locate the live card independently of the size of the conversation history.
         // Sample points only discover candidate ancestors. No action uses these points.
-        let deadline = ProcessInfo.processInfo.systemUptime + 0.32
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.35
         var visited = Set<AXUIElement>()
-        for fraction in [0.76, 0.63, 0.84] {
-            let point = CGPoint(x: windowRect.minX + windowRect.width * 0.61,
-                                y: windowRect.minY + windowRect.height * fraction)
+        let system = AXUIElementCreateSystemWide()
+        for (x, y) in [(0.40, 0.76), (0.55, 0.70), (0.68, 0.82)] {
+            let point = CGPoint(x: windowRect.minX + windowRect.width * x,
+                                y: windowRect.minY + windowRect.height * y)
             var hit: AXUIElement?
-            guard AXUIElementCopyElementAtPosition(ax, Float(point.x), Float(point.y), &hit) == .success,
+            guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
                   var candidate = hit else { continue }
-            for _ in 0..<14 {
+            var owner: pid_t = 0
+            guard AXUIElementGetPid(candidate, &owner) == .success, owner == app.processIdentifier else { continue }
+            for _ in 0..<64 {
                 guard ProcessInfo.processInfo.systemUptime < deadline else { break }
                 if visited.insert(candidate).inserted, let bounds = frame(candidate),
-                   bounds.width >= windowRect.width * 0.25, bounds.height >= 100,
-                   bounds.height <= windowRect.height * 0.70,
+                   bounds.width >= windowRect.width * 0.22, bounds.height >= 85,
+                   bounds.height <= windowRect.height * 0.78,
                    let local = project(ax, window: window, rect: windowRect, root: candidate,
-                                       pid: app.processIdentifier, budget: 0.22),
+                                       pid: owner, budget: 0.18),
                    local.complete, activeForm(local.nodes) != nil { return local }
                 guard let parent = element(candidate, kAXParentAttribute as CFString), !CFEqual(parent, window) else { break }
                 candidate = parent
             }
         }
-        return project(ax, window: window, rect: windowRect, root: window, pid: app.processIdentifier, budget: budget)
+        guard let whole = project(ax, window: window, rect: windowRect, root: window,
+                                  pid: app.processIdentifier, budget: budget) else { return nil }
+        if !whole.complete, let form = activeForm(whole.nodes),
+           let isolated = project(ax, window: window, rect: windowRect, root: whole.elements[form.root],
+                                  pid: whole.pid, budget: 0.25),
+           isolated.complete, activeForm(isolated.nodes) != nil { return isolated }
+        return whole
     }
 
     @MainActor private static func project(_ ax: AXUIElement, window: AXUIElement, rect windowRect: CGRect,
                                            root: AXUIElement, pid: pid_t, budget: TimeInterval) -> Snapshot? {
         let local = !CFEqual(window, root)
         var queue: [(AXUIElement, Int?, Int)] = [(root, local ? 0 : nil, 0)]
-        var head = 0
+        var examined = 0
         var nodes: [Node] = local ? [Node(parent: nil, role: "AXWindow", rect: windowRect)] : []
         var elements: [AXUIElement] = local ? [window] : []
         var seen: [CFHashCode: [AXUIElement]] = [:]
         let deadline = ProcessInfo.processInfo.systemUptime + budget
         var complete = true
-        while head < queue.count, head < 1800 {
+        while !queue.isEmpty, examined < 2200 {
             guard stillFrontmost(pid) else { return nil }
             if ProcessInfo.processInfo.systemUptime >= deadline { complete = false ; break }
-            let (current, parent, depth) = queue[head]
-            head += 1
+            let (current, parent, depth) = queue.removeLast()
+            examined += 1
             let hash = CFHash(current)
             if (seen[hash] ?? []).contains(where: { CFEqual($0, current) }) { continue }
             seen[hash, default: []].append(current)
@@ -617,8 +625,8 @@ enum CodexConversationControls {
                     fixed.contains($0) || Int($0).map { (1...12).contains($0) } == true
                 } ?? ""
                 // Promote a fixed label to its enclosing button if AX omitted its name.
-                if !label.isEmpty, let parent, nodes[parent].role == "AXButton", nodes[parent].label.isEmpty {
-                    nodes[parent].label = label
+                if !label.isEmpty, let parent, nodes[parent].role == "AXButton" {
+                    nodes[parent].label = [label, nodes[parent].label].filter { !$0.isEmpty }.joined(separator: "\n")
                 }
             }
             let enabled = values[3] as? Bool != false
@@ -631,12 +639,12 @@ enum CodexConversationControls {
                 selected: selected, editable: editable, pressable: actionable && actions(current).contains(kAXPressAction as String)))
             elements.append(current)
             let kids = attribute(current, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
-            if depth >= 25 && !kids.isEmpty { complete = false ; continue }
+            if depth >= 96 && !kids.isEmpty { complete = false ; continue }
             queue.append(contentsOf: kids.map { ($0, index, depth + 1) })
         }
         guard stillFrontmost(pid) else { return nil }
         return Snapshot(pid: pid, app: ax, elements: elements, nodes: nodes, window: windowRect,
-                        complete: complete && head == queue.count)
+                        complete: complete && queue.isEmpty)
     }
     private static func attribute(_ node: AXUIElement, _ name: CFString) -> CFTypeRef? {
         var value: CFTypeRef?

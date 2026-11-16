@@ -85,9 +85,12 @@ import ApplicationServices
             guard let selectedControl,
                   let target = dialog.controls.first(where: { CFEqual($0.element, selectedControl) }),
                   isFrontmost(app.processIdentifier),
-                  let focused = element(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute),
-                  ownsDialog(dialog.window, focused: focused), enabled(target.element) else { return true }
-            _ = press(target.element)
+                  let window = interactionWindow(AXUIElementCreateApplication(app.processIdentifier)),
+                  CFEqual(dialog.window, window), enabled(target.element) else { return true }
+            guard press(target.element) else {
+                CodexNavigation.showNotice("Codex 未接受按钮操作，请重新选择后再按 OK。")
+                return true
+            }
             // AXPress can synchronously dismiss or replace the window. Refresh on the
             // next run-loop turn and keep watching until it closes or loses focus.
             Task { @MainActor in _ = refreshRemoteSelection() }
@@ -284,12 +287,7 @@ import ApplicationServices
         guard AXIsProcessTrusted() else { return Snapshot() }
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 0.03)
-        guard let focused = element(root, kAXFocusedWindowAttribute) else { return Snapshot() }
-        var window = focused
-        for _ in 0..<4 {
-            guard let sheet = (attribute(window, "AXSheets") as? [AXUIElement])?.last else { break }
-            window = sheet
-        }
+        guard let window = interactionWindow(root) else { return Snapshot() }
         let native = isModal(window)
         // Sparkle's download window may be a standard native status window.
         // Inspect only immediate children for the exact Sparkle status identifier.
@@ -361,8 +359,8 @@ import ApplicationServices
         guard let current, target == current else { return target }
         // Up/down also walk a horizontal button row, so every option is reachable
         // with the remote's usual list navigation. Edges never wrap.
-        if direction == .up { return max(0, current - 1) }
-        if direction == .down { return min(controls.count - 1, current + 1) }
+        if direction == .up || direction == .left { return max(0, current - 1) }
+        if direction == .down || direction == .right { return min(controls.count - 1, current + 1) }
         return target
     }
 
@@ -375,16 +373,27 @@ import ApplicationServices
         return "menu=\(resolveMenu(in: app) != nil) incomplete=\(state.incomplete) blocked=\(state.blocked) install=\(!a.installs.isEmpty) relaunch=\(!a.relaunches.isEmpty) progress=\(a.progress) current=\(a.current) failed=\(a.failed) controls=\(controls)"
     }
 
-    private static func ownsDialog(_ dialog: AXUIElement, focused: AXUIElement) -> Bool {
-        if CFEqual(dialog, focused) { return true }
-        var top = focused
+    /// With a standalone Sparkle NSAlert, Electron can still report its chat as
+    /// AXFocusedWindow. Prefer an attached sheet or a visible modal in this PID.
+    /// Both classification and the last check before AXPress use the same window.
+    private static func interactionWindow(_ root: AXUIElement) -> AXUIElement? {
+        let focused = element(root, kAXFocusedWindowAttribute)
+        var candidate = focused
+        if focused.map({ !isModal($0) && (attribute($0, "AXSheets") as? [AXUIElement] ?? []).isEmpty }) ?? true {
+            let windows = attribute(root, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            if let modal = windows.first(where: {
+                isModal($0) && attribute($0, kAXMinimizedAttribute) as? Bool != true
+                    && attribute($0, "AXHidden") as? Bool != true
+            }) { candidate = modal }
+        }
+        guard var top = candidate else { return nil }
         for _ in 0..<4 {
-            guard let sheet = (attribute(top, "AXSheets") as? [AXUIElement])?.last else { return false }
-            if CFEqual(dialog, sheet) { return true }
+            guard let sheet = (attribute(top, "AXSheets") as? [AXUIElement])?.last else { break }
             top = sheet
         }
-        return false
+        return top
     }
+
     private static func isModal(_ node: AXUIElement) -> Bool {
         let role = string(node, kAXRoleAttribute)
         return role == "AXSheet" || role == "AXDialog" || string(node, kAXSubroleAttribute) == "AXDialog"

@@ -202,7 +202,7 @@ import ApplicationServices
             "Installing update…", "Ready to Install"]
 
         init(sparkle: Bundle? = nil) {
-            guard let resourceURL = sparkle?.resourceURL,
+            guard let resourceURL = sparkle?.resourceURL?.resolvingSymlinksInPath(),
                   let directories = try? FileManager.default.contentsOfDirectory(at: resourceURL,
                     includingPropertiesForKeys: nil) else { return }
             for directory in directories where directory.pathExtension == "lproj" {

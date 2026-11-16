@@ -109,6 +109,21 @@ final class MappingEngine: @unchecked Sendable {
     /// 浮层键捕获（M5 v2「UI 模态路由」）：非 nil 时按键事件不走动作分发，
     /// 经 mainDispatch 投递到主线程交给浮层处理；浮层关闭（置 nil）即恢复。
     private var overlayHandler: ((ButtonEvent) -> Void)?
+    private var codexUpdateDialogActive = false
+    private var updateDialogPressed: Set<RemoteKey> = []
+    var onCodexUpdateKey: ((RemoteKey) -> Void)?
+    private var capturesCodexUpdateKeys: Bool {
+        codexUpdateDialogActive && activeBundleID == "com.openai.codex" && overlayHandler == nil
+    }
+
+    func setCodexUpdateDialogActive(_ active: Bool) {
+        dispatch { [weak self] in
+            guard let self, self.codexUpdateDialogActive != active else { return }
+            self.codexUpdateDialogActive = active
+            self._resetInputState(active ? "更新弹窗打开" : "更新弹窗关闭")
+        }
+    }
+
     private var immediateOverlayDirections = false
     private var prioritizeOverlayNavigationTaps = false
     /// Main-thread app-specific tap hook. False preserves the normal tap action
@@ -327,7 +342,7 @@ final class MappingEngine: @unchecked Sendable {
         // 其余方向继续直接改写，保留系统原生 autorepeat 与零延迟。
         let directions: Set<RemoteKey> = [.up, .down, .left, .right]
         let native = Set(directions.filter { key in
-            !(douyinNavigationActive && isDouyinNavigationKey(key))
+            !capturesCodexUpdateKeys && !(douyinNavigationActive && isDouyinNavigationKey(key))
                 && !applicationNavigationActive && reservedDirectionAction(key) == nil && customDirectionDouble(key) == nil
                 && (!independent || overlayDeclared(key)?.overrideBase != true)
                 && !codexContextKey(key)
@@ -516,6 +531,7 @@ final class MappingEngine: @unchecked Sendable {
     }
 
     private func _resetInputState(_ reason: String, preserveReservedPresses: Bool = true) {
+        if !preserveReservedPresses { updateDialogPressed.removeAll() }
         invalidateInputSession()
         applicationNavigationGestures.reset(preservePressed: preserveReservedPresses)
         codexContextGestures.reset(preservePressed: preserveReservedPresses)
@@ -577,6 +593,23 @@ final class MappingEngine: @unchecked Sendable {
             || reservedDirectionGestures.consumeSuppressed(event)
             || codexContextGestures.consumeSuppressed(event)
             || douyinVoiceGestures.consumeSuppressed(event) { return }
+        // A button can dismiss its dialog on down. Consume repeats and the matching
+        // up even after the window disappears, so the chat never receives that press.
+        if updateDialogPressed.contains(event.key) {
+            if !event.isDown { updateDialogPressed.remove(event.key) }
+            return
+        }
+        if capturesCodexUpdateKeys, event.key == .ok || isDirection(event.key) {
+            if event.isDown {
+                updateDialogPressed.insert(event.key)
+                let generation = inputGeneration
+                mainDispatch { [weak self] in
+                    guard let self, self.inputGeneration == generation else { return }
+                    self.onCodexUpdateKey?(event.key)
+                }
+            }
+            return
+        }
         if event.key == .voice,
            douyinVoiceGestures.isTracking(.voice)
             || (event.isDown && douyinLiveVoiceEligible && douyinVoiceContextAvailable
@@ -1507,6 +1540,17 @@ extension MappingEngine {
             }
             func tap(_ key: RemoteKey) { event(key, true); clock.advance(10); event(key, false) }
             func take() -> [Action] { let result = runner.actions; runner.actions.removeAll(); return result }
+            var dialogKeys: [RemoteKey] = []
+            engine.onCodexUpdateKey = { dialogKeys.append($0) }
+            engine.setCodexUpdateDialogActive(true)
+            for key in [RemoteKey.up, .down, .left, .right] {
+                event(key, true); clock.advance(800); event(key, true); event(key, false)
+            }
+            event(.ok, true)
+            engine.setCodexUpdateDialogActive(false)
+            event(.ok, true); clock.advance(1000); event(.ok, false)
+            expect(dialogKeys == [.up, .down, .left, .right, .ok] && take().isEmpty,
+                   "update dialog handles each press once, including OK release after dismissal")
             expect(engine.tapRoute.nativeDirections.isEmpty, "context directions enter engine")
             for key in [RemoteKey.up, .down, .left, .right] { tap(key) }
             expect(take() == [.system("codex_context_up"), .system("codex_context_down"),

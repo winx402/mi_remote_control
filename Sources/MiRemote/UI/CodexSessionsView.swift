@@ -75,7 +75,7 @@ struct CodexSessionsView: View {
                                 Image(systemName: "arrow.down.circle")
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text("更新 Codex").fontWeight(.medium)
-                                    Text("有新版本时下载、安装并重新打开 Codex")
+                                    Text("用方向键选择更新窗口中的按钮，按 OK 确认")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()

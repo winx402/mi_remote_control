@@ -453,6 +453,13 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         DispatchQueue.main.async { [weak self] in
             guard let self, let km = services.keyMapper, let filter = services.hidFilter else { return }
             self.dockNavigation.engine = km.engine
+            CodexAppUpdate.onDialogActiveChanged = { [weak engine = km.engine] in
+                engine?.setCodexUpdateDialogActive($0)
+            }
+            km.engine.onCodexUpdateKey = { key in
+                MainActor.assumeIsolated { _ = CodexAppUpdate.handleRemote(key) }
+            }
+            _ = CodexAppUpdate.refreshRemoteSelection()
             km.engine.onInputReset = { [weak self] in
                 MainActor.assumeIsolated {
                     if CodexDictation.isActive { CodexDictation.shutdown() }
@@ -590,6 +597,7 @@ final class GUIAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
                     if CodexDictation.isActive, bundleID != CodexDictation.activeBundleID {
                         CodexDictation.cancelCurrent(reason: "切换应用")
                     }
+                    if bundleID == "com.openai.codex" { _ = CodexAppUpdate.refreshRemoteSelection() }
                     self?.overlayCenter?.noteProfileSwitch(bundleID)
                 }
             }

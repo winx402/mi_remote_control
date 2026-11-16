@@ -247,6 +247,19 @@ final class ActionRunner: ActionRunning, CodexBackspacePreparing, @unchecked Sen
             defer { if direction { Self.pendingCodexDirection.withLock { $0 = false } } }
             guard current() else { return }
             guard issued.duration(to: .now) < .milliseconds(500) else { return }
+            if let action = CodexConversationControls.Action(rawValue: name) {
+                let dialogKey: RemoteKey?
+                switch action {
+                case .up: dialogKey = .up
+                case .down: dialogKey = .down
+                case .left: dialogKey = .left
+                case .right: dialogKey = .right
+                case .ok: dialogKey = .ok
+                case .submit: dialogKey = nil
+                }
+                if let dialogKey, CodexAppUpdate.handleRemote(dialogKey) { return }
+                if action == .submit, CodexAppUpdate.refreshRemoteSelection() { return }
+            }
             if name == "codex_context_submit", CodexDictation.isActive {
                 CodexNavigation.showNotice("请先结束听写，等文字出现在输入框后再长按 OK 发送。")
                 return

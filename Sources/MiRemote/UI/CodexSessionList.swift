@@ -1,7 +1,13 @@
 import Foundation
 
 struct CodexSessionList {
+    enum Tool: CaseIterable { case updateCodex }
+    static let recentTab = 1
+
     struct Tab: Identifiable {
+        var isTools: Bool { id == "tools" }
+        var isRecent: Bool { id == "recent" }
+
         let id: String
         let title: String
         let hostTitle: String?
@@ -11,7 +17,7 @@ struct CodexSessionList {
     }
 
     struct Selection: Equatable {
-        var tab = 0
+        var tab = CodexSessionList.recentTab
         // nil selects the New Chat action above the sessions.
         var row: Int? = nil
     }
@@ -30,7 +36,8 @@ struct CodexSessionList {
                        hostTitle: project.hostID == nil ? "本机" : host,
                        project: project, isRemote: project.hostID != nil, entries: entries)
         }
-        tabs = [recent] + projects
+        let tools = Tab(id: "tools", title: "功能", hostTitle: nil, project: nil, isRemote: false, entries: [])
+        tabs = [tools, recent] + projects
     }
 
     func entry(at selection: Selection) -> CodexSessions.Entry? {
@@ -40,11 +47,16 @@ struct CodexSessionList {
     }
 
     func initialSelection(tab: Int, currentKey: String? = nil) -> Selection {
+        if tabs[tab].isTools { return Selection(tab: tab, row: 0) }
         let entries = tabs[tab].entries
         return Selection(tab: tab, row: entries.firstIndex { $0.identityKey == currentKey } ?? entries.indices.first)
     }
 
     func moved(_ selection: Selection, key: RemoteKey) -> Selection {
+        if tabs[selection.tab].isTools, key == .up || key == .down {
+            let row = CodexSessions.movedIndex(selection.row ?? 0, delta: key == .up ? -1 : 1, count: Tool.allCases.count)
+            return Selection(tab: selection.tab, row: row)
+        }
         switch key {
         case .left, .right:
             let next = selection.tab + (key == .left ? -1 : 1)
@@ -64,8 +76,9 @@ struct CodexSessionList {
     func selection(after previous: Self, prior: Selection, browsed: Bool, currentKey: String?) -> Selection {
         guard browsed, previous.tabs.indices.contains(prior.tab),
               let tab = tabs.firstIndex(where: { $0.id == previous.tabs[prior.tab].id }) else {
-            return initialSelection(tab: 0, currentKey: currentKey)
+            return initialSelection(tab: Self.recentTab, currentKey: currentKey)
         }
+        if tabs[tab].isTools { return Selection(tab: tab, row: prior.row ?? 0) }
         guard let oldRow = prior.row, !tabs[tab].entries.isEmpty else { return Selection(tab: tab) }
         let key = previous.entry(at: prior)?.identityKey
         let rows = tabs[tab].entries
@@ -89,25 +102,29 @@ struct CodexSessionList {
         let sidebar = [localProject, remoteProject, emptyProject]
         let historical = CodexSessions.Entry(id: "old-folder", name: nil, updatedAt: 0, projectID: "cwd:/old", projectName: "Old")
         let list = Self(entries: local + [remote, historical], sidebarProjects: sidebar)
-        guard empty.tabs.count == 1, empty.entry(at: Selection()) == nil,
-              list.tabs.count == 4, list.tabs[3].entries.isEmpty, list.tabs[0].entries.map(\.updatedAt) == [14,12,11,10,9,8,7,6,5,4],
-              list.tabs[1].entries.count == 12, list.tabs[2].isRemote,
-              list.moved(Selection(tab: 0, row: 9), key: .down) == Selection(tab: 0, row: 9),
-              list.moved(Selection(tab: 0, row: 9), key: .right) == Selection(tab: 1, row: 0),
-              list.entry(at: Selection(tab: 2, row: 0))?.identityKey == remote.identityKey else { return false }
-        guard list.moved(Selection(tab: 0, row: 0), key: .up) == Selection(tab: 0),
-              list.moved(Selection(tab: 0), key: .down) == Selection(tab: 0, row: 0),
-              list.initialSelection(tab: 3).row == nil,
-              list.tabs[0].project == nil, list.tabs[2].project?.hostID == "host",
-              list.tabs[3].project?.id == "empty",
-              list.selection(after: list, prior: Selection(tab: 2), browsed: true, currentKey: nil) == Selection(tab: 2)
+        guard empty.tabs.count == 2, empty.entry(at: Selection()) == nil,
+              list.tabs.count == 5, list.tabs[4].entries.isEmpty, list.tabs[1].entries.map(\.updatedAt) == [14,12,11,10,9,8,7,6,5,4],
+              list.tabs[2].entries.count == 12, list.tabs[3].isRemote,
+              list.moved(Selection(tab: 1, row: 9), key: .down) == Selection(tab: 1, row: 9),
+              list.moved(Selection(tab: 1, row: 9), key: .right) == Selection(tab: 2, row: 0),
+              list.entry(at: Selection(tab: 3, row: 0))?.identityKey == remote.identityKey else { return false }
+        guard list.moved(Selection(tab: 1, row: 0), key: .up) == Selection(tab: 1),
+              list.moved(Selection(tab: 1), key: .down) == Selection(tab: 1, row: 0),
+              list.initialSelection(tab: 4).row == nil,
+              list.tabs[1].project == nil, list.tabs[3].project?.hostID == "host",
+              list.tabs[4].project?.id == "empty",
+              list.selection(after: list, prior: Selection(tab: 3), browsed: true, currentKey: nil) == Selection(tab: 3)
         else { return false }
+        let tools = list.moved(Selection(), key: .left)
+        guard list.tabs[Selection().tab].isRecent, list.tabs[tools.tab].isTools, tools.row == 0,
+              list.moved(tools, key: .down) == tools, list.moved(tools, key: .right).tab == Self.recentTab,
+              list.selection(after: list, prior: tools, browsed: true, currentKey: nil) == tools else { return false }
         let earlier = CodexSessions.Entry(id: "extra", name: nil, updatedAt: 15, projectID: "a", projectName: "Alpha")
         let alpha = CodexSessionCatalog.Project(id: "a", name: "Alpha", hostID: nil, roots: [])
         let fresh = Self(entries: local + [remote, earlier], sidebarProjects: [alpha] + sidebar)
-        let kept = fresh.selection(after: list, prior: Selection(tab: 2, row: 0), browsed: true, currentKey: nil)
-        return kept.tab == 3 && fresh.entry(at: kept)?.identityKey == remote.identityKey
-            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: remote.identityKey) == Selection(tab: 0, row: 1)
-            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == Selection(tab: 0, row: 0)
+        let kept = fresh.selection(after: list, prior: Selection(tab: 3, row: 0), browsed: true, currentKey: nil)
+        return kept.tab == 4 && fresh.entry(at: kept)?.identityKey == remote.identityKey
+            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: remote.identityKey) == Selection(tab: 1, row: 1)
+            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == Selection(tab: 1, row: 0)
     }
 }

@@ -7,6 +7,7 @@ struct CodexSessionsView: View {
     let tabIndex: Int
     let selected: Int?
     var isCreating = false
+    let onTool: (CodexSessionList.Tool) -> Void
     let onNewChat: (String) -> Void
     let onTabSelected: (Int) -> Void
 
@@ -32,7 +33,7 @@ struct CodexSessionsView: View {
                 Image(systemName: "text.bubble")
                 Text("Codex 会话").font(.headline)
                 Spacer()
-                if snapshot.isLoading {
+                if snapshot.isLoading && currentTab?.isTools != true {
                     ProgressView().controlSize(.small)
                     Text("读取中…").font(.callout).foregroundStyle(.secondary)
                 } else if let selectedIndex {
@@ -42,7 +43,7 @@ struct CodexSessionsView: View {
             }
             if !list.tabs.isEmpty {
                 projectTabs
-                if let tab = currentTab {
+                if let tab = currentTab, !tab.isTools {
                     Button { onNewChat(tab.id) } label: {
                         HStack(spacing: 8) {
                             if isCreating {
@@ -66,7 +67,30 @@ struct CodexSessionsView: View {
                     .accessibilityAddTraits(selected == nil ? .isSelected : [])
                 }
             }
-            if entries.isEmpty {
+            if currentTab?.isTools == true {
+                VStack(spacing: 4) {
+                    ForEach(Array(CodexSessionList.Tool.allCases.enumerated()), id: \.offset) { index, tool in
+                        Button { onTool(tool) } label: {
+                            HStack {
+                                Image(systemName: "arrow.down.circle")
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("更新 Codex").fontWeight(.medium)
+                                    Text("有新版本时下载、安装并重新打开 Codex")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                            .padding(12)
+                            .background(index == selected ? Color.accentColor.opacity(0.14) : .clear,
+                                        in: RoundedRectangle(cornerRadius: Radius.small))
+                            .overlay(RoundedRectangle(cornerRadius: Radius.small)
+                                .stroke(index == selected ? Color.accentColor : .clear, lineWidth: 2))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(index == selected ? .isSelected : [])
+                    }
+                }.frame(maxWidth: .infinity, minHeight: 360, alignment: .topLeading)
+            } else if entries.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: snapshot.error == nil ? "text.bubble" : "exclamationmark.bubble")
                         .font(.system(size: 30)).foregroundStyle(.secondary)
@@ -93,24 +117,24 @@ struct CodexSessionsView: View {
                     .onChange(of: entries.map(\.identityKey)) { _, _ in scroll(proxy) }
                 }
             }
-            if let error = snapshot.error {
+            if currentTab?.isTools != true, let error = snapshot.error {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
-            if let notice = snapshot.notice {
+            if currentTab?.isTools != true, let notice = snapshot.notice {
                 Text(notice).font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let currentIndex = CodexSessionList.currentIndex(in: snapshot) {
+            if currentTab?.isTools != true, let currentIndex = CodexSessionList.currentIndex(in: snapshot) {
                 let current = snapshot.entries[currentIndex]
                 Label("当前：\(current.groupTitle) · \(current.title)", systemImage: "location.fill")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            Text("↑↓ 选择 · 按住连续移动 · ←→ 切项目 · OK 打开 · 返回 / Home / TV 取消")
+            Text("↑↓ 选择 · ←→ 切换标签 · OK 打开 · 返回 / Home / TV 取消")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(Spacing.sheetPadding)
-        .frame(width: min(742, (NSScreen.main?.visibleFrame.width ?? 782) - 40))
+        .frame(width: min(list.tabs.count >= 6 ? 880 : 742, (NSScreen.main?.visibleFrame.width ?? 782) - 40))
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Radius.overlay))
         .overlay(RoundedRectangle(cornerRadius: Radius.overlay)
             .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
@@ -140,12 +164,12 @@ struct CodexSessionsView: View {
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
-                    Image(systemName: index == 0 ? "clock" : tab.isRemote ? "network" : "folder")
+                    Image(systemName: tab.isTools ? "wrench.and.screwdriver" : tab.isRecent ? "clock" : tab.isRemote ? "network" : "folder")
                     Text(tab.title).fontWeight(isSelected ? .semibold : .regular)
                         .lineLimit(1).truncationMode(.middle)
-                    Text("\(tab.entries.count)").font(.caption).monospacedDigit()
+                    if !tab.isTools { Text("\(tab.entries.count)").font(.caption).monospacedDigit() }
                 }
-                Text(subtitle(for: tab, recent: index == 0))
+                Text(subtitle(for: tab))
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
@@ -163,8 +187,9 @@ struct CodexSessionsView: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    private func subtitle(for tab: CodexSessionList.Tab, recent: Bool) -> String {
-        if recent { return "按更新时间" }
+    private func subtitle(for tab: CodexSessionList.Tab) -> String {
+        if tab.isTools { return "应用操作" }
+        if tab.isRecent { return "按更新时间" }
         guard tab.isRemote else { return "本机" }
         return tab.hostTitle.map { "远程 · " + $0 } ?? "远程"
     }
@@ -192,7 +217,7 @@ struct CodexSessionsView: View {
                 Text(entry.title)
                     .font(.body.weight(selected ? .semibold : .regular))
                     .lineLimit(2)
-                if currentTabIndex == 0 {
+                if currentTab?.isRecent == true {
                     Text("\(entry.groupTitle) · \(entry.isRemote ? "远程 · " : "")\(entry.hostTitle)")
                         .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)

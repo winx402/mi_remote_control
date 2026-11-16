@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import os
 
 /// ATVV（Android TV Voice）私有 GATT 服务的 CoreBluetooth 桥。
 ///
@@ -62,6 +63,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             payload.append(UInt8(sessionID & 0xFF))
         }
         return payload
+    }
+
+    /// v1.0 MIC_EXTEND resets Audio Transfer Timeout for this stream, without
+    /// reopening the microphone. Never use the protocol's broadcast 0xff ID.
+    static func microphoneExtendCommand(version: UInt16, sessionID: UInt16?) -> [UInt8]? {
+        guard version >= 0x0100, let sessionID, sessionID < 0xff else { return nil }
+        return [0x0E, UInt8(sessionID)]
     }
 
     private static func be16(_ bytes: [UInt8], _ index: Int) -> UInt16 {
@@ -147,6 +155,12 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var micOpenPending = false
 
     private var streaming = false
+    private var continuation = ATVVVoiceContinuation()
+    private var continuationWork: DispatchWorkItem?
+    private var continuationEpoch: UInt64 = 0
+    private var segmentStartNs: UInt64 = 0
+    private var continuationFirstFramePending = false
+    private static let continuationLogger = Logger(subsystem: "com.miremote.controller", category: "ATVVContinuity")
 
     // Explicitly armed diagnostic; every mutable member remains on the ATVV queue.
     private var voiceContinuityProbe: VoiceContinuityProbe?
@@ -271,6 +285,101 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
+    /// Renewed only by the physical-HID/context owner. Timestamp at the caller so
+    /// queue congestion cannot turn an old main-thread decision into a fresh lease.
+    func authorizeVoiceContinuation(token: UInt64) {
+        let issued = DispatchTime.now().uptimeNanoseconds
+        queue.async { [weak self] in
+            guard let self, self.voiceContinuityProbe == nil, self.shouldRun,
+                  self.peripheral?.state == .connected else { return }
+            self.continuation.authorize(token: token, nowNs: issued)
+        }
+    }
+
+    /// Initial transport keeps its existing tail-drain path; a host-opened segment
+    /// or pending recovery closes immediately, without a new OPEN or failure hint.
+    func revokeVoiceContinuation(token: UInt64) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.applyContinuationEffects(self.continuation.revoke(token: token, nowNs: DispatchTime.now().uptimeNanoseconds))
+        }
+    }
+
+    private func scheduleContinuationTick() {
+        continuationWork?.cancel()
+        continuationEpoch &+= 1
+        guard continuation.isActive else { continuationWork = nil; return }
+        let epoch = continuationEpoch
+        let connection = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == connection, self.continuationEpoch == epoch else { return }
+            self.applyContinuationEffects(self.continuation.advance(nowNs: DispatchTime.now().uptimeNanoseconds))
+            self.scheduleContinuationTick()
+        }
+        continuationWork = work
+        queue.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
+    }
+
+    private func applyContinuationEffects(_ effects: [ATVVVoiceContinuation.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .begin:
+                resetAudioSegment()
+                continuationFirstFramePending = false
+                continuityLog("logical-start version=\(hex16(protocolVersion)) session=\(hex16(sessionID))")
+                delegate?.atvvVoiceStarted()
+            case .segment:
+                resetAudioSegment()
+                continuationFirstFramePending = true
+                continuityLog("reopen-start version=\(hex16(protocolVersion)) session=\(hex16(sessionID))")
+                delegate?.atvvVoiceSegmentStarted()
+            case .open:
+                guard shouldRun, capsReady, audioSubscribed, controlSubscribed,
+                      peripheral?.state == .connected, txChar != nil else {
+                    // A connection teardown owns cancellation; never emit a speculative OPEN.
+                    continuation = ATVVVoiceContinuation()
+                    clearVoiceFrameState()
+                    delegate?.atvvVoiceStopped()
+                    return
+                }
+                continuityLog("reopen-request version=\(hex16(protocolVersion)) oldSession=\(hex16(sessionID))")
+                sendMicOpen()
+            case .extend(let streamID):
+                guard streaming, capsReady, peripheral?.state == .connected,
+                      let payload = Self.microphoneExtendCommand(version: protocolVersion, sessionID: streamID) else { continue }
+                continuityLog("extend version=\(hex16(protocolVersion)) session=\(hex16(streamID)) segmentMs=\(segmentElapsedMs())")
+                writeCommand(payload)
+            case .failed(let reason):
+                continuityLog("reopen-failed reason=\(reason)")
+                delegate?.atvvVoiceContinuationFailed(reason: reason)
+            case .end:
+                continuityLog("logical-end session=\(hex16(sessionID)) segmentMs=\(segmentElapsedMs())")
+                continuationFirstFramePending = false
+                clearVoiceFrameState()
+                log("AUDIO_STOP")
+                delegate?.atvvVoiceStopped()
+            case .close:
+                sendMicClose()
+            }
+        }
+    }
+
+    private func resetAudioSegment() {
+        clearVoiceFrameState()
+        streaming = true
+        segmentStartNs = DispatchTime.now().uptimeNanoseconds
+    }
+
+    private func segmentElapsedMs() -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now >= segmentStartNs ? (now - segmentStartNs) / 1_000_000 : 0
+    }
+
+    private func continuityLog(_ message: String) {
+        Self.continuationLogger.notice("\(message, privacy: .public)")
+        log(message)
+    }
+
     /// Arms a bounded experiment; it never starts a microphone until the physical
     /// remote requests it. Callbacks run on MainActor; no voice delegate is invoked.
     func startVoiceContinuityProbe(
@@ -279,7 +388,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     ) {
         queue.async { [weak self] in
             guard let self else { return }
-            guard self.voiceContinuityProbe == nil, !self.streaming else {
+            guard self.voiceContinuityProbe == nil, !self.streaming, !self.continuation.isActive else {
                 let report = VoiceContinuityProbe.Report.unavailable(.busy, "请先结束当前会话，再开始诊断。")
                 DispatchQueue.main.async { completion(report) }
                 return
@@ -544,6 +653,10 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         capsReady = false
         micOpenPending = false
         streaming = false
+        continuation = ATVVVoiceContinuation()
+        continuationEpoch &+= 1
+        continuationWork?.cancel()
+        continuationWork = nil
         pendingSync = nil
         headerMode = false
         frameFormatProbed = false
@@ -870,6 +983,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             handleCaps(b)
 
         case 0x08: // 用户按下语音键，请求开麦
+            guard continuation.physicalRequest() else { return }
             log("MIC_REQUEST (0x08)")
             // S8：能力帧尚未就绪时暂存请求，caps 完成后补发 MIC_OPEN。
             if capsReady {
@@ -885,8 +999,12 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         case 0x0A: // 同步帧
             handleSyncFrame(b)
 
-        case 0x00: // 流结束
-            handleStreamStop()
+        case 0x00: // 流结束（v1 第二字节明确区分 timeout / HTT release 等）
+            handleStreamStop(reason: protocolVersion >= 0x0100 ? b.dropFirst().first : nil)
+
+        case 0x0C: // MIC_OPEN_ERROR: no retry loop on a rejected host reopen.
+            applyContinuationEffects(continuation.transportError("遥控器拒绝MIC_OPEN"))
+            scheduleContinuationTick()
 
         default:
             log("CTL_UNKNOWN op=\(hex(op))")
@@ -933,19 +1051,18 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func handleStreamStart(_ b: [UInt8]) {
-        sessionID = ATVVBridge.parseStreamSessionID(b)
-        streaming = true
-        pendingSync = nil
-        frameFormatProbed = false
-        headerMode = false
-        probeBuffer.removeAll(keepingCapacity: true)
-        waitingForResync = false
-        accumulator = FrameAccumulator(frameSize: capsFrameLen)
-        log("AUDIO_START sessionID=\(hex16(sessionID))")
-        delegate?.atvvVoiceStarted()
+        let parsedID = b.count >= 4 ? ATVVBridge.parseStreamSessionID(b) : nil
+        let effects = continuation.started(sessionID: parsedID, supportsExtension: protocolVersion >= 0x0100 && parsedID != 0xff, physicalStart: protocolVersion >= 0x0100 && b.count >= 2 && (b[1] == 0x01 || b[1] == 0x03), nowNs: DispatchTime.now().uptimeNanoseconds)
+        if effects.contains(.begin) || effects.contains(.segment) {
+            sessionID = parsedID ?? 0
+            log("AUDIO_START sessionID=\(hex16(sessionID))")
+        }
+        applyContinuationEffects(effects)
+        scheduleContinuationTick()
     }
 
     private func handleSyncFrame(_ b: [UInt8]) {
+        guard streaming else { return }
         guard let sync = ATVVBridge.parseSync(b) else { return }
         let predictor = sync.predictor
         let step = sync.stepIndex
@@ -966,14 +1083,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         log("SYNC predictor=\(predictor) step=\(step)")
     }
 
-    private func handleStreamStop() {
-        // 实机发现：MIC_CLOSE 会引来遥控器再回一个 0x00，若不加门控会无限乒乓。
-        // 只有"流进行中"的第一个 0x00 才算数，其余静默忽略。
-        guard streaming else { return }
+    private func handleStreamStop(reason: UInt8?) {
+        continuityLog("remote-stop version=\(hex16(protocolVersion)) session=\(hex16(sessionID)) reason=\(reason.map { hex($0) } ?? "absent") segmentMs=\(segmentElapsedMs())")
+        // The policy consumes the first STOP and absorbs every CLOSE echo. A
+        // firmware boundary pauses audio while HID release gets 200ms to arrive.
         streaming = false
-        log("AUDIO_STOP")
-        delegate?.atvvVoiceStopped()
-        sendMicClose()
+        applyContinuationEffects(continuation.stopped(reason: .init(byte: reason), nowNs: DispatchTime.now().uptimeNanoseconds))
+        scheduleContinuationTick()
     }
 
     private func sendMicClose() {
@@ -1073,6 +1189,15 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func emit(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?) {
+        // Only complete, decodable-size payloads confirm a host-opened segment.
+        guard streaming, frame.count == capsFrameLen,
+              sync.map({ (0...88).contains($0.stepIndex) }) ?? true else { return }
+        applyContinuationEffects(continuation.audioFrame(nowNs: DispatchTime.now().uptimeNanoseconds))
+        guard streaming else { return }
+        if continuationFirstFramePending {
+            continuationFirstFramePending = false
+            continuityLog("reopen-first-frame session=\(hex16(sessionID)) segmentMs=\(segmentElapsedMs()) bytes=\(frame.count)")
+        }
         delegate?.atvvAudioFrame(frame, sync: sync)
     }
 

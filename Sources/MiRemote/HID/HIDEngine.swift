@@ -1,5 +1,6 @@
 import Foundation
 import IOKit.hid
+import os
 
 /// M2 HID 按键引擎。
 ///
@@ -26,6 +27,8 @@ final class HIDEngine: @unchecked Sendable {
 
     private weak var delegate: HIDEngineDelegate?
     private var manager: IOHIDManager?
+    private var voiceDownAtNs: UInt64?
+    private static let voiceLog = Logger(subsystem: "com.miremote.controller", category: "RemoteSpeech")
 
     /// 设备接入/移除通知（main 接线：蓝牙重连后重装 hidutil 映射 / 移除后复位输入状态）。
     /// 回调线程 = manager 调度的 runloop 线程。
@@ -75,6 +78,7 @@ final class HIDEngine: @unchecked Sendable {
         IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         manager = nil
+        voiceDownAtNs = nil
     }
 
     // MARK: - 事件处理（回调线程）
@@ -96,6 +100,12 @@ final class HIDEngine: @unchecked Sendable {
         }
 
         let event = ButtonEvent(key: key, isDown: isDown, timeNs: DispatchTime.now().uptimeNanoseconds)
+        if key == .voice {
+            let elapsed = voiceDownAtNs.map { Double(event.timeNs &- $0) / 1_000_000_000 } ?? 0
+            if isDown, voiceDownAtNs == nil { voiceDownAtNs = event.timeNs }
+            Self.voiceLog.notice("原始语音键 source=iohid state=\(isDown ? "down" : "up", privacy: .public) uptimeNs=\(event.timeNs) elapsed=\(elapsed)s")
+            if !isDown { voiceDownAtNs = nil }
+        }
         delegate?.hidButton(event)
     }
 
@@ -105,6 +115,10 @@ final class HIDEngine: @unchecked Sendable {
     }
 
     private func handleDeviceRemoved(_ device: IOHIDDevice) {
+        if voiceDownAtNs != nil {
+            Self.voiceLog.notice("原始语音键 source=iohid state=unavailable reason=device-removed")
+            voiceDownAtNs = nil
+        }
         delegate?.hidLog("HID: 设备移除")
         onDeviceRemoved?()
     }

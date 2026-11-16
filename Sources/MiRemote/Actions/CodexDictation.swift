@@ -19,6 +19,8 @@ enum CodexDictation {
     @MainActor static var onPhysicalHoldRelease: ((UInt64) -> Void)?
     /// 新 Codex 会话开始前，清理通用语音工具仍在持有的键／延迟恢复。
     @MainActor static var onPhysicalHoldPrepare: (() -> Void)?
+    /// 仅在原目标刚通过上下文复核后续租；服务容器再核对真实 IOHID 按住状态。
+    @MainActor static var onPhysicalHoldContinuation: ((UInt64) -> Void)?
     @MainActor private static var voiceEngine: CodexVoiceEngine = .wechat
     @MainActor private static var bridgeDeviceName = "BlackHole 2ch"
     @MainActor private static var remoteIME: RemoteInputMethodSession?
@@ -49,6 +51,7 @@ enum CodexDictation {
     @MainActor private static var physicalHoldActive = false
     @MainActor private static var physicalHoldStartedAt: TimeInterval?
     @MainActor private static var remoteReleaseRequested = false
+    @MainActor private static var continuationFailureNoticed = false
     @MainActor private static var remotePCMSamples = 0
     @MainActor private static var remoteGeneration: UInt64 = 0
     @MainActor private static var remoteSession: RemoteSession?
@@ -221,8 +224,11 @@ enum CodexDictation {
                         stop(reason: "应用、窗口或输入焦点改变", restoreImmediately: true, showError: false)
                         return
                     }
+                    renewPhysicalHoldContinuation()
                 }
             }
+            if let remoteTimer { RunLoop.main.add(remoteTimer, forMode: .common) }
+            renewPhysicalHoldContinuation()
             return
         }
         notice(unavailable)
@@ -650,6 +656,7 @@ enum CodexDictation {
         let decision = remoteContext.observe(evidence, now: ProcessInfo.processInfo.systemUptime)
         switch decision {
         case .allow:
+            renewPhysicalHoldContinuation()
             if remoteContextQuarantined {
                 status("上下文复核 engine=wechat state=recovered；原输入框已核实")
             }
@@ -675,6 +682,29 @@ enum CodexDictation {
     @MainActor private static func cancelForRemoteContext(_ issue: String) {
         status("上下文取消 engine=wechat issue=\(issue)")
         stop(reason: "输入上下文改变或持续无法核实（\(issue)）", restoreImmediately: true, showError: false)
+    }
+
+    @MainActor private static func renewPhysicalHoldContinuation() {
+        guard useRemoteMicrophone, physicalHoldActive, !remoteReleaseRequested,
+              remoteIME != nil || remoteSession != nil else { return }
+        onPhysicalHoldContinuation?(remoteGeneration)
+    }
+
+    /// Called before the final transport STOP. Keep prior PCM and the ordinary
+    /// drain path; a failed continuation never starts another input action.
+    @MainActor static func remoteContinuationFailed(token: UInt64, reason: String) {
+        guard token == remoteGeneration, physicalHoldActive, !remoteReleaseRequested,
+              !continuationFailureNoticed else { return }
+        let valid: Bool
+        if let current = remoteIME {
+            valid = remoteInputMethodContext(current.target) == .matched
+        } else if let current = remoteSession {
+            valid = remoteTargetIsCurrent(current.target)
+        } else { valid = false }
+        guard valid else { return }
+        continuationFailureNoticed = true
+        status("遥控器续采结束 reason=\(reason)；保留此前音频")
+        notice("遥控器这段收音已结束，请松开再按住接着说。")
     }
 
     @MainActor private static func remoteInputMethodContext(_ target: RemoteTarget) -> RemoteDictationContextGuard.Observation {
@@ -782,6 +812,7 @@ enum CodexDictation {
         physicalHoldActive = false
         physicalHoldStartedAt = nil
         remoteReleaseRequested = false
+        continuationFailureNoticed = false
         remotePCMSamples = 0
         remoteIMEStartup = RemotePCMStartupGate()
         remoteContext = RemoteDictationContextGuard()

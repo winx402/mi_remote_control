@@ -269,6 +269,15 @@ protocol ATVVBridgeDelegate: AnyObject {
     func atvvDisconnected(error: String?)
     func atvvVoiceStarted()                            // 收到 0x04 流开始
     func atvvVoiceStopped()                            // 收到 0x00 流结束
+    /// 同一次已授权按住中的新 ADPCM 段；保留识别会话，仅重置段解码状态。
+    func atvvVoiceSegmentStarted()
+    /// 已确认仍按住时续采失败；既有音频仍按正常 STOP 收尾。
+    func atvvVoiceContinuationFailed(reason: String)
     /// 一帧完整 ADPCM 数据（已按帧长切好，未解码）；sync 非 nil 表示先用它重置解码器
     func atvvAudioFrame(_ frame: Data, sync: (predictor: Int16, stepIndex: Int)?)
+}
+
+extension ATVVBridgeDelegate {
+    func atvvVoiceSegmentStarted() {}
+    func atvvVoiceContinuationFailed(reason: String) {}
 }

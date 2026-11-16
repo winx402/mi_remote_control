@@ -410,6 +410,12 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 松手后仍可能等待最终结果；断连也必须取消这个 token。
     private var codexRecognitionToken: UInt64?
     private var codexReleaseWork: DispatchWorkItem?
+    /// Raw IOHID evidence is independent of BLE STOP and mapping eligibility.
+    private var rawVoiceHIDDown = false
+    private var rawVoicePressGeneration: UInt64 = 0
+    private var codexHoldPressGeneration: UInt64?
+    var authorizeVoiceContinuation: ((UInt64) -> Void)?
+    var revokeVoiceContinuation: ((UInt64) -> Void)?
     private var cleanupCount = 0
     private var _routeRemoteAudio: Bool
     private var _switchInput: Bool
@@ -464,6 +470,80 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     var releaseDouyinPhysicalVoice: (() -> Void)?
     var resetDouyinPhysicalVoice: (() -> Void)?
 
+    func receiveRawVoiceHID(_ event: ButtonEvent) {
+        guard event.key == .voice else { return }
+        sessionLock.lock()
+        if event.isDown, !rawVoiceHIDDown { rawVoicePressGeneration &+= 1 }
+        rawVoiceHIDDown = event.isDown
+        if !event.isDown { codexHoldPressGeneration = nil }
+        let revokeToken = event.isDown ? nil : codexRecognitionToken
+        sessionLock.unlock()
+        if let revokeToken { revokeVoiceContinuation?(revokeToken) }
+    }
+
+    func resetRawVoiceHID() {
+        sessionLock.lock()
+        rawVoiceHIDDown = false
+        codexHoldPressGeneration = nil
+        let token = codexRecognitionToken
+        sessionLock.unlock()
+        if let token { revokeVoiceContinuation?(token) }
+    }
+
+    /// Main has freshly validated the original dictation target. A BLE START or
+    /// configured binding alone cannot issue a lease without a raw HID down.
+    func renewVoiceContinuation(token: UInt64) {
+        sessionLock.lock()
+        let allowed = rawVoiceHIDDown && codexHoldPressGeneration == rawVoicePressGeneration
+            && codexRecognitionToken == token && cleanupCount == 0
+        sessionLock.unlock()
+        if allowed { authorizeVoiceContinuation?(token) }
+    }
+
+    static func voiceContinuationSelfCheck() -> Bool {
+        let app = VoiceBridgeApp(outputName: nil, wavPath: nil, gainDB: 0, verbose: false,
+                                 switchInput: false, doubao: false, sinkOverride: LevelMeterSink())
+        var authorized: [UInt64] = []
+        var revoked: [UInt64] = []
+        app.authorizeVoiceContinuation = { authorized.append($0) }
+        app.revokeVoiceContinuation = { revoked.append($0) }
+        app.shouldUseCodexPhysicalHold = { true }
+        app.atvvVoiceStarted()
+        app.setCodexPhysicalHold(active: true, token: 42)
+        app.renewVoiceContinuation(token: 42)
+        guard authorized.isEmpty else { return false } // BLE alone is insufficient.
+        app.receiveRawVoiceHID(.init(key: .voice, isDown: true, timeNs: 1))
+        app.renewVoiceContinuation(token: 42)
+        guard authorized.isEmpty else { return false } // old token cannot claim a new press.
+        app.setCodexPhysicalHold(active: true, token: 42)
+        app.renewVoiceContinuation(token: 41)
+        app.renewVoiceContinuation(token: 42)
+        guard authorized == [42] else { return false }
+        // Each segment resets both ADPCM and smoothing history, preserving the
+        // logical hold and gate token. No hardware/audio/input action is invoked.
+        let frame = VoicePressGate.Frame(data: Data([0x11]), sync: nil)
+        for _ in 0..<3 {
+            app.decoder.reset(predictor: 1234, stepIndex: 50)
+            _ = app.post.process([3000, 4000])
+            app.atvvVoiceSegmentStarted()
+            guard app.decoder.decode(frame.data) == ADPCMDecoder().decode(frame.data),
+                  app.post.process([100, 200]) == [100, 200],
+                  app.codexPCM.receive(frame)?.token == 42 else { return false }
+        }
+        app.receiveRawVoiceHID(.init(key: .voice, isDown: false, timeNs: 2))
+        app.renewVoiceContinuation(token: 42)
+        guard revoked == [42], authorized == [42],
+              app.codexPCM.receive(frame)?.token == 42 else { return false } // tail stays open.
+        app.receiveRawVoiceHID(.init(key: .voice, isDown: true, timeNs: 3))
+        app.renewVoiceContinuation(token: 42)
+        guard authorized == [42] else { return false }
+        app.resetRawVoiceHID()
+        app.renewVoiceContinuation(token: 42)
+        guard revoked == [42, 42], authorized == [42] else { return false }
+        app.setCodexPhysicalHold(active: false, token: 43)
+        return revoked == [42, 42, 42] && app.codexPCM.receive(frame) == nil
+    }
+
     /// Codex 即将接管触发键；保留其 BLE 预缓存，作废通用会话的所有延迟动作。
     /// 调用者为主线程；shutdown 可能访问 TIS，必须在 sessionLock 外执行。
     func prepareCodexPhysicalHold() {
@@ -484,6 +564,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         guard active else {
+            codexHoldPressGeneration = nil
+            if let token = codexRecognitionToken { revokeVoiceContinuation?(token) }
             codexReleaseWork?.cancel()
             codexReleaseWork = nil
             codexPCM.deactivate()
@@ -491,6 +573,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
             return
         }
         codexRecognitionToken = token
+        codexHoldPressGeneration = rawVoiceHIDDown ? rawVoicePressGeneration : nil
         if let delivery = codexPCM.activate(token: token) {
             for frame in delivery.frames { processCodexFrame(frame, token: delivery.token) }
         }
@@ -499,6 +582,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// HID up 与 BLE 尾包走不同队列。等待 STOP；缺失 STOP 时最多补收 250ms，
     /// 然后在已投递的主队列 PCM 后插入结束标记，不能先递增识别代次。
     func releaseCodexPhysicalHold(token: UInt64) {
+        revokeVoiceContinuation?(token)
         sessionLock.lock()
         defer { sessionLock.unlock() }
         codexReleaseWork?.cancel()
@@ -711,6 +795,24 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         stopPhysicalVoiceLocked()
     }
 
+    func atvvVoiceSegmentStarted() {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard physicalVoiceInProgress, codexPhysicalSession, cleanupCount == 0 else { return }
+        decoder.reset(predictor: 0, stepIndex: 0)
+        post.reset()
+    }
+
+    func atvvVoiceContinuationFailed(reason: String) {
+        sessionLock.lock()
+        let token = rawVoiceHIDDown && codexHoldPressGeneration == rawVoicePressGeneration
+            ? codexRecognitionToken : nil
+        sessionLock.unlock()
+        if let token {
+            DispatchQueue.main.async { CodexDictation.remoteContinuationFailed(token: token, reason: reason) }
+        }
+    }
+
     private func stopPhysicalVoiceLocked() {
         releaseDouyinPhysicalVoice?()
         physicalVoiceInProgress = false
@@ -803,6 +905,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
     private func prepareForceEndLocked() -> Bool {
         cleanupCount += 1
+        rawVoiceHIDDown = false
+        codexHoldPressGeneration = nil
         pendingVoiceResolution = nil
         pendingVoiceFrames.removeAll()
         pendingVoiceStopped = false
@@ -811,6 +915,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         codexReleaseWork = nil
         let streamToken = codexPCM.end()
         if let token = codexRecognitionToken ?? streamToken {
+            revokeVoiceContinuation?(token)
             DispatchQueue.main.async { CodexDictation.cancelRemoteTransport(token: token) }
         }
         codexRecognitionToken = nil
@@ -1164,12 +1269,14 @@ final class IOHIDOnlyFilter: HIDEngineDelegate {
     let allowed: Set<RemoteKey>
     /// 所有原始按键事件（含被过滤不进引擎的），GUI「识别按键」学习模式用。
     var onRawButton: ((ButtonEvent) -> Void)?
+    var onRawVoiceButton: ((ButtonEvent) -> Void)?
     init(_ target: KeyMapperApp, voiceKey: Bool = false) {
         self.target = target
         self.allowed = voiceKey ? [.back, .voice] : [.back]
     }
     func hidLog(_ message: String) { target.hidLog(message) }
     func hidButton(_ event: ButtonEvent) {
+        if event.key == .voice { onRawVoiceButton?(event) }
         target.hidLog("IOHID读到 \(event.key.rawValue) \(event.isDown ? "↓" : "↑")")
         onRawButton?(event)
         if allowed.contains(event.key) { target.hidButton(event) }
@@ -1283,6 +1390,8 @@ final class AppServices {
         voiceApp.minimumHoldMs = options.keys && preloaded?.globalShortcuts != nil
             ? preloaded?.settings.holdMs ?? 600 : 0
         bridge = ATVVBridge(delegate: voiceApp)
+        voiceApp.authorizeVoiceContinuation = { [weak bridge] token in bridge?.authorizeVoiceContinuation(token: token) }
+        voiceApp.revokeVoiceContinuation = { [weak bridge] token in bridge?.revokeVoiceContinuation(token: token) }
         health.log = { log("健康 \($0)") }
         voiceApp.onConnection = { [weak health] connected, _ in
             health?.setBLEConnected(connected)
@@ -1328,6 +1437,9 @@ final class AppServices {
                 CodexDictation.onPhysicalHoldPrepare = { [weak voiceApp] in
                     voiceApp?.prepareCodexPhysicalHold()
                 }
+                CodexDictation.onPhysicalHoldContinuation = { [weak voiceApp] token in
+                    voiceApp?.renewVoiceContinuation(token: token)
+                }
             }
             let km = KeyMapperApp(config: config, verbose: options.verbose)
             voiceApp.shouldReserveDouyinPhysicalVoice = { [weak voiceRuleStore] in voiceRuleStore?.isDouyinFrontmost() ?? false }
@@ -1351,6 +1463,7 @@ final class AppServices {
             let tap = TapEngine(delegate: km)
             tap.router = km.engine  // 方向键三态分流的快照来源
             let filter = IOHIDOnlyFilter(km, voiceKey: true)
+            filter.onRawVoiceButton = { [weak voiceApp] event in voiceApp?.receiveRawVoiceHID(event) }
             let hid = HIDEngine(delegate: filter)
             keyMapper = km
             tapEngine = tap
@@ -1381,6 +1494,7 @@ final class AppServices {
                 self?.bridge.requestReconnect(reason: "系统已接入遥控器按键设备")
             }
             hid.onDeviceRemoved = { [weak self, weak km, weak tap] in
+                self?.voiceApp.resetRawVoiceHID()
                 self?.onRemoteContextChanged?("遥控器已断开")
                 km?.resetDouyinVoiceReservation()
                 km?.engine.resetInputState(reason: "设备移除")
@@ -1412,6 +1526,7 @@ final class AppServices {
             workspaceObservers.append(wsnc.addObserver(
                 forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self, weak km, weak tap] _ in
                 self?.onRemoteContextChanged?("系统即将休眠")
+                self?.voiceApp.resetRawVoiceHID()
                 self?.bridge.cancelReconnectRequest(reason: "系统即将休眠")
                 km?.resetDouyinVoiceReservation()
                 km?.engine.resetInputState(reason: "系统睡眠")

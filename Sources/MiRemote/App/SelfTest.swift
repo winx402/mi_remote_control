@@ -237,6 +237,12 @@ enum SelfTest {
 
             expect(ATVVBridge.microphoneOpenCommand(version: 0x0100, codec: 0x02)
                    == [0x0C, 0x00], "ATVV v1 MIC_OPEN 布局")
+            expect(ATVVBridge.microphoneExtendCommand(version: 0x0100, sessionID: 0x7A) == [0x0E, 0x7A]
+                   && ATVVBridge.microphoneExtendCommand(version: 0x0100, sessionID: 0) == [0x0E, 0]
+                   && ATVVBridge.microphoneExtendCommand(version: 0x0100, sessionID: nil) == nil
+                   && ATVVBridge.microphoneExtendCommand(version: 0x0100, sessionID: 0xFF) == nil
+                   && ATVVBridge.microphoneExtendCommand(version: 0x0004, sessionID: 1) == nil,
+                   "ATVV v1 按已确认的实际 stream ID 延长，旧设备及未知 ID 不发延长命令")
             expect(ATVVBridge.microphoneCloseCommand(version: 0x0100, sessionID: 0x7A)
                    == [0x0D, 0x7A], "ATVV v1 MIC_CLOSE 使用单字节 stream ID")
         }
@@ -250,6 +256,7 @@ enum SelfTest {
         expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
         expect(IndependentGestures.selfCheck(), "独立全局手势单击/双击/长按互斥与取消")
         expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局长按⌃方向键、一次触发与释放")
+        expect(ATVVVoiceContinuation.selfCheck(), "持续按住时跨越遥控器音频分段，松手及重开失败时结束")
         expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")
         expect(MappingEngine.codexContextSelfCheck(), "Codex 专用动作、长短按互斥与捕获优先")
@@ -265,6 +272,7 @@ enum SelfTest {
         expect(ATVVReconnectPlan.selfCheck(), "ATVV 重连窗口合并、一次已知尝试、停止与旧代隔离")
         expect(AudioBridge.selfTest(), "长音频按源采样率完整排空并核对样本数（无设备 I/O）")
         expect(VoiceDeliveryGate.selfCheck(), "语音关闭总门、旧会话隔离与清理代次（无音频输出）")
+        expect(VoiceBridgeApp.voiceContinuationSelfCheck(), "真实 HID 续采授权、松手撤销与三段解码复位保留尾音（无设备 I/O）")
         expect(XiaomiTVController.selfCheck(), "MiLink 报文、成对按键、分片 ACK 与有界队列策略（无网络）")
         expect(DouyinMenuLayout.wrapSelfCheck(), "抖音直播菜单四向穿越、短行与单列边界")
         expect(WindowPickerFlow.selfCheck(), "全局窗口列表上下选择与翻页")

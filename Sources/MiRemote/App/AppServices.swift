@@ -414,6 +414,9 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     private var rawVoiceHIDDown = false
     private var rawVoicePressGeneration: UInt64 = 0
     private var codexHoldPressGeneration: UInt64?
+    /// Physical press identity for remotes using host-requested capture. Bridge callbacks
+    /// enqueue on its BLE queue and must not synchronously call back into this service.
+    var onPhysicalVoiceKey: ((_ held: Bool, _ generation: UInt64) -> Void)?
     var authorizeVoiceContinuation: ((UInt64) -> Void)?
     var revokeVoiceContinuation: ((UInt64) -> Void)?
     private var cleanupCount = 0
@@ -473,7 +476,10 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     func receiveRawVoiceHID(_ event: ButtonEvent) {
         guard event.key == .voice else { return }
         sessionLock.lock()
-        if event.isDown, !rawVoiceHIDDown { rawVoicePressGeneration &+= 1 }
+        if event.isDown != rawVoiceHIDDown {
+            if event.isDown { rawVoicePressGeneration &+= 1 }
+            onPhysicalVoiceKey?(event.isDown, rawVoicePressGeneration)
+        }
         rawVoiceHIDDown = event.isDown
         if !event.isDown { codexHoldPressGeneration = nil }
         let revokeToken = event.isDown ? nil : codexRecognitionToken
@@ -483,6 +489,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
 
     func resetRawVoiceHID() {
         sessionLock.lock()
+        if rawVoiceHIDDown { onPhysicalVoiceKey?(false, rawVoicePressGeneration) }
         rawVoiceHIDDown = false
         codexHoldPressGeneration = nil
         let token = codexRecognitionToken
@@ -503,6 +510,8 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     static func voiceContinuationSelfCheck() -> Bool {
         let app = VoiceBridgeApp(outputName: nil, wavPath: nil, gainDB: 0, verbose: false,
                                  switchInput: false, doubao: false, sinkOverride: LevelMeterSink())
+        var physical: [Int] = []
+        app.onPhysicalVoiceKey = { held, generation in physical.append((held ? 1 : -1) * Int(generation)) }
         var authorized: [UInt64] = []
         var revoked: [UInt64] = []
         app.authorizeVoiceContinuation = { authorized.append($0) }
@@ -542,6 +551,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         guard revoked == [42, 42], authorized == [42] else { return false }
         app.setCodexPhysicalHold(active: false, token: 43)
         return revoked == [42, 42, 42] && app.codexPCM.receive(frame) == nil
+            && physical == [1, -1, 2, -2]
     }
 
     /// Codex 即将接管触发键；保留其 BLE 预缓存，作废通用会话的所有延迟动作。
@@ -564,6 +574,9 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         guard active else {
+            if let press = codexHoldPressGeneration, rawVoiceHIDDown && press == rawVoicePressGeneration {
+                onPhysicalVoiceKey?(false, press)
+            }
             codexHoldPressGeneration = nil
             if let token = codexRecognitionToken { revokeVoiceContinuation?(token) }
             codexReleaseWork?.cancel()
@@ -905,6 +918,7 @@ final class VoiceBridgeApp: ATVVBridgeDelegate {
     /// 调用者持 sessionLock；先禁止交付，再清理所有本地会话状态。
     private func prepareForceEndLocked() -> Bool {
         cleanupCount += 1
+        if rawVoiceHIDDown { onPhysicalVoiceKey?(false, rawVoicePressGeneration) }
         rawVoiceHIDDown = false
         codexHoldPressGeneration = nil
         pendingVoiceResolution = nil
@@ -1390,6 +1404,9 @@ final class AppServices {
         voiceApp.minimumHoldMs = options.keys && preloaded?.globalShortcuts != nil
             ? preloaded?.settings.holdMs ?? 600 : 0
         bridge = ATVVBridge(delegate: voiceApp)
+        voiceApp.onPhysicalVoiceKey = { [weak bridge] held, generation in
+            bridge?.setVoiceButtonHeld(held, token: generation)
+        }
         voiceApp.authorizeVoiceContinuation = { [weak bridge] token in bridge?.authorizeVoiceContinuation(token: token) }
         voiceApp.revokeVoiceContinuation = { [weak bridge] token in bridge?.revokeVoiceContinuation(token: token) }
         health.log = { log("健康 \($0)") }

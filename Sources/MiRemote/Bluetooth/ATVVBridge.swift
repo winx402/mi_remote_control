@@ -102,7 +102,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     // MARK: - 命令字节
 
-    private static let getCaps: [UInt8] = [0x0A, 0x01, 0x00, 0x00, 0x03, 0x03]
+    static func capabilitiesCommand(onRequest: Bool) -> [UInt8] {
+        [0x0A, 0x01, 0x00, 0x00, 0x03, onRequest ? 0x00 : 0x03]
+    }
+
+    /// Local, explicit UUID opt-in. Removing this preference restores standard
+    /// negotiation on the next connection; a failed trial removes it automatically.
+    static let onRequestTrialPeripheralKey = "MiRemote.ATVV.onRequestTrialPeripheralIdentifier"
 
     // MARK: - 运行时状态
 
@@ -156,6 +162,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private var streaming = false
     private var continuation = ATVVVoiceContinuation()
+    private var onRequestVoice = ATVVOnRequestVoice()
+    private var onRequestTrialChosen = false
+    private var onRequestSafetyGuard = false
+    private var onRequestRetiredHostGuard = false
+    private var onRequestFailedPeers = Set<UUID>()
+    private var onRequestLease: (contextToken: UInt64, physicalToken: UInt64, expires: UInt64)?
+    private var standardFallbackWork: DispatchWorkItem?
     private var continuationWork: DispatchWorkItem?
     private var continuationEpoch: UInt64 = 0
     private var segmentStartNs: UInt64 = 0
@@ -293,6 +306,9 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             guard let self, self.voiceContinuityProbe == nil, self.shouldRun,
                   self.peripheral?.state == .connected else { return }
             self.continuation.authorize(token: token, nowNs: issued)
+            if let physicalToken = self.onRequestVoice.heldToken {
+                self.onRequestLease = (token, physicalToken, issued &+ ATVVVoiceContinuation.leaseNs)
+            }
         }
     }
 
@@ -301,23 +317,103 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func revokeVoiceContinuation(token: UInt64) {
         queue.async { [weak self] in
             guard let self else { return }
+            if self.onRequestLease?.contextToken == token { self.onRequestLease = nil }
             self.applyContinuationEffects(self.continuation.revoke(token: token, nowNs: DispatchTime.now().uptimeNanoseconds))
+        }
+    }
+
+    /// Raw physical events, including short taps and cancellation, independent of
+    /// the speech/context continuation lease. Call UP with the matching DOWN token.
+    func setVoiceButtonHeld(_ held: Bool, token: UInt64) {
+        let issued = DispatchTime.now().uptimeNanoseconds
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.applyOnRequestEffects(self.onRequestVoice.button(held: held, token: token, nowNs: issued))
+            if !held, self.onRequestLease?.physicalToken == token { self.onRequestLease = nil }
+            if !held, self.onRequestSafetyGuard, self.onRequestVoice.heldToken == nil {
+                // Also retire any standard-mode deferred OPEN left by a fallback.
+                self.micOpenPending = false
+            }
+            self.scheduleContinuationTick()
         }
     }
 
     private func scheduleContinuationTick() {
         continuationWork?.cancel()
         continuationEpoch &+= 1
-        guard continuation.isActive else { continuationWork = nil; return }
+        guard continuation.isActive || onRequestVoice.needsTick else { continuationWork = nil; return }
         let epoch = continuationEpoch
         let connection = generation
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.generation == connection, self.continuationEpoch == epoch else { return }
             self.applyContinuationEffects(self.continuation.advance(nowNs: DispatchTime.now().uptimeNanoseconds))
+            let now = DispatchTime.now().uptimeNanoseconds
+            self.applyOnRequestEffects(self.onRequestVoice.advance(nowNs: now,
+                extensionAuthorized: self.onRequestLease.map {
+                    $0.physicalToken == self.onRequestVoice.heldToken && $0.expires > now
+                } ?? false))
             self.scheduleContinuationTick()
         }
         continuationWork = work
         queue.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
+    }
+
+    private func applyOnRequestEffects(_ effects: [ATVVOnRequestVoice.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .open:
+                guard shouldRun, capsReady, audioSubscribed, controlSubscribed,
+                      peripheral?.state == .connected, txChar != nil,
+                      onRequestVoice.heldToken != nil else { continue }
+                continuityLog("ON_REQUEST MIC_OPEN physical-held=true")
+                sendMicOpen()
+            case .begin:
+                sessionID = 0
+                resetAudioSegment()
+                continuityLog("ON_REQUEST START_CONFIRMED reason=0x00 streamID=0x00")
+                delegate?.atvvVoiceStarted()
+            case .end:
+                clearVoiceFrameState()
+                continuityLog("ON_REQUEST logical-end segmentMs=\(segmentElapsedMs())")
+                delegate?.atvvVoiceStopped()
+            case .close(let streamID):
+                continuityLog("ON_REQUEST MIC_CLOSE streamID=\(hex16(streamID)) physical-held=\(onRequestVoice.heldToken != nil)")
+                writeCommand(Self.microphoneCloseCommand(version: protocolVersion, sessionID: streamID))
+            case .extend(let streamID):
+                guard streaming, onRequestVoice.heldToken != nil,
+                      let payload = Self.microphoneExtendCommand(version: protocolVersion, sessionID: streamID) else { continue }
+                continuityLog("ON_REQUEST extend streamID=\(hex16(streamID)) segmentMs=\(segmentElapsedMs())")
+                writeCommand(payload)
+            case .fallback(let reason):
+                fallbackFromOnRequest(reason: reason)
+            }
+        }
+    }
+
+    private func fallbackFromOnRequest(reason: String) {
+        onRequestRetiredHostGuard = true
+        onRequestLease = nil
+        if let id = peripheral?.identifier {
+            onRequestFailedPeers.insert(id)
+            if defaults.string(forKey: Self.onRequestTrialPeripheralKey).flatMap(UUID.init(uuidString:)) == id {
+                defaults.removeObject(forKey: Self.onRequestTrialPeripheralKey)
+            }
+        }
+        micOpenPending = false
+        capsReady = false
+        continuityLog("ON_REQUEST FALLBACK standard-model=0x03 opt-in-cleared reason=\(reason)")
+        guard shouldRun, peripheral?.state == .connected, txChar != nil else { return }
+        // One standard re-negotiation, never another trial or speculative OPEN.
+        writeCommand(Self.capabilitiesCommand(onRequest: false))
+        let connection = generation
+        standardFallbackWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == connection, !self.capsReady, let p = self.peripheral else { return }
+            self.pendingDisconnectReason = "standard CAPS fallback timed out"
+            self.central.cancelPeripheralConnection(p)
+        }
+        standardFallbackWork = work
+        queue.asyncAfter(deadline: .now() + .seconds(3), execute: work)
     }
 
     private func applyContinuationEffects(_ effects: [ATVVVoiceContinuation.Effect]) {
@@ -388,7 +484,8 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     ) {
         queue.async { [weak self] in
             guard let self else { return }
-            guard self.voiceContinuityProbe == nil, !self.streaming, !self.continuation.isActive else {
+            guard self.voiceContinuityProbe == nil, !self.streaming, !self.continuation.isActive,
+                  !self.onRequestSafetyGuard else {
                 let report = VoiceContinuityProbe.Report.unavailable(.busy, "请先结束当前会话，再开始诊断。")
                 DispatchQueue.main.async { completion(report) }
                 return
@@ -637,6 +734,13 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     }
 
     private func resetSessionState() {
+        onRequestVoice = ATVVOnRequestVoice()
+        onRequestTrialChosen = false
+        onRequestSafetyGuard = false
+        onRequestRetiredHostGuard = false
+        onRequestLease = nil
+        standardFallbackWork?.cancel()
+        standardFallbackWork = nil
         pendingConnectWork?.cancel()
         pendingConnectWork = nil
         connectionWindowToken = nil
@@ -910,6 +1014,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         guard isCurrent(peripheral) else { return }
         if let error {
             log("VALUE_ERROR \(characteristic.uuid) \(error.localizedDescription)")
+            applyOnRequestEffects(onRequestVoice.error("On-request蓝牙通知读取失败"))
             stopVoiceContinuityProbe(.interrupted, detail: "蓝牙数据读取出错，本次不判定支持。")
             return
         }
@@ -930,9 +1035,10 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func peripheral(_ peripheral: CBPeripheral,
                     didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard isCurrent(peripheral), characteristic.uuid == txUUID,
-              let probe = voiceContinuityProbe, !probe.isFinished,
-              probeConnectionGeneration == generation, error != nil else { return }
+        guard isCurrent(peripheral), characteristic.uuid == txUUID, error != nil else { return }
+        applyOnRequestEffects(onRequestVoice.error("On-request命令写入失败"))
+        guard let probe = voiceContinuityProbe, !probe.isFinished,
+              probeConnectionGeneration == generation else { return }
         applyVoiceProbeEffects(probe.stop(.interrupted,
             detail: "ATVV命令写入报告错误，本次不判定支持。"))
     }
@@ -940,8 +1046,19 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     // MARK: - 握手状态机（严格按 DESIGN.md §1.3 时序）
 
     private func sendGetCaps() {
-        log("GET_CAPS")
-        writeCommand(ATVVBridge.getCaps)
+        if !onRequestTrialChosen {
+            onRequestTrialChosen = true
+            if let id = peripheral?.identifier,
+               !onRequestFailedPeers.contains(id),
+               defaults.string(forKey: Self.onRequestTrialPeripheralKey).flatMap(UUID.init(uuidString:)) == id,
+               defaults.string(forKey: Self.rememberedPeripheralKey).flatMap(UUID.init(uuidString:)) == id {
+                onRequestSafetyGuard = true
+                onRequestVoice.negotiate(nowNs: DispatchTime.now().uptimeNanoseconds)
+            }
+        }
+        continuityLog("GET_CAPS requested-model=\(onRequestVoice.isEnabled ? "0x00 on-request trial" : "0x03 standard")")
+        writeCommand(Self.capabilitiesCommand(onRequest: onRequestVoice.isEnabled))
+        scheduleContinuationTick()
     }
 
     private func writeCommand(_ payload: [UInt8]) {
@@ -983,6 +1100,16 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             handleCaps(b)
 
         case 0x08: // 用户按下语音键，请求开麦
+            if onRequestVoice.isEnabled {
+                continuityLog("ON_REQUEST MIC_REQUEST observed; physical HID owns OPEN")
+                onRequestVoice.remoteRequest(nowNs: DispatchTime.now().uptimeNanoseconds)
+                scheduleContinuationTick()
+                return
+            }
+            if onRequestSafetyGuard, onRequestVoice.heldToken == nil {
+                log("MIC_REQUEST ignored after trial (physical key released)")
+                return
+            }
             guard continuation.physicalRequest() else { return }
             log("MIC_REQUEST (0x08)")
             // S8：能力帧尚未就绪时暂存请求，caps 完成后补发 MIC_OPEN。
@@ -1003,6 +1130,11 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
             handleStreamStop(reason: protocolVersion >= 0x0100 ? b.dropFirst().first : nil)
 
         case 0x0C: // MIC_OPEN_ERROR: no retry loop on a rejected host reopen.
+            if onRequestVoice.isEnabled {
+                applyOnRequestEffects(onRequestVoice.error("遥控器拒绝On-request MIC_OPEN"))
+                scheduleContinuationTick()
+                return
+            }
             applyContinuationEffects(continuation.transportError("遥控器拒绝MIC_OPEN"))
             scheduleContinuationTick()
 
@@ -1013,6 +1145,11 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func handleCaps(_ b: [UInt8]) {
         guard let caps = ATVVBridge.parseCapabilities(b) else {
+            if onRequestVoice.isEnabled {
+                applyOnRequestEffects(onRequestVoice.error("On-request CAP_RESP无有效16kHz能力"))
+                scheduleContinuationTick()
+                return
+            }
             log("CAPS_REJECTED len=\(b.count) (malformed or no 16kHz codec)")
             pendingDisconnectReason = "invalid capabilities or remote does not support 16kHz codec"
             if let p = peripheral { central.cancelPeripheralConnection(p) }
@@ -1024,10 +1161,25 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         capsFrameLen = caps.frameSize
         accumulator = FrameAccumulator(frameSize: capsFrameLen)
 
-        log("CAPS version=\(hex16(protocolVersion)) codecs=\(hex16(codecMask)) frame=\(capsFrameLen)")
+        let interactionModel: UInt8? = caps.version >= 0x0100 && b.count >= 5 ? b[4] : nil
+        continuityLog("CAP_RESP version=\(hex16(protocolVersion)) codecs=\(hex16(codecMask)) frame=\(capsFrameLen) interaction-model=\(interactionModel.map { hex($0) } ?? "absent") requested=\(onRequestVoice.isEnabled ? "on-request" : "standard") raw=\(hexBytes(b))")
         selectedCodec = 0x02
         let wasReady = capsReady
         capsReady = true
+        let acceptedStandardFallback = standardFallbackWork != nil
+        standardFallbackWork?.cancel()
+        standardFallbackWork = nil
+        if acceptedStandardFallback {
+            onRequestSafetyGuard = false
+            continuityLog("ON_REQUEST STANDARD_RESTORED; ordinary MIC_REQUEST/physical START handling resumed")
+        }
+        if onRequestVoice.isEnabled {
+            applyOnRequestEffects(onRequestVoice.capabilities(version: caps.version,
+                interactionModel: interactionModel, nowNs: DispatchTime.now().uptimeNanoseconds))
+            scheduleContinuationTick()
+            guard capsReady else { return } // Failed trial is now negotiating standard CAPS.
+            continuityLog("ON_REQUEST CAPS_ACCEPTED (awaiting actual host START validation)")
+        }
         rememberVerifiedPeripheral()
         log("CAPS_OK selectedCodec=0x02, awaiting mic key")
         // UI 的“遥控器已连接”必须代表 ATVV 能力协商完成，而不只是 BLE 链路建成。
@@ -1038,12 +1190,17 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // S8：若开麦请求早于能力帧到达，此刻补发 MIC_OPEN。
         if micOpenPending {
             micOpenPending = false
+            guard !onRequestSafetyGuard || onRequestVoice.heldToken != nil else { return }
             log("MIC_OPEN (deferred, caps now ready)")
             sendMicOpen()
         }
     }
 
     private func sendMicOpen() {
+        guard !onRequestSafetyGuard || onRequestVoice.heldToken != nil else {
+            log("MIC_OPEN suppressed (physical key released after trial)")
+            return
+        }
         let payload = ATVVBridge.microphoneOpenCommand(version: protocolVersion,
                                                        codec: selectedCodec)
         log("MIC_OPEN \(hexBytes(payload))")
@@ -1052,6 +1209,31 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
 
     private func handleStreamStart(_ b: [UInt8]) {
         let parsedID = b.count >= 4 ? ATVVBridge.parseStreamSessionID(b) : nil
+        let reason: UInt8? = protocolVersion >= 0x0100 && b.count >= 2 ? b[1] : nil
+        continuityLog("AUDIO_START reason=\(reason.map { hex($0) } ?? "absent") streamID=\(parsedID.map { hex16($0) } ?? "absent") raw=\(hexBytes(b))")
+        if onRequestVoice.isEnabled {
+            // A START before CAP_RESP is not proof that the trial was accepted.
+            if !onRequestVoice.isOnRequest {
+                applyOnRequestEffects(onRequestVoice.error("On-request能力确认前收到START"))
+                if reason != 1 && reason != 3 {
+                    writeCommand(Self.microphoneCloseCommand(version: protocolVersion, sessionID: parsedID ?? 0))
+                }
+            } else {
+                applyOnRequestEffects(onRequestVoice.started(reason: reason, streamID: parsedID,
+                    nowNs: DispatchTime.now().uptimeNanoseconds))
+            }
+            scheduleContinuationTick()
+            // A physical START is already the remote's live stream. Preserve this
+            // press even if its HID DOWN trails the BLE notification slightly.
+            if reason != 1 && reason != 3 { return }
+        }
+        if onRequestSafetyGuard || onRequestRetiredHostGuard, reason != 1 && reason != 3,
+           onRequestVoice.heldToken == nil || !capsReady {
+            // A delayed response to the retired trial must not start listening.
+            writeCommand(Self.microphoneCloseCommand(version: protocolVersion, sessionID: parsedID ?? 0))
+            continuityLog("AUDIO_START rejected after trial (released or CAPS pending)")
+            return
+        }
         let effects = continuation.started(sessionID: parsedID, supportsExtension: protocolVersion >= 0x0100 && parsedID != 0xff, physicalStart: protocolVersion >= 0x0100 && b.count >= 2 && (b[1] == 0x01 || b[1] == 0x03), nowNs: DispatchTime.now().uptimeNanoseconds)
         if effects.contains(.begin) || effects.contains(.segment) {
             sessionID = parsedID ?? 0
@@ -1088,6 +1270,11 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // The policy consumes the first STOP and absorbs every CLOSE echo. A
         // firmware boundary pauses audio while HID release gets 200ms to arrive.
         streaming = false
+        if onRequestVoice.isEnabled {
+            applyOnRequestEffects(onRequestVoice.stopped())
+            scheduleContinuationTick()
+            return
+        }
         applyContinuationEffects(continuation.stopped(reason: .init(byte: reason), nowNs: DispatchTime.now().uptimeNanoseconds))
         scheduleContinuationTick()
     }
@@ -1192,6 +1379,7 @@ final class ATVVBridge: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         // Only complete, decodable-size payloads confirm a host-opened segment.
         guard streaming, frame.count == capsFrameLen,
               sync.map({ (0...88).contains($0.stepIndex) }) ?? true else { return }
+        onRequestVoice.audioFrame(nowNs: DispatchTime.now().uptimeNanoseconds)
         applyContinuationEffects(continuation.audioFrame(nowNs: DispatchTime.now().uptimeNanoseconds))
         guard streaming else { return }
         if continuationFirstFramePending {

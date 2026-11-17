@@ -256,6 +256,7 @@ enum SelfTest {
         expect(CodexSessions.selfCheck(), "Codex 会话列表解码、排序、链接与取消代次")
         expect(IndependentGestures.selfCheck(), "独立全局手势单击/双击/长按互斥与取消")
         expect(MappingEngine.reservedDirectionSelfCheck(), "左右全局长按⌃方向键、一次触发与释放")
+        expect(ATVVOnRequestVoice.selfCheck(), "主机请求收音模式协商、实体松手关闭与退回原模式")
         expect(ATVVVoiceContinuation.selfCheck(), "持续按住时跨越遥控器音频分段，松手及重开失败时结束")
         expect(VoiceContinuityProbe.selfCheck(), "连续收音诊断有界观察、有效PCM与取消隔离")
         expect(MappingEngine.independentRoutingSelfCheck(), "全局手势优先于 App/浮层及音量连续调节")

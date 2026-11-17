@@ -142,19 +142,6 @@ struct CodexSessionsView: View {
                     .onChange(of: entries.map(\.identityKey)) { _, _ in scroll(proxy) }
                 }
             }
-            if currentTab?.isTools != true, let error = snapshot.error {
-                Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-            }
-            if currentTab?.isTools != true, let notice = snapshot.notice {
-                Text(notice).font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if currentTab?.isTools != true, let currentIndex = CodexSessionList.currentIndex(in: snapshot) {
-                let current = snapshot.entries[currentIndex]
-                Label("当前：\(current.groupTitle) · \(current.title)", systemImage: "location.fill")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
             Text("↑↓ 选择 · ←→ 切换标签 · OK 打开 · 返回 / Home / TV 取消")
                 .font(.caption).foregroundStyle(.secondary)
         }

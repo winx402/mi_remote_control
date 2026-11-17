@@ -17,9 +17,22 @@ struct CodexSessionList {
     }
 
     struct Selection: Equatable {
-        var tab = CodexSessionList.recentTab
-        // nil selects the New Chat action above the sessions.
-        var row: Int? = nil
+        enum Item: Equatable { case dot, newChat, row(Int) }
+        let tab: Int
+        let item: Item
+
+        var row: Int? {
+            if case let .row(index) = item { return index }
+            return nil
+        }
+
+        init(tab: Int = CodexSessionList.recentTab, row: Int? = nil) {
+            self.tab = tab
+            self.item = row.map(Item.row) ?? .newChat
+        }
+
+        private init(dotIn tab: Int) { self.tab = tab; self.item = .dot }
+        static let dot = Selection(dotIn: CodexSessionList.recentTab)
     }
 
     let tabs: [Tab]
@@ -49,7 +62,10 @@ struct CodexSessionList {
     func initialSelection(tab: Int, currentKey: String? = nil) -> Selection {
         if tabs[tab].isTools { return Selection(tab: tab, row: 0) }
         let entries = tabs[tab].entries
-        return Selection(tab: tab, row: entries.firstIndex { $0.identityKey == currentKey } ?? entries.indices.first)
+        if let current = entries.firstIndex(where: { $0.identityKey == currentKey }) {
+            return Selection(tab: tab, row: current)
+        }
+        return tabs[tab].isRecent ? .dot : Selection(tab: tab, row: entries.indices.first)
     }
 
     func moved(_ selection: Selection, key: RemoteKey) -> Selection {
@@ -62,9 +78,11 @@ struct CodexSessionList {
             let next = selection.tab + (key == .left ? -1 : 1)
             return tabs.indices.contains(next) ? initialSelection(tab: next) : selection
         case .up:
+            if tabs[selection.tab].isRecent, selection.row == nil { return .dot }
             guard let row = selection.row, row > 0 else { return Selection(tab: selection.tab) }
             return Selection(tab: selection.tab, row: row - 1)
         case .down:
+            if selection.item == .dot { return Selection(tab: selection.tab) }
             let rows = tabs[selection.tab].entries
             guard !rows.isEmpty else { return Selection(tab: selection.tab) }
             return Selection(tab: selection.tab, row: min((selection.row ?? -1) + 1, rows.count - 1))
@@ -78,6 +96,7 @@ struct CodexSessionList {
               let tab = tabs.firstIndex(where: { $0.id == previous.tabs[prior.tab].id }) else {
             return initialSelection(tab: Self.recentTab, currentKey: currentKey)
         }
+        if prior.item == .dot, tabs[tab].isRecent { return .dot }
         if tabs[tab].isTools { return Selection(tab: tab, row: prior.row ?? 0) }
         guard let oldRow = prior.row, !tabs[tab].entries.isEmpty else { return Selection(tab: tab) }
         let key = previous.entry(at: prior)?.identityKey
@@ -125,6 +144,11 @@ struct CodexSessionList {
         let kept = fresh.selection(after: list, prior: Selection(tab: 3, row: 0), browsed: true, currentKey: nil)
         return kept.tab == 4 && fresh.entry(at: kept)?.identityKey == remote.identityKey
             && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: remote.identityKey) == Selection(tab: 1, row: 1)
-            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == Selection(tab: 1, row: 0)
+            && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == .dot
+            && list.moved(Selection(tab: Self.recentTab), key: .up) == .dot
+            && list.moved(.dot, key: .up) == .dot
+            && list.moved(.dot, key: .down) == Selection(tab: Self.recentTab)
+            && fresh.selection(after: list, prior: .dot, browsed: true, currentKey: remote.identityKey) == .dot
+            && empty.initialSelection(tab: Self.recentTab) == .dot
     }
 }

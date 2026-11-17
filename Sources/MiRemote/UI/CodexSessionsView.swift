@@ -6,7 +6,9 @@ struct CodexSessionsView: View {
     let list: CodexSessionList
     let tabIndex: Int
     let selected: Int?
-    var isCreating = false
+    var dotSelected = false
+    let onDot: () -> Void
+    var isLaunching = false
     let onTool: (CodexSessionList.Tool) -> Void
     let onNewChat: (String) -> Void
     let onTabSelected: (Int) -> Void
@@ -43,10 +45,33 @@ struct CodexSessionsView: View {
             }
             if !list.tabs.isEmpty {
                 projectTabs
+                if currentTab?.isRecent == true {
+                    Button(action: onDot) {
+                        HStack(spacing: 10) {
+                            if isLaunching && dotSelected {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "bubble.left.fill")
+                            }
+                            Text("你的 Dot").fontWeight(.medium)
+                            Spacer()
+                            Image(systemName: "pin.fill").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12).frame(height: 40)
+                        .background(dotSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.06),
+                                    in: RoundedRectangle(cornerRadius: Radius.small))
+                        .overlay(RoundedRectangle(cornerRadius: Radius.small)
+                            .stroke(dotSelected ? Color.accentColor : Color.clear, lineWidth: 2))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isLaunching)
+                    .accessibilityLabel("你的 Dot，置顶会话")
+                    .accessibilityAddTraits(dotSelected ? .isSelected : [])
+                }
                 if let tab = currentTab, !tab.isTools {
                     Button { onNewChat(tab.id) } label: {
                         HStack(spacing: 8) {
-                            if isCreating {
+                            if isLaunching && !dotSelected {
                                 ProgressView().controlSize(.small)
                             } else {
                                 Image(systemName: "square.and.pencil")
@@ -57,14 +82,14 @@ struct CodexSessionsView: View {
                                 .foregroundStyle(.secondary).lineLimit(1)
                         }
                         .padding(.horizontal, 12).frame(height: 38)
-                        .background(selected == nil ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.06),
+                        .background(selected == nil && !dotSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.06),
                                     in: RoundedRectangle(cornerRadius: Radius.small))
                         .overlay(RoundedRectangle(cornerRadius: Radius.small)
-                            .stroke(selected == nil ? Color.accentColor : Color.clear, lineWidth: 2))
+                            .stroke(selected == nil && !dotSelected ? Color.accentColor : Color.clear, lineWidth: 2))
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCreating)
-                    .accessibilityAddTraits(selected == nil ? .isSelected : [])
+                    .disabled(isLaunching)
+                    .accessibilityAddTraits(selected == nil && !dotSelected ? .isSelected : [])
                 }
             }
             if currentTab?.isTools == true {
@@ -95,7 +120,7 @@ struct CodexSessionsView: View {
                     Image(systemName: snapshot.error == nil ? "text.bubble" : "exclamationmark.bubble")
                         .font(.system(size: 30)).foregroundStyle(.secondary)
                     Text(snapshot.isLoading ? "正在读取会话…"
-                         : snapshot.error == nil ? "没有可打开的会话" : "无法读取会话")
+                         : snapshot.error != nil ? "无法读取会话" : currentTab?.isRecent == true ? "还没有最近会话" : "没有可打开的会话")
                         .font(.body)
                 }
                 .frame(maxWidth: .infinity).frame(height: list.tabs.count > 1 ? 360 : 150)

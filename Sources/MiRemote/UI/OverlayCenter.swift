@@ -146,7 +146,7 @@ final class OverlayUIState: ObservableObject {
     @Published var wheelIndex = 0
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexList = CodexSessionList(entries: [])
-    @Published var isCreatingCodexChat = false
+    @Published var isLaunchingCodexChat = false
     @Published var codexSelection = CodexSessionList.Selection()
     @Published var powerMenu = PowerMenuState()
     @Published var televisionPowerStatus: String?
@@ -250,7 +250,7 @@ final class OverlayCenter {
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexList = CodexSessionList(entries: [])
     private var codexSelection = CodexSessionList.Selection()
-    private var creatingCodexChat: Task<Void, Never>?
+    private var codexLaunchTask: Task<Void, Never>?
     private var browsedSessions = false
     private var powerMenu = PowerMenuState()
     private var powerApplication: NSRunningApplication?
@@ -463,7 +463,7 @@ final class OverlayCenter {
         case .codexSessions:
             let identity = CodexSessionIdentity.capture()
             browsedSessions = false
-            codexSelection = CodexSessionList.Selection()
+            codexSelection = .dot
             codexSnapshot = CodexSessions.Snapshot(isLoading: true)
             codexList = CodexSessionList(entries: [])
             showPanel()
@@ -521,8 +521,8 @@ final class OverlayCenter {
         powerOKHeld = false
         if dismissTV { XiaomiTVController.shared.dismissPowerMenu(matching: televisionConfiguration) }
         else if abandoningTV { XiaomiTVController.shared.abandonMenuNavigation(matching: televisionConfiguration) }
-        creatingCodexChat?.cancel()
-        creatingCodexChat = nil
+        codexLaunchTask?.cancel()
+        codexLaunchTask = nil
         codexSessions.cancel()
         codexSnapshot = CodexSessions.Snapshot()
         codexList = CodexSessionList(entries: [])
@@ -1483,7 +1483,7 @@ final class OverlayCenter {
     // MARK: Codex 项目会话列表
 
     private func codexStep(_ key: RemoteKey) {
-        guard creatingCodexChat == nil else { return }
+        guard codexLaunchTask == nil else { return }
         browsedSessions = true
         codexSelection = codexList.moved(codexSelection, key: key)
         restartOverlayIdleTimer()
@@ -1491,7 +1491,7 @@ final class OverlayCenter {
     }
 
     private func selectCodexTab(_ index: Int) {
-        guard active == .codexSessions, creatingCodexChat == nil, codexList.tabs.indices.contains(index), index != codexSelection.tab else { return }
+        guard active == .codexSessions, codexLaunchTask == nil, codexList.tabs.indices.contains(index), index != codexSelection.tab else { return }
         browsedSessions = true
         codexSelection = codexList.initialSelection(tab: index)
         restartOverlayIdleTimer()
@@ -1499,23 +1499,39 @@ final class OverlayCenter {
     }
 
     private func createCodexChat(tabID: String) {
-        guard active == .codexSessions, creatingCodexChat == nil,
+        guard active == .codexSessions, codexLaunchTask == nil,
               codexList.tabs.indices.contains(codexSelection.tab) else { return }
         let tab = codexList.tabs[codexSelection.tab]
         guard !tab.isTools, tab.id == tabID else { return }
-        browsedSessions = true
-        codexSelection.row = nil
-        restartOverlayIdleTimer()
-        creatingCodexChat = Task { @MainActor [weak self] in
-            guard !Task.isCancelled else { return }
+        launchCodexChat(selection: .init(tab: codexSelection.tab)) {
             let opened = await CodexSessions.openNew(in: tab.project)
+            return opened ? nil : CodexSessions.newSessionFailure ?? "无法打开新会话，请重试。"
+        }
+    }
+
+    private func openCodexDot() {
+        guard active == .codexSessions, codexList.tabs[codexSelection.tab].isRecent else { return }
+        launchCodexChat(selection: .dot) {
+            await CodexDot.open() ? nil : "无法打开「你的 Dot」，请确认 Codex 侧栏中有此入口。"
+        }
+    }
+
+    private func launchCodexChat(selection: CodexSessionList.Selection,
+                                 action: @escaping @MainActor () async -> String?) {
+        guard codexLaunchTask == nil else { return }
+        browsedSessions = true
+        codexSelection = selection
+        restartOverlayIdleTimer()
+        codexLaunchTask = Task { @MainActor [weak self] in
+            guard !Task.isCancelled else { return }
+            let failure = await action()
             guard !Task.isCancelled, let self, self.active == .codexSessions else { return }
-            self.creatingCodexChat = nil
-            if opened {
-                self.close()
-            } else {
-                self.codexSnapshot.error = CodexSessions.newSessionFailure ?? "无法打开新会话，请重试。"
+            self.codexLaunchTask = nil
+            if let failure {
+                self.codexSnapshot.error = failure
                 self.sync(animated: false)
+            } else {
+                self.close()
             }
         }
         sync(animated: false)
@@ -1544,11 +1560,12 @@ final class OverlayCenter {
                 }
                 return
             }
+            if codexSelection.item == .dot { openCodexDot(); return }
             if codexSelection.row == nil {
                 createCodexChat(tabID: codexList.tabs[codexSelection.tab].id)
                 return
             }
-            guard creatingCodexChat == nil, let target = codexList.entry(at: codexSelection) else { return }
+            guard codexLaunchTask == nil, let target = codexList.entry(at: codexSelection) else { return }
             if CodexSessions.open(target) {
                 close()
             } else {
@@ -1586,7 +1603,7 @@ final class OverlayCenter {
             uiState.codexSnapshot = codexSnapshot
             uiState.codexList = codexList
             uiState.codexSelection = codexSelection
-            uiState.isCreatingCodexChat = creatingCodexChat != nil
+            uiState.isLaunchingCodexChat = codexLaunchTask != nil
             uiState.powerMenu = powerMenu
             uiState.televisionPowerStatus = televisionPowerStatus
             uiState.powerConfirmingID = powerConfirmingID
@@ -1619,6 +1636,7 @@ final class OverlayCenter {
             onDouyinBack: { [weak self] in self?.backFromDouyinMenu() },
             onDouyinAction: { [weak self] in self?.performDouyinAction($0) },
             onCodexTool: { [weak self] in self?.runCodexTool($0) },
+            onCodexDot: { [weak self] in self?.openCodexDot() },
             onCodexNewChat: { [weak self] in self?.createCodexChat(tabID: $0) },
             onCodexTabSelected: { [weak self] in self?.selectCodexTab($0) },
             onMenuSelect: { [weak self] in self?.selectMenuEntry($0) },
@@ -2021,6 +2039,7 @@ private struct OverlayRootView: View {
     let onDouyinBack: () -> Void
     let onDouyinAction: (DouyinMenuItem) -> Void
     let onCodexTool: (CodexSessionList.Tool) -> Void
+    let onCodexDot: () -> Void
     let onCodexNewChat: (String) -> Void
     let onCodexTabSelected: (Int) -> Void
     let onMenuSelect: (Int) -> Void
@@ -2054,7 +2073,8 @@ private struct OverlayRootView: View {
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, tabIndex: state.codexSelection.tab,
-                                      selected: state.codexSelection.row, isCreating: state.isCreatingCodexChat, onTool: onCodexTool, onNewChat: onCodexNewChat, onTabSelected: onCodexTabSelected)
+                                      selected: state.codexSelection.row, dotSelected: state.codexSelection.item == .dot,
+                                      onDot: onCodexDot, isLaunching: state.isLaunchingCodexChat, onTool: onCodexTool, onNewChat: onCodexNewChat, onTabSelected: onCodexTabSelected)
                 case .computerPower:
                     let generation = state.powerGeneration
                     let inputGeneration = state.confirmationInputGeneration

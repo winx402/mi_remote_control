@@ -1578,13 +1578,14 @@ final class OverlayCenter {
         }
     }
 
-    private func performCodexSettingsOperation(_ operation: @escaping @MainActor () async throws -> Void) {
+    private func performCodexSettingsOperation(hidePanel: Bool = true,
+                                               _ operation: @escaping @MainActor () async throws -> Void) {
         guard active == .codexSettings, codexSettingsTask == nil else { return }
         codexSettingsEpoch &+= 1
         let epoch = codexSettingsEpoch
         uiState.codexSettings.busy = true
         uiState.codexSettings.error = nil
-        panel?.orderOut(nil)
+        if hidePanel { panel?.orderOut(nil) }
         codexSettingsTask = Task { @MainActor [weak self] in
             do { try await operation() }
             catch {
@@ -1603,22 +1604,18 @@ final class OverlayCenter {
     private func selectCodexSetting(_ field: CodexSessionSettings.Field) {
         guard active == .codexSettings, !uiState.codexSettings.busy,
               let context = uiState.codexSettings.snapshot?.context else { return }
-        uiState.codexSettings.selected = field == .model ? 0 : field == .effort ? 1 : 2
+        uiState.codexSettings.selected = field
         if uiState.codexSettings.expanded == field {
             uiState.codexSettings.collapse()
             return
         }
-        performCodexSettingsOperation {
+        performCodexSettingsOperation(hidePanel: field != .presets) {
             let options = try await CodexSessionSettings.options(field, context: context)
             try Task.checkCancellation()
             self.uiState.codexSettings.expanded = field
             self.uiState.codexSettings.options = options
             self.uiState.codexSettings.optionIndex = options.firstIndex(where: \.isSelected) ?? 0
         }
-    }
-
-    private func openCodexPlugins() {
-        selectCodexSetting(.plugins)
     }
 
     private func applyCodexSetting(_ option: CodexSessionSettings.Option) {
@@ -1632,7 +1629,7 @@ final class OverlayCenter {
                 self.uiState.codexSettings.snapshot = current
                 self.uiState.codexSettings.collapse()
             } catch {
-                if field == .effort, !Task.isCancelled {
+                if (field == .effort || field == .presets), !Task.isCancelled {
                     self.uiState.codexSettings.snapshot = try? CodexSessionSettings.snapshot(context)
                     self.uiState.codexSettings.collapse()
                 }
@@ -1671,10 +1668,8 @@ final class OverlayCenter {
             if uiState.codexSettings.expanded != nil {
                 let state = uiState.codexSettings
                 if state.options.indices.contains(state.optionIndex) { applyCodexSetting(state.options[state.optionIndex]) }
-            } else if uiState.codexSettings.selected == 2 {
-                openCodexPlugins()
             } else {
-                selectCodexSetting(uiState.codexSettings.selected == 0 ? .model : .effort)
+                selectCodexSetting(uiState.codexSettings.selected)
             }
         default: break
         }
@@ -1769,7 +1764,6 @@ final class OverlayCenter {
             onDouyinAction: { [weak self] in self?.performDouyinAction($0) },
             onCodexSettingsField: { [weak self] in self?.selectCodexSetting($0) },
             onCodexSettingsOption: { [weak self] in self?.applyCodexSetting($0) },
-            onCodexPlugins: { [weak self] in self?.openCodexPlugins() },
             onCodexSettingsRetry: { [weak self] in self?.reloadCodexSettings() },
             onCodexSettingsBack: { [weak self] in self?.backFromCodexSettings() },
             onCodexTool: { [weak self] in self?.runCodexTool($0) },
@@ -2179,7 +2173,6 @@ private struct OverlayRootView: View {
     let onDouyinAction: (DouyinMenuItem) -> Void
     let onCodexSettingsField: (CodexSessionSettings.Field) -> Void
     let onCodexSettingsOption: (CodexSessionSettings.Option) -> Void
-    let onCodexPlugins: () -> Void
     let onCodexSettingsRetry: () -> Void
     let onCodexSettingsBack: () -> Void
     let onCodexTool: (CodexSessionList.Tool) -> Void
@@ -2218,7 +2211,7 @@ private struct OverlayRootView: View {
                 case .codexSettings:
                     CodexSessionSettingsView(state: state.codexSettings,
                         onField: onCodexSettingsField, onOption: onCodexSettingsOption,
-                        onPlugins: onCodexPlugins, onBack: onCodexSettingsBack, onRetry: onCodexSettingsRetry)
+                        onBack: onCodexSettingsBack, onRetry: onCodexSettingsRetry)
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, tabIndex: state.codexSelection.tab,
                                       selected: state.codexSelection.row, dotSelected: state.codexSelection.item == .dot,

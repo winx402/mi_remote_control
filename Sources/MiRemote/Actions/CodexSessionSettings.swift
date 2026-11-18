@@ -5,7 +5,7 @@ import OSLog
 
 @MainActor
 enum CodexSessionSettings {
-    enum Field { case model, effort, plugins }
+    enum Field: CaseIterable { case presets, model, effort, plugins }
 
     struct Context {
         fileprivate let pid: pid_t
@@ -93,6 +93,24 @@ enum CodexSessionSettings {
         }
     }
 
+    private enum Preset: String, CaseIterable {
+        case solExtraHigh, astraMedium
+
+        var model: String {
+            switch self {
+            case .solExtraHigh: "GPT-6.2 Sol"
+            case .astraMedium: "GPT-6.2 Astra"
+            }
+        }
+
+        var effort: Effort {
+            switch self {
+            case .solExtraHigh: .xhigh
+            case .astraMedium: .medium
+            }
+        }
+    }
+
     private static let addLabels: Set<String> = ["添加文件等内容", "加入檔案等內容", "新增檔案等內容", "Add files and more"]
     private static let modelLabels: Set<String> = ["选择模型", "選擇模型", "選取模型", "Select model"]
     private static let effortLabels: Set<String> = ["选择推理强度", "選取推理強度", "選擇推理強度", "Select effort"]
@@ -125,6 +143,13 @@ enum CodexSessionSettings {
         busy = true
         defer { busy = false }
         let current = try snapshot(context)
+        if field == .presets {
+            return Preset.allCases.map { preset in
+                Option(id: preset.rawValue, label: "\(preset.model) · \(preset.effort.labels[0])",
+                       isSelected: matchesModel(current.model, preset.model) && preset.effort.labels.contains(current.effort),
+                       isEnabled: true)
+            }
+        }
         if field == .effort {
             // Model metadata describes available choices. The live slider is only
             // needed when applying one, and may be hidden on the model list page.
@@ -152,20 +177,22 @@ enum CodexSessionSettings {
         defer { busy = false }
         let current = try snapshot(context)
         guard option.isEnabled else { throw Failure.option }
-        if field == .effort {
+        switch field {
+        case .presets:
+            guard let preset = Preset(rawValue: option.id) else { throw Failure.option }
+            return try await applyPreset(preset, from: current)
+        case .model:
+            return try await applyModel(named: option.id, from: current)
+        case .effort:
             guard let target = Effort(rawValue: option.id) else { throw Failure.option }
-            return try await applyEffort(target, from: current)
-        }
-        return try await withMenu(field, context: context) { trigger in
-            let rows = try await rows(field, trigger: trigger, context: context)
-            guard let row = rows.first(where: { $0.option.id == option.id && $0.option.isEnabled }) else {
-                throw Failure.option
-            }
-            if field == .model, row.option.isSelected {
-                try await close(trigger, context: context)
-                return try snapshot(context)
-            }
-            if field == .plugins {
+            guard let catalog = await effortCatalog(for: current.model, context: context) else { throw Failure.effort }
+            return try await applyEffort(target, from: current, catalog: catalog)
+        case .plugins:
+            return try await withMenu(.plugins, context: context) { trigger in
+                let rows = try await rows(.plugins, trigger: trigger, context: context)
+                guard let row = rows.first(where: { $0.option.id == option.id && $0.option.isEnabled }) else {
+                    throw Failure.option
+                }
                 let priorChips = countChips(for: row.option, context: context)
                 try await clickPlugin(row, trigger: trigger, context: context)
                 try await wait(context) {
@@ -173,10 +200,34 @@ enum CodexSessionSettings {
                 }
                 return try snapshot(context)
             }
+        }
+    }
+
+    private static func applyPreset(_ preset: Preset, from initial: Snapshot) async throws -> Snapshot {
+        if matchesModel(initial.model, preset.model), preset.effort.labels.contains(initial.effort) { return initial }
+        // Check the target model's effort before writing either setting.
+        guard let catalog = await effortCatalog(for: preset.model, context: initial.context),
+              catalog.contains(preset.effort) else { throw Failure.effort }
+        try Task.checkCancellation()
+        let current = try snapshot(initial.context)
+        let selected = try await applyModel(named: preset.model, from: current)
+        return try await applyEffort(preset.effort, from: selected, catalog: catalog)
+    }
+
+    private static func applyModel(named model: String, from current: Snapshot) async throws -> Snapshot {
+        if matchesModel(current.model, model) { return current }
+        let context = current.context
+        return try await withMenu(.model, context: context) { trigger in
+            let rows = try await rows(.model, trigger: trigger, context: context)
+            let matches = rows.filter { matchesModel($0.option.id, model) && $0.option.isEnabled }
+            guard matches.count == 1, let row = matches.first else {
+                throw Failure.option
+            }
             try press(row.element, context: context)
-            try await close(trigger, context: context)
-            return try await wait(context) {
-                guard let result = try? snapshot(context), matchesModel(result.model, option.label) else { return nil }
+            try await close(try validate(context).picker, context: context)
+            return try await wait(context, attempts: 55) {
+                guard let picker = (try? validate(context))?.picker, enabled(picker), expanded(picker) == false,
+                      let result = try? snapshot(context), matchesModel(result.model, model) else { return nil }
                 return result
             }
         }
@@ -418,9 +469,8 @@ enum CodexSessionSettings {
         return menus.count == 1 ? menus[0] : nil
     }
 
-    private static func applyEffort(_ target: Effort, from initial: Snapshot) async throws -> Snapshot {
+    private static func applyEffort(_ target: Effort, from initial: Snapshot, catalog: [Effort]) async throws -> Snapshot {
         let context = initial.context
-        guard let catalog = await effortCatalog(for: initial.model, context: context) else { throw Failure.effort }
         guard let desired = catalog.firstIndex(of: target) else { throw Failure.option }
         var saved = try snapshot(context)
         guard matchesModel(saved.model, initial.model),

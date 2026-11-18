@@ -3,7 +3,7 @@ import SwiftUI
 /// Dropdown state belongs to this open panel, never persisted as app defaults.
 struct CodexSessionSettingsPanel {
     var snapshot: CodexSessionSettings.Snapshot?
-    var selected = 0
+    var selected: CodexSessionSettings.Field = .presets
     var expanded: CodexSessionSettings.Field?
     var options: [CodexSessionSettings.Option] = []
     var optionIndex = 0
@@ -14,8 +14,9 @@ struct CodexSessionSettingsPanel {
         let delta = key == .up || key == .left ? -1 : 1
         if expanded != nil {
             optionIndex = CodexSessions.movedIndex(optionIndex, delta: delta, count: options.count)
-        } else {
-            selected = CodexSessions.movedIndex(selected, delta: delta, count: 3)
+        } else if let index = CodexSessionSettings.Field.allCases.firstIndex(of: selected) {
+            let fields = CodexSessionSettings.Field.allCases
+            selected = fields[CodexSessions.movedIndex(index, delta: delta, count: fields.count)]
         }
     }
 
@@ -30,7 +31,6 @@ struct CodexSessionSettingsView: View {
     let state: CodexSessionSettingsPanel
     let onField: (CodexSessionSettings.Field) -> Void
     let onOption: (CodexSessionSettings.Option) -> Void
-    let onPlugins: () -> Void
     let onBack: () -> Void
     let onRetry: () -> Void
 
@@ -43,22 +43,10 @@ struct CodexSessionSettingsView: View {
                 if state.busy { ProgressView().controlSize(.small) }
             }
             VStack(spacing: 10) {
-                fieldRow(.model, title: "模型", value: state.snapshot?.model ?? "读取中…", index: 0)
-                fieldRow(.effort, title: "思考强度", value: state.snapshot?.effort ?? "读取中…", index: 1)
-                Button(action: onPlugins) {
-                    HStack {
-                        Image(systemName: "puzzlepiece.extension")
-                        Text("添加插件")
-                        Spacer()
-                        Image(systemName: state.expanded == .plugins ? "chevron.up" : "chevron.down").foregroundStyle(.secondary)
-                    }
-                    .padding(14)
-                    .background(rowFill(state.selected == 2), in: RoundedRectangle(cornerRadius: Radius.small))
-                    .overlay(RoundedRectangle(cornerRadius: Radius.small)
-                        .stroke(state.selected == 2 ? Color.accentColor : .clear, lineWidth: 2))
-                }
-                .buttonStyle(.plain)
-                .disabled(state.busy || state.snapshot == nil)
+                fieldRow(.presets, title: "常用模型和强度", icon: "star")
+                fieldRow(.model, title: "模型", value: state.snapshot?.model ?? "读取中…")
+                fieldRow(.effort, title: "思考强度", value: state.snapshot?.effort ?? "读取中…")
+                fieldRow(.plugins, title: "添加插件", icon: "puzzlepiece.extension")
             }
             if let field = state.expanded {
                 Divider()
@@ -66,7 +54,10 @@ struct CodexSessionSettingsView: View {
                     Text(field == .plugins ? "当前没有可添加的插件" : "当前模型没有可调整的选项")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Text(field == .model ? "选择模型" : field == .effort ? "选择思考强度" : "添加插件到当前输入框").font(.subheadline).foregroundStyle(.secondary)
+                if field != .presets {
+                    Text(field == .model ? "选择模型" : field == .effort ? "选择思考强度" : "添加插件到当前输入框")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 4) {
@@ -116,18 +107,20 @@ struct CodexSessionSettingsView: View {
         .shadow(radius: 24, y: 8)
     }
 
-    private func fieldRow(_ field: CodexSessionSettings.Field, title: String, value: String, index: Int) -> some View {
+    private func fieldRow(_ field: CodexSessionSettings.Field, title: String, value: String? = nil, icon: String? = nil) -> some View {
         Button { onField(field) } label: {
             HStack {
-                Text(title).frame(width: 100, alignment: .leading)
+                if let icon { Image(systemName: icon) }
+                Text(title)
                 Spacer()
-                Text(value).lineLimit(2).multilineTextAlignment(.trailing)
-                Image(systemName: state.expanded == field ? "chevron.up" : "chevron.down").font(.caption)
+                if let value { Text(value).lineLimit(2).multilineTextAlignment(.trailing) }
+                Image(systemName: state.expanded == field ? "chevron.up" : "chevron.down")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             .padding(14)
-            .background(rowFill(state.selected == index), in: RoundedRectangle(cornerRadius: Radius.small))
+            .background(rowFill(state.selected == field), in: RoundedRectangle(cornerRadius: Radius.small))
             .overlay(RoundedRectangle(cornerRadius: Radius.small)
-                .stroke(state.selected == index ? Color.accentColor : .clear, lineWidth: 2))
+                .stroke(state.selected == field ? Color.accentColor : .clear, lineWidth: 2))
         }
         .buttonStyle(.plain)
         .disabled(state.busy || state.snapshot == nil)

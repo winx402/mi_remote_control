@@ -61,6 +61,10 @@ enum CodexSessionSettings {
 
     private struct Power {
         let item: AXUIElement
+        let reading: PowerReading?
+    }
+
+    private struct PowerReading {
         let effort: Effort
         let index: Int
         let count: Int
@@ -93,6 +97,7 @@ enum CodexSessionSettings {
     private static let modelLabels: Set<String> = ["选择模型", "選擇模型", "選取模型", "Select model"]
     private static let effortLabels: Set<String> = ["选择推理强度", "選取推理強度", "選擇推理強度", "Select effort"]
     private static let powerLabels: Set<String> = ["强度", "強度", "Power"]
+    private static let resetModelLabels: Set<String> = ["重置为默认", "重設為預設", "重置為預設", "Reset to default"]
     private static let pluginLabels: Set<String> = ["插件", "外掛程式", "外掛", "Plugins"]
     private static let trace = Logger(subsystem: "com.miremote.controller", category: "CodexEffort")
     private static var busy = false
@@ -188,7 +193,8 @@ enum CodexSessionSettings {
                 expanded(trigger) == true ? true : nil
             }
             let value = try await operation(trigger)
-            try await close(trigger, context: context)
+            let liveTrigger = (try? validate(context))?.trigger(field) ?? trigger
+            try await close(liveTrigger, context: context)
             return value
         } catch {
             // Cleanup only the menu we opened and only while its original chat is focused.
@@ -312,13 +318,7 @@ enum CodexSessionSettings {
             let entry = try await wait(context, attempts: 40, failure: .effortControl) {
                 () -> Entry? in
                 guard let menu = effortMenu(context) else { return nil }
-                let scope = powerScope(menu)
-                if let power = currentPower(in: scope, model: model) { return .power(power) }
-                if let item = powerItem(in: scope) {
-                    stage = enabled(item) ? "power-status-unreadable" : "power-row-disabled"
-                } else {
-                    stage = "power-row-missing"
-                }
+                if let power = currentPower(in: menu, model: model, stage: &stage) { return .power(power) }
                 let rows = descendants(menu, depth: 9, limit: 160) { item in
                     role(item) == "AXMenuItem" && enabled(item) && matchesModel(label(item), model) &&
                         !(string(item, "AXMenuItemMarkChar") ?? "").isEmpty
@@ -332,7 +332,8 @@ enum CodexSessionSettings {
                 // Activating the already checked model returns to the compact slider view.
                 try press(row, context: context)
                 return try await wait(context, attempts: 40, failure: .effortControl) {
-                    livePower(context, model: model)
+                    guard let menu = effortMenu(context) else { return nil }
+                    return currentPower(in: menu, model: model, stage: &stage)
                 }
             }
         } catch {
@@ -351,35 +352,50 @@ enum CodexSessionSettings {
         scope.first(where: { ["AXMenuItem", "AXSlider"].contains(role($0)) && powerLabels.contains(label($0)) })
     }
 
-    private static func livePower(_ context: Context, model: String) -> Power? {
-        effortMenu(context).flatMap { currentPower(in: powerScope($0), model: model) }
-    }
-
-    private static func currentPower(in scope: [AXUIElement], model: String) -> Power? {
-        guard let item = powerItem(in: scope), enabled(item) else { return nil }
-        for status in scope where string(status, kAXSubroleAttribute) == "AXApplicationStatus" {
-            // Electron can expose the label and position as one text node or split children.
-            let labels = staticLabels(status, depth: 4)
-            for text in [labels.joined(separator: " "), label(status), string(status, kAXValueAttribute) ?? ""] {
-                guard let reading = powerReading(text, model: model) else { continue }
-                return Power(item: item, effort: reading.effort, index: reading.index, count: reading.count)
-            }
+    private static func currentPower(in menu: AXUIElement, model: String, stage: inout String) -> Power? {
+        let scope = powerScope(menu)
+        guard let item = powerItem(in: scope) else { stage = "power-row-missing"; return nil }
+        guard enabled(item) else { stage = "power-row-disabled"; return nil }
+        if let reading = readPowerStatus(in: menu, scope: scope, model: model) {
+            return Power(item: item, reading: reading)
         }
+        // A reset-to-default action identifies an explicit model selection. Check
+        // the displayed model as well before treating this as a single-model slider.
+        let reset = scope.contains { role($0) == "AXMenuItem" && resetModelLabels.contains(label($0)) }
+        let header = scope.first { role($0) == "AXMenuItem" && modelLabels.contains(label($0)) }
+        if reset, let header, staticLabels(header, depth: 5).contains(where: { matchesPowerModel($0, model) }) {
+            return Power(item: item, reading: nil)
+        }
+        stage = reset ? "power-model-header-unreadable" : "power-status-unreadable"
         return nil
     }
 
-    private static func powerReading(_ text: String, model: String) -> (effort: Effort, index: Int, count: Int)? {
+    private static func readPowerStatus(in menu: AXUIElement, scope: [AXUIElement], model: String) -> PowerReading? {
+        for status in scope where string(status, kAXSubroleAttribute) == "AXApplicationStatus" {
+            let candidates = [staticLabels(status, depth: 4).joined(separator: " "), label(status),
+                              string(status, kAXValueAttribute) ?? ""]
+            if let reading = candidates.lazy.compactMap({ powerReading($0, model: model) }).first { return reading }
+        }
+        // Chromium sometimes exposes the announcement as ordinary text instead of AXApplicationStatus.
+        return staticLabels(menu, depth: 10).lazy.compactMap { powerReading($0, model: model) }.first
+    }
+
+    private static func matchesPowerModel(_ label: String, _ model: String) -> Bool {
+        let key = normalizedModel(label)
+        let expected = normalizedModel(model)
+        return key == expected || "gpt" + key == expected
+    }
+
+    private static func powerReading(_ text: String, model: String) -> PowerReading? {
         let parts = text.components(separatedBy: .init(charactersIn: ",，、"))
         let selection = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
         let numbers = parts.dropFirst().joined(separator: " ").split { !$0.isNumber }.compactMap { Int($0) }
         guard numbers.count == 2, numbers[0] > 0, numbers[0] <= numbers[1],
               numbers[1] <= Effort.allCases.count else { return nil }
-        let modelKey = normalizedModel(model)
         for effort in Effort.allCases {
             for name in effort.labels where selection.hasSuffix(" " + name) {
-                let key = normalizedModel(String(selection.dropLast(name.count + 1)))
-                if key == modelKey || "gpt" + key == modelKey {
-                    return (effort, numbers[0] - 1, numbers[1])
+                if matchesPowerModel(String(selection.dropLast(name.count + 1)), model) {
+                    return PowerReading(effort: effort, index: numbers[0] - 1, count: numbers[1])
                 }
             }
         }
@@ -415,38 +431,38 @@ enum CodexSessionSettings {
         for index in stride(from: start, to: desired, by: direction) {
             let expected = index + direction
             let previous = saved
-            saved = try await withMenu(.effort, context: context) { trigger in
+            saved = try await withMenu(.effort, context: context) { _ in
                 let power = try await readPower(context, model: previous.model)
-                guard power.index == index, power.count == catalog.count, power.effort == catalog[index] else {
-                    trace.notice("Effort catalog mismatch: UI index \(power.index, privacy: .public) of \(power.count, privacy: .public), expected index \(index, privacy: .public) of \(catalog.count, privacy: .public)")
+                if let reading = power.reading,
+                   reading.index != index || reading.count != catalog.count || reading.effort != catalog[index] {
+                    trace.notice("Effort catalog mismatch: UI index \(reading.index, privacy: .public) of \(reading.count, privacy: .public), expected index \(index, privacy: .public) of \(catalog.count, privacy: .public)")
                     throw Failure.effort
                 }
-                try await focusPower(power.item, context: context)
-                guard postKey(direction > 0 ? 124 : 123, context: context) else { throw Failure.effort }
-
-                // The live status can show a preview before the composer saves it.
-                // Confirm in the native menu, then read the collapsed composer before moving again.
-                let menuClosed = try await wait(context, attempts: 30, failure: .effortNotApplied) {
-                    if expanded(trigger) == false { return true }
-                    guard let fresh = livePower(context, model: previous.model), fresh.index == expected,
-                          fresh.effort == catalog[expected], fresh.count == catalog.count else { return nil }
-                    return false
-                }
-                if !menuClosed {
-                    let app = AXUIElementCreateApplication(context.pid)
-                    guard let fresh = livePower(context, model: previous.model), fresh.index == expected,
-                          fresh.effort == catalog[expected], fresh.count == catalog.count,
-                          let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, fresh.item),
-                          postKey(36, context: context) else { throw Failure.effortNotApplied }
-                }
-                return try await wait(context, attempts: 45, failure: .effortNotApplied) {
-                    guard expanded(trigger) == false, enabled(trigger),
-                          let result = try? snapshot(context), matchesModel(result.model, previous.model),
-                          catalog[expected].labels.contains(result.effort) else { return nil }
-                    return result
+                var stage = "focus"
+                do {
+                    try await focusPower(power.item, context: context)
+                    stage = "arrow"
+                    guard postKey(direction > 0 ? 124 : 123, context: context) else { throw Failure.effort }
+                    // Codex commits the arrow change on keydown. Allow the renderer to
+                    // process it, dismiss the menu, and verify the saved composer value.
+                    stage = "dismiss"
+                    try await Task.sleep(for: .milliseconds(350))
+                    try await close(try validate(context).picker, context: context)
+                    stage = "composer-confirmation"
+                    return try await wait(context, attempts: 55, failure: .effortNotApplied) {
+                        guard let picker = (try? validate(context))?.picker,
+                              expanded(picker) == false, enabled(picker),
+                              let result = try? snapshot(context), matchesModel(result.model, previous.model),
+                              catalog[expected].labels.contains(result.effort) else { return nil }
+                        return result
+                    }
+                } catch {
+                    trace.notice("Effort step failed: \(stage, privacy: .public), expected \(catalog[expected].rawValue, privacy: .public)")
+                    throw error
                 }
             }
         }
+        trace.notice("Effort applied: \(target.rawValue, privacy: .public)")
         return saved
     }
 

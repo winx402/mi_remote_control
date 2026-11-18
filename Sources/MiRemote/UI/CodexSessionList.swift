@@ -7,6 +7,7 @@ struct CodexSessionList {
     struct Tab: Identifiable {
         var isTools: Bool { id == "tools" }
         var isRecent: Bool { id == "recent" }
+        var isProjectless: Bool { id == "projectless" }
 
         let id: String
         let title: String
@@ -50,7 +51,10 @@ struct CodexSessionList {
                        project: project, isRemote: project.hostID != nil, entries: entries)
         }
         let tools = Tab(id: "tools", title: "功能", hostTitle: nil, project: nil, isRemote: false, entries: [])
-        tabs = [tools, recent] + projects
+        let projectGroups = Set(sidebarProjects.map(\.groupID))
+        let projectless = Tab(id: "projectless", title: "无项目", hostTitle: nil, project: nil,
+                              isRemote: false, entries: newest.filter { !projectGroups.contains($0.groupID) })
+        tabs = [tools, recent, projectless] + projects
     }
 
     func entry(at selection: Selection) -> CodexSessions.Entry? {
@@ -121,28 +125,38 @@ struct CodexSessionList {
         let sidebar = [localProject, remoteProject, emptyProject]
         let historical = CodexSessions.Entry(id: "old-folder", name: nil, updatedAt: 0, projectID: "cwd:/old", projectName: "Old")
         let list = Self(entries: local + [remote, historical], sidebarProjects: sidebar)
-        guard empty.tabs.count == 2, empty.entry(at: Selection()) == nil,
-              list.tabs.count == 5, list.tabs[4].entries.isEmpty, list.tabs[1].entries.map(\.updatedAt) == [14,12,11,10,9,8,7,6,5,4],
-              list.tabs[2].entries.count == 12, list.tabs[3].isRemote,
+        guard empty.tabs.count == 3, empty.entry(at: Selection()) == nil,
+              list.tabs.count == 6, list.tabs[5].entries.isEmpty, list.tabs[1].entries.map(\.updatedAt) == [14,12,11,10,9,8,7,6,5,4],
+              list.tabs[3].entries.count == 12, list.tabs[4].isRemote,
               list.moved(Selection(tab: 1, row: 9), key: .down) == Selection(tab: 1, row: 9),
               list.moved(Selection(tab: 1, row: 9), key: .right) == Selection(tab: 2, row: 0),
-              list.entry(at: Selection(tab: 3, row: 0))?.identityKey == remote.identityKey else { return false }
+              list.entry(at: Selection(tab: 4, row: 0))?.identityKey == remote.identityKey else { return false }
         guard list.moved(Selection(tab: 1, row: 0), key: .up) == Selection(tab: 1),
               list.moved(Selection(tab: 1), key: .down) == Selection(tab: 1, row: 0),
-              list.initialSelection(tab: 4).row == nil,
-              list.tabs[1].project == nil, list.tabs[3].project?.hostID == "host",
-              list.tabs[4].project?.id == "empty",
-              list.selection(after: list, prior: Selection(tab: 3), browsed: true, currentKey: nil) == Selection(tab: 3)
+              list.initialSelection(tab: 5).row == nil,
+              list.tabs[1].project == nil, list.tabs[4].project?.hostID == "host",
+              list.tabs[5].project?.id == "empty",
+              list.selection(after: list, prior: Selection(tab: 4), browsed: true, currentKey: nil) == Selection(tab: 4)
         else { return false }
         let tools = list.moved(Selection(), key: .left)
         guard list.tabs[Selection().tab].isRecent, list.tabs[tools.tab].isTools, tools.row == 0,
               list.moved(tools, key: .down) == tools, list.moved(tools, key: .right).tab == Self.recentTab,
               list.selection(after: list, prior: tools, browsed: true, currentKey: nil) == tools else { return false }
+        let unassigned = (0..<15).map {
+            CodexSessions.Entry(id: "unassigned-\($0)", name: nil, updatedAt: Double($0),
+                                hostID: $0.isMultiple(of: 2) ? nil : "remote")
+        }
+        let all = Self(entries: local + unassigned + [historical], sidebarProjects: sidebar)
+        guard all.tabs[2].isProjectless, all.tabs[2].entries.count == 16,
+              all.tabs[2].entries.first?.id == "unassigned-14",
+              all.tabs[2].entries.contains(where: { $0.id == historical.id }),
+              !all.tabs[2].entries.contains(where: { $0.projectID == "p" }),
+              all.tabs[2].project == nil, all.tabs[1].entries.count == 10 else { return false }
         let earlier = CodexSessions.Entry(id: "extra", name: nil, updatedAt: 15, projectID: "a", projectName: "Alpha")
         let alpha = CodexSessionCatalog.Project(id: "a", name: "Alpha", hostID: nil, roots: [])
         let fresh = Self(entries: local + [remote, earlier], sidebarProjects: [alpha] + sidebar)
-        let kept = fresh.selection(after: list, prior: Selection(tab: 3, row: 0), browsed: true, currentKey: nil)
-        return kept.tab == 4 && fresh.entry(at: kept)?.identityKey == remote.identityKey
+        let kept = fresh.selection(after: list, prior: Selection(tab: 4, row: 0), browsed: true, currentKey: nil)
+        return kept.tab == 5 && fresh.entry(at: kept)?.identityKey == remote.identityKey
             && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: remote.identityKey) == Selection(tab: 1, row: 1)
             && fresh.selection(after: empty, prior: Selection(), browsed: false, currentKey: local[0].identityKey) == .dot
             && list.moved(Selection(tab: Self.recentTab), key: .up) == .dot

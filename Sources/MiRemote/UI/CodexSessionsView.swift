@@ -176,7 +176,7 @@ struct CodexSessionsView: View {
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
-                    Image(systemName: tab.isTools ? "wrench.and.screwdriver" : tab.isRecent ? "clock" : tab.isRemote ? "network" : "folder")
+                    Image(systemName: tab.isTools ? "wrench.and.screwdriver" : tab.isRecent ? "clock" : tab.isProjectless ? "tray" : tab.isRemote ? "network" : "folder")
                     Text(tab.title).fontWeight(isSelected ? .semibold : .regular)
                         .lineLimit(1).truncationMode(.middle)
                     if !tab.isTools { Text("\(tab.entries.count)").font(.caption).monospacedDigit() }
@@ -202,6 +202,7 @@ struct CodexSessionsView: View {
     private func subtitle(for tab: CodexSessionList.Tab) -> String {
         if tab.isTools { return "应用操作" }
         if tab.isRecent { return "按更新时间" }
+        if tab.isProjectless { return "全部会话" }
         guard tab.isRemote else { return "本机" }
         return tab.hostTitle.map { "远程 · " + $0 } ?? "远程"
     }
@@ -229,7 +230,7 @@ struct CodexSessionsView: View {
                 Text(entry.title)
                     .font(.body.weight(selected ? .semibold : .regular))
                     .lineLimit(2)
-                if currentTab?.isRecent == true {
+                if currentTab?.isRecent == true || currentTab?.isProjectless == true {
                     Text("\(entry.groupTitle) · \(entry.isRemote ? "远程 · " : "")\(entry.hostTitle)")
                         .font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)

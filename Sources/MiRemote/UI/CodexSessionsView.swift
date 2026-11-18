@@ -97,10 +97,10 @@ struct CodexSessionsView: View {
                     ForEach(Array(CodexSessionList.Tool.allCases.enumerated()), id: \.offset) { index, tool in
                         Button { onTool(tool) } label: {
                             HStack {
-                                Image(systemName: "arrow.down.circle")
+                                Image(systemName: tool.icon)
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("更新 Codex").fontWeight(.medium)
-                                    Text("用方向键选择更新窗口中的按钮，按 OK 确认")
+                                    Text(tool.title).fontWeight(.medium)
+                                    Text(tool.detail)
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()

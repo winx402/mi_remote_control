@@ -1,7 +1,12 @@
 import Foundation
 
 struct CodexSessionList {
-    enum Tool: CaseIterable { case updateCodex }
+    enum Tool: CaseIterable {
+        case sessionSettings, updateCodex
+        var title: String { self == .sessionSettings ? "当前会话设置" : "更新 Codex" }
+        var icon: String { self == .sessionSettings ? "slider.horizontal.3" : "arrow.down.circle" }
+        var detail: String { self == .sessionSettings ? "模型、思考强度与添加插件" : "用方向键选择更新窗口中的按钮，按 OK 确认" }
+    }
     static let recentTab = 1
 
     struct Tab: Identifiable {
@@ -140,7 +145,7 @@ struct CodexSessionList {
         else { return false }
         let tools = list.moved(Selection(), key: .left)
         guard list.tabs[Selection().tab].isRecent, list.tabs[tools.tab].isTools, tools.row == 0,
-              list.moved(tools, key: .down) == tools, list.moved(tools, key: .right).tab == Self.recentTab,
+              list.moved(tools, key: .down) == Selection(tab: 0, row: 1), list.moved(tools, key: .right).tab == Self.recentTab,
               list.selection(after: list, prior: tools, browsed: true, currentKey: nil) == tools else { return false }
         let unassigned = (0..<15).map {
             CodexSessions.Entry(id: "unassigned-\($0)", name: nil, updatedAt: Double($0),

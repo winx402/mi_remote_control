@@ -1,0 +1,628 @@
+import AppKit
+import ApplicationServices
+import CoreGraphics
+
+@MainActor
+enum CodexSessionSettings {
+    enum Field { case model, effort, plugins }
+
+    struct Context {
+        fileprivate let pid: pid_t
+        fileprivate let window: AXUIElement
+        fileprivate let title: String
+        fileprivate let web: AXUIElement
+        fileprivate let editor: AXUIElement
+    }
+
+    struct Snapshot {
+        let context: Context
+        let model: String
+        let effort: String
+    }
+
+    struct Option: Identifiable, Equatable {
+        let id: String
+        let label: String
+        let isSelected: Bool
+        let isEnabled: Bool
+    }
+
+    private enum Failure: LocalizedError {
+        case access, context, composer, menu, effort, option, verification
+
+        var errorDescription: String? {
+            switch self {
+            case .access: "需要辅助功能权限才能操作 Codex。"
+            case .context: "当前 Codex 会话已切换，请重新打开会话设置。"
+            case .composer: "当前 Codex 输入区没有可操作的模型设置。"
+            case .menu: "无法读取当前 Codex 菜单，请关闭菜单后重试。"
+            case .effort: "无法确认该模型当前可用的推理强度，请在 Codex 中调整。"
+            case .option: "所选项目已不可用，请重新打开下拉菜单。"
+            case .verification: "Codex 未确认所选项目，请核对当前会话。"
+            }
+        }
+    }
+
+    private struct Composer {
+        let picker: AXUIElement
+        let add: AXUIElement
+
+        func trigger(_ field: Field) -> AXUIElement { field == .plugins ? add : picker }
+    }
+
+    private struct Row {
+        let option: Option
+        let element: AXUIElement
+    }
+
+    private struct Power {
+        let item: AXUIElement
+        let model: String
+        let effort: Effort
+        let index: Int
+        let count: Int
+    }
+
+    private enum Effort: String, CaseIterable, Sendable {
+        case none, minimal, low, medium, high, xhigh, max, ultra, persistent
+
+        var labels: [String] {
+            switch self {
+            case .none: ["无", "None", "無"]
+            case .minimal: ["极低", "Minimal", "極低"]
+            case .low: ["轻度", "Low", "低", "輕度", "Light"]
+            case .medium: ["中", "Medium", "标准", "標準", "Standard"]
+            case .high: ["高", "High"]
+            case .xhigh: ["极高", "Extra High", "極高", "Extra high", "Very High"]
+            case .max: ["Max", "Maximum", "最高"]
+            case .ultra: ["Ultra"]
+            case .persistent: ["持续", "Persistent", "持續"]
+            }
+        }
+
+        func label(matching current: String) -> String {
+            current.unicodeScalars.contains(where: { (0x3400...0x9FFF).contains($0.value) })
+                ? labels[0] : labels.first(where: { $0.unicodeScalars.allSatisfy(\.isASCII) }) ?? labels[0]
+        }
+    }
+
+    private static let addLabels: Set<String> = ["添加文件等内容", "加入檔案等內容", "新增檔案等內容", "Add files and more"]
+    private static let modelLabels: Set<String> = ["选择模型", "選擇模型", "選取模型", "Select model"]
+    private static let effortLabels: Set<String> = ["选择推理强度", "選取推理強度", "選擇推理強度", "Select effort"]
+    private static let powerLabels: Set<String> = ["强度", "強度", "Power"]
+    private static let pluginLabels: Set<String> = ["插件", "外掛程式", "外掛", "Plugins"]
+    private static var busy = false
+
+    static func capture() async throws -> Snapshot {
+        guard AXIsProcessTrusted() else { throw Failure.access }
+        guard !busy, let running = NSWorkspace.shared.frontmostApplication,
+              running.bundleIdentifier == "com.openai.codex" else { throw Failure.context }
+        let app = AXUIElementCreateApplication(running.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.05)
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        guard let window = element(app, kAXFocusedWindowAttribute),
+              let bounds = frame(window), let title = string(window, kAXTitleAttribute),
+              let web = firstDescendant(window, depth: 10, limit: 40, matching: { role($0) == "AXWebArea" }) else {
+            throw Failure.composer
+        }
+        guard let (editor, _) = findComposer(in: web, bounds: bounds) else { throw Failure.composer }
+        let context = Context(pid: running.processIdentifier, window: window, title: title, web: web, editor: editor)
+        return try snapshot(context)
+    }
+
+    static func options(_ field: Field, context: Context) async throws -> [Option] {
+        guard !busy else { throw Failure.menu }
+        busy = true
+        defer { busy = false }
+        let current = try snapshot(context)
+        let catalog = field == .effort ? await effortCatalog(for: current.model, context: context) : nil
+        return try await withMenu(field, context: context) { trigger in
+            if field == .effort {
+                let power = try await readPower(context)
+                return try effortOptions(power, current: current, catalog: catalog)
+            }
+            let rows = try await rows(field, trigger: trigger, context: context)
+            return rows.map(\.option)
+        }
+    }
+
+    static func apply(_ field: Field, option: Option, context: Context) async throws -> Snapshot {
+        guard !busy else { throw Failure.menu }
+        busy = true
+        defer { busy = false }
+        let current = try snapshot(context)
+        guard option.isEnabled else { throw Failure.option }
+        let catalog = field == .effort ? await effortCatalog(for: current.model, context: context) : nil
+        return try await withMenu(field, context: context) { trigger in
+            if field == .effort {
+                let power = try await readPower(context)
+                let available = try effortOptions(power, current: current, catalog: catalog)
+                guard let desired = available.firstIndex(where: { $0.id == option.id && $0.isEnabled }) else {
+                    throw Failure.option
+                }
+                if desired != power.index {
+                    try await selectEffort(desired, starting: power, context: context)
+                }
+                try await close(trigger, context: context)
+                let result = try snapshot(context)
+                guard let effort = Effort(rawValue: option.id), effort.labels.contains(result.effort) else {
+                    throw Failure.verification
+                }
+                return result
+            }
+
+            let rows = try await rows(field, trigger: trigger, context: context)
+            guard let row = rows.first(where: { $0.option.id == option.id && $0.option.isEnabled }) else {
+                throw Failure.option
+            }
+            if field == .model, row.option.isSelected {
+                try await close(trigger, context: context)
+                return try snapshot(context)
+            }
+            if field == .plugins {
+                let priorChips = countChips(for: row.option, context: context)
+                try await clickPlugin(row, trigger: trigger, context: context)
+                try await wait(context) {
+                    expanded(trigger) == false && countChips(for: row.option, context: context) > priorChips ? true : nil
+                }
+                return try snapshot(context)
+            }
+            try press(row.element, context: context)
+            try await close(trigger, context: context)
+            return try await wait(context) {
+                guard let result = try? snapshot(context), matchesModel(result.model, option.label) else { return nil }
+                return result
+            }
+        }
+    }
+
+    private static func withMenu<T>(_ field: Field, context: Context,
+                                    operation: @MainActor (AXUIElement) async throws -> T) async throws -> T {
+        let composer = try validate(context)
+        let trigger = composer.trigger(field)
+        guard expanded(trigger) == false else { throw Failure.menu }
+        try press(trigger, context: context)
+        do {
+            try await wait(context) { expanded(trigger) == true ? true : nil }
+            let value = try await operation(trigger)
+            try await close(trigger, context: context)
+            return value
+        } catch {
+            // Cleanup only the menu we opened and only while its original chat is focused.
+            if expanded(trigger) == true, (try? validate(context)) != nil {
+                _ = postKey(53, context: context)
+            }
+            throw error
+        }
+    }
+
+    private static func rows(_ field: Field, trigger: AXUIElement, context: Context) async throws -> [Row] {
+        if field == .plugins {
+            return try await wait(context) {
+                guard expanded(trigger) == true else { return nil }
+                return pluginRows(context)
+            }
+        }
+
+        let menu = try await wait(context) { modelMenu(context) }
+        if let selector = firstDescendant(menu, depth: 7, limit: 45,
+            matching: { role($0) == "AXMenuItem" && modelLabels.contains(label($0)) }) {
+            try press(selector, context: context)
+        }
+        return try await wait(context) {
+            guard let menu = modelMenu(context) else { return nil }
+            let items = descendants(menu, depth: 8, limit: 140) { role($0) == "AXMenuItem" }
+            let rows: [Row] = items.compactMap { item in
+                let name = label(item)
+                // Model names in the native Codex catalog begin with GPT. Use
+                // only concrete model rows, excluding reset, access and service-tier actions.
+                guard splitSelection(name) == nil, isModelName(name),
+                      !name.localizedCaseInsensitiveContains("locked"),
+                      !name.contains("已锁定"), !name.contains("已鎖定") else { return nil }
+                let selected = !(string(item, "AXMenuItemMarkChar") ?? "").isEmpty
+                return Row(option: Option(id: name, label: name, isSelected: selected,
+                                          isEnabled: enabled(item)), element: item)
+            }
+            return rows.isEmpty ? nil : unique(rows)
+        }
+    }
+
+    private static func pluginRows(_ context: Context) -> [Row]? {
+        for node in portals(context, matching: { role($0) == "AXGroup" }) {
+            let section = children(node)
+            guard let heading = section.firstIndex(where: { child in
+                role(child) == "AXGroup" && children(child).contains {
+                    role($0) == "AXStaticText" && pluginLabels.contains(string($0, kAXValueAttribute) ?? "")
+                }
+            }) else { continue }
+            let rows = section.dropFirst(heading + 1).prefix {
+                ["AXButton", "AXListItem", "AXOption"].contains(role($0))
+            }.compactMap { item -> Row? in
+                let title = label(item)
+                guard !title.isEmpty else { return nil }
+                let name = staticLabels(item, depth: 4).first ?? title
+                return Row(option: Option(id: title, label: name, isSelected: false, isEnabled: enabled(item)),
+                           element: item)
+            }
+            return unique(rows)
+        }
+        return nil
+    }
+
+    private static func unique(_ rows: [Row]) -> [Row] {
+        let duplicates = Dictionary(grouping: rows, by: \.option.id)
+        return rows.filter { duplicates[$0.option.id]?.count == 1 }
+    }
+
+    private static func countChips(for row: Option, context: Context) -> Int {
+        // The editor represents an inserted mention as an AXImage whose name
+        // is the plugin's display name. The menu adds its description to that name.
+        descendants(context.editor, depth: 6, limit: 160) { item in
+            guard role(item) == "AXImage" else { return false }
+            let name = label(item)
+            return !name.isEmpty && (row.id == name || row.id.hasPrefix(name + " "))
+        }.count
+    }
+
+    private static func clickPlugin(_ row: Row, trigger: AXUIElement, context: Context) async throws {
+        // Chromium's AXPress dismisses these suggestion rows without invoking
+        // the insertion handler. Clicking the same verified element takes its normal path.
+        if pluginHitPoint(row.element) == nil {
+            _ = try validate(context)
+            guard expanded(trigger) == true,
+                  AXUIElementPerformAction(row.element, "AXScrollToVisible" as CFString) == .success else {
+                throw Failure.option
+            }
+        }
+        let location = try await wait(context) { pluginHitPoint(row.element) }
+        try Task.checkCancellation()
+        _ = try validate(context)
+        guard expanded(trigger) == true, enabled(row.element), label(row.element) == row.option.id,
+              pluginHitPoint(row.element) == location,
+              let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                                 mouseCursorPosition: location, mouseButton: .left),
+              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                               mouseCursorPosition: location, mouseButton: .left) else { throw Failure.option }
+        for event in [down, up] {
+            event.flags = []
+            event.setIntegerValueField(.eventSourceUserData, value: AppNavigationAccessibility.syntheticEventTag)
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private static func pluginHitPoint(_ item: AXUIElement) -> CGPoint? {
+        guard let rect = frame(item), rect.height >= 8, rect.width >= 8 else { return nil }
+        let point = CGPoint(x: rect.midX, y: rect.midY)
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.05)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+              let hit, CFEqual(hit, item) else { return nil }
+        return point
+    }
+
+    private static func readPower(_ context: Context) async throws -> Power {
+        try await wait(context) { currentPower(context) }
+    }
+
+    private static func currentPower(_ context: Context) -> Power? {
+        guard let menu = modelMenu(context) else { return nil }
+        let scope = descendants(menu, depth: 7, limit: 65) {
+            role($0) == "AXMenuItem" || string($0, kAXSubroleAttribute) == "AXApplicationStatus"
+        }
+        guard let item = scope.first(where: { powerLabels.contains(label($0)) }), enabled(item) else { return nil }
+        for status in scope where string(status, kAXSubroleAttribute) == "AXApplicationStatus" {
+            for text in staticLabels(status, depth: 2) {
+                let parts = text.components(separatedBy: .init(charactersIn: ",，"))
+                let numbers = parts.dropFirst().joined(separator: " ").split { !$0.isNumber }.compactMap { Int($0) }
+                guard let selection = splitSelection(parts[0]), numbers.count == 2,
+                      numbers[0] > 0, numbers[0] <= numbers[1], numbers[1] <= Effort.allCases.count else { continue }
+                return Power(item: item, model: selection.model, effort: selection.effort,
+                             index: numbers[0] - 1, count: numbers[1])
+            }
+        }
+        return nil
+    }
+
+    private static func effortOptions(_ power: Power, current: Snapshot, catalog: [Effort]?) throws -> [Option] {
+        guard let catalog, catalog.count == power.count, catalog.indices.contains(power.index),
+              catalog[power.index] == power.effort, power.effort.labels.contains(current.effort),
+              matchesModel(power.model, current.model) else { throw Failure.effort }
+        return catalog.map {
+            Option(id: $0.rawValue, label: $0.label(matching: current.effort),
+                   isSelected: $0 == power.effort, isEnabled: true)
+        }
+    }
+
+    private static func selectEffort(_ desired: Int, starting: Power, context: Context) async throws {
+        var current = starting
+        while current.index != desired {
+            try Task.checkCancellation()
+            _ = try validate(context)
+            let increasing = current.index < desired
+            let expected = current.index + (increasing ? 1 : -1)
+            // A focused AX menuitem routes arrows to the native effort control.
+            // Revalidate before every step because the UI updates after each key.
+            AXUIElementSetAttributeValue(current.item, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            let app = AXUIElementCreateApplication(context.pid)
+            guard let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, current.item),
+                  postKey(increasing ? 124 : 123, context: context) else { throw Failure.effort }
+            current = try await wait(context) {
+                guard let fresh = currentPower(context), fresh.index == expected,
+                      fresh.count == starting.count, matchesModel(fresh.model, starting.model) else { return nil }
+                return fresh
+            }
+        }
+    }
+
+    private static func modelMenu(_ context: Context) -> AXUIElement? {
+        portals(context, matching: { role($0) == "AXGroup" && ["菜单", "選單", "menu"].contains(
+            string($0, kAXRoleDescriptionAttribute) ?? "") }).first
+    }
+
+    private static func portals(_ context: Context, matching: (AXUIElement) -> Bool) -> [AXUIElement] {
+        // Electron appends floating menus after the app shell under the web root.
+        // This bounded shallow walk does not descend into the thread transcript.
+        return descendants(context.web, depth: 10, limit: 120, reversed: true,
+            descending: { node in
+                let subrole = string(node, kAXSubroleAttribute) ?? ""
+                return !["AXLandmarkMain", "AXLandmarkComplementary", "AXLandmarkBanner"].contains(subrole)
+            }, matching: matching)
+    }
+
+    private static func snapshot(_ context: Context) throws -> Snapshot {
+        let composer = try validate(context)
+        guard let value = splitSelection(label(composer.picker)) else { throw Failure.composer }
+        return Snapshot(context: context, model: value.model, effort: value.label)
+    }
+
+    private static func validate(_ context: Context) throws -> Composer {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == context.pid else { throw Failure.context }
+        let app = AXUIElementCreateApplication(context.pid)
+        AXUIElementSetMessagingTimeout(app, 0.05)
+        guard let window = element(app, kAXFocusedWindowAttribute), CFEqual(window, context.window),
+              string(window, kAXTitleAttribute) == context.title,
+              let parent = element(context.editor, kAXParentAttribute),
+              let bounds = frame(window), let editorFrame = frame(context.editor),
+              bounds.intersects(editorFrame), let current = composer(around: parent, editor: context.editor) else {
+            throw Failure.context
+        }
+        return current
+    }
+
+    private static func findComposer(in web: AXUIElement, bounds: CGRect) -> (AXUIElement, Composer)? {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.65
+        var stack = [(web, 0)]
+        var visited = 0
+        while let (node, depth) = stack.popLast(), visited < 350, ProcessInfo.processInfo.systemUptime < deadline {
+            visited += 1
+            guard depth < 32 else { continue }
+            let kind = role(node)
+            if kind == "AXTextArea", let parent = element(node, kAXParentAttribute),
+               let composer = composer(around: parent, editor: node) { return (node, composer) }
+            guard ["AXWebArea", "AXGroup", "AXScrollArea"].contains(kind),
+                  !["AXLandmarkComplementary", "AXLandmarkBanner"].contains(string(node, kAXSubroleAttribute) ?? "")
+            else { continue }
+            if let rect = frame(node), rect.maxY < bounds.maxY - min(390, bounds.height * 0.55) { continue }
+            for child in children(node).prefix(150) { stack.append((child, depth + 1)) }
+        }
+        return nil
+    }
+
+    private static func composer(around parent: AXUIElement, editor: AXUIElement) -> Composer? {
+        let siblings = children(parent)
+        guard siblings.contains(where: { CFEqual($0, editor) }),
+              let add = siblings.first(where: { role($0) == "AXButton" && addLabels.contains(label($0)) }),
+              let picker = siblings.first(where: {
+                  role($0) == "AXPopUpButton" &&
+                    (splitSelection(label($0)) != nil || effortLabels.contains(label($0)))
+              }) else { return nil }
+        return Composer(picker: picker, add: add)
+    }
+
+    private static func splitSelection(_ text: String) -> (model: String, effort: Effort, label: String)? {
+        for effort in Effort.allCases {
+            for name in effort.labels where text.hasSuffix(" " + name) {
+                let model = String(text.dropLast(name.count + 1))
+                if isModelName(model) { return (model, effort, name) }
+            }
+        }
+        return nil
+    }
+
+    private static func isModelName(_ name: String) -> Bool {
+        let normalized = normalizedModel(name)
+        return normalized.hasPrefix("gpt") && normalized.dropFirst(3).first?.isNumber == true
+    }
+
+    nonisolated private static func normalizedModel(_ name: String) -> String {
+        name.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func matchesModel(_ lhs: String, _ rhs: String) -> Bool {
+        normalizedModel(lhs) == normalizedModel(rhs)
+    }
+
+    @discardableResult
+    private static func wait<T>(_ context: Context, forValue: () -> T?) async throws -> T {
+        for _ in 0..<14 {
+            try Task.checkCancellation()
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == context.pid else { throw Failure.context }
+            if let value = forValue() { return value }
+            try await Task.sleep(for: .milliseconds(40))
+        }
+        throw Failure.verification
+    }
+
+    private static func close(_ trigger: AXUIElement, context: Context) async throws {
+        if expanded(trigger) == false { return }
+        guard expanded(trigger) == true, postKey(53, context: context) else { throw Failure.menu }
+        try await wait(context) { expanded(trigger) == false ? true : nil }
+    }
+
+    private static func postKey(_ key: CGKeyCode, context: Context) -> Bool {
+        guard (try? validate(context)) != nil,
+              let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) else { return false }
+        for event in [down, up] {
+            event.flags = []
+            event.setIntegerValueField(.eventSourceUserData, value: AppNavigationAccessibility.syntheticEventTag)
+            event.post(tap: .cghidEventTap)
+        }
+        return true
+    }
+
+    private static func press(_ node: AXUIElement, context: Context) throws {
+        try Task.checkCancellation()
+        _ = try validate(context)
+        guard enabled(node) else { throw Failure.option }
+        AXUIElementSetMessagingTimeout(node, 0.12)
+        guard AXUIElementPerformAction(node, kAXPressAction as CFString) == .success else { throw Failure.menu }
+    }
+
+    private static func attribute(_ node: AXUIElement, _ key: String) -> CFTypeRef? {
+        AXUIElementSetMessagingTimeout(node, 0.04)
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(node, key as CFString, &value) == .success ? value : nil
+    }
+
+    private static func element(_ node: AXUIElement, _ key: String) -> AXUIElement? {
+        guard let value = attribute(node, key), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    private static func frame(_ node: AXUIElement) -> CGRect? {
+        guard let origin = attribute(node, kAXPositionAttribute), let size = attribute(node, kAXSizeAttribute),
+              CFGetTypeID(origin) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+        var point = CGPoint.zero
+        var dimensions = CGSize.zero
+        guard AXValueGetValue(unsafeDowncast(origin, to: AXValue.self), .cgPoint, &point),
+              AXValueGetValue(unsafeDowncast(size, to: AXValue.self), .cgSize, &dimensions),
+              dimensions.width > 0, dimensions.height > 0 else { return nil }
+        return CGRect(origin: point, size: dimensions)
+    }
+
+    private static func string(_ node: AXUIElement, _ key: String) -> String? {
+        attribute(node, key) as? String
+    }
+
+    private static func role(_ node: AXUIElement) -> String { string(node, kAXRoleAttribute) ?? "" }
+    private static func label(_ node: AXUIElement) -> String {
+        let title = string(node, kAXTitleAttribute) ?? ""
+        return title.isEmpty ? string(node, kAXDescriptionAttribute) ?? "" : title
+    }
+
+    private static func expanded(_ node: AXUIElement) -> Bool? { attribute(node, kAXExpandedAttribute) as? Bool }
+    private static func enabled(_ node: AXUIElement) -> Bool { attribute(node, kAXEnabledAttribute) as? Bool == true }
+    private static func children(_ node: AXUIElement) -> [AXUIElement] { attribute(node, kAXChildrenAttribute) as? [AXUIElement] ?? [] }
+
+    private static func staticLabels(_ node: AXUIElement, depth: Int) -> [String] {
+        descendants(node, depth: depth, limit: 32) { role($0) == "AXStaticText" }.compactMap {
+            string($0, kAXValueAttribute)
+        }
+    }
+
+    private static func firstDescendant(_ root: AXUIElement, depth: Int, limit: Int,
+                                        matching: (AXUIElement) -> Bool) -> AXUIElement? {
+        descendants(root, depth: depth, limit: limit, first: true, matching: matching).first
+    }
+
+    private static func descendants(_ root: AXUIElement, depth: Int, limit: Int, reversed: Bool = false,
+                                    first: Bool = false, descending: (AXUIElement) -> Bool = { _ in true },
+                                    matching: (AXUIElement) -> Bool) -> [AXUIElement] {
+        var result: [AXUIElement] = []
+        var stack = [(root, 0)]
+        var count = 0
+        while let (node, level) = stack.popLast(), count < limit {
+            count += 1
+            if matching(node) {
+                result.append(node)
+                if first { break }
+            }
+            if level < depth, descending(node) {
+                let nodes = children(node)
+                let ordered = reversed ? nodes : Array(nodes.reversed())
+                stack.append(contentsOf: ordered.map { ($0, level + 1) })
+            }
+        }
+        return result
+    }
+
+    private static func effortCatalog(for model: String, context: Context) async -> [Effort]? {
+        let running = NSRunningApplication(processIdentifier: context.pid)
+        guard let cli = running?.bundleURL?.appendingPathComponent("Contents/Resources/codex-cli/bin/codex")
+        else { return nil }
+        let normalized = normalizedModel(model)
+        return await Task.detached(priority: .userInitiated) {
+            readEffortCatalog(executable: cli, model: normalized)
+        }.value
+    }
+
+    /// The supported levels come from the running app's bundled CLI. The UI's
+    /// selected index/count must independently agree before we expose these levels.
+    nonisolated private static func readEffortCatalog(executable: URL, model: String) -> [Effort]? {
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else { return nil }
+        let pipe = Pipe()
+        let input = Pipe()
+        guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else { return nil }
+        let task = Process()
+        task.executableURL = executable
+        task.arguments = ["app-server", "-c", "analytics.enabled=false"]
+        task.standardInput = input
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        defer {
+            try? input.fileHandleForWriting.close()
+            if task.isRunning { task.terminate() }
+        }
+
+        func send(_ message: String) -> Bool {
+            do {
+                try input.fileHandleForWriting.write(contentsOf: Data((message + "\n").utf8))
+                return true
+            } catch { return false }
+        }
+
+        do { try task.run() } catch { return nil }
+        guard send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"miremote_settings","version":"1.0"}}}"#)
+        else { return nil }
+        let end = ProcessInfo.processInfo.systemUptime + 3
+        var buffer = Data()
+        var pending = pollfd(fd: pipe.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0)
+        var bytes = [UInt8](repeating: 0, count: 16_384)
+        while ProcessInfo.processInfo.systemUptime < end && buffer.count < 1_048_576 {
+            guard poll(&pending, 1, 100) >= 0 else { return nil }
+            guard pending.revents & Int16(POLLIN) != 0 else {
+                if pending.revents != 0 { return nil }
+                continue
+            }
+            let count = bytes.withUnsafeMutableBytes { read(pending.fd, $0.baseAddress, $0.count) }
+            guard count > 0 else { return nil }
+            buffer.append(contentsOf: bytes.prefix(count))
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = buffer.prefix(upTo: newline)
+                buffer.removeSubrange(...newline)
+                guard let reply = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                      let id = reply["id"] as? Int else { continue }
+                guard let result = reply["result"] as? [String: Any] else { return nil }
+                if id == 1 {
+                    guard send(#"{"method":"initialized"}"#),
+                          send(#"{"id":2,"method":"model/list","params":{"limit":100}}"#) else { return nil }
+                }
+                if id == 2 {
+                    let entries = result["data"] as? [[String: Any]] ?? []
+                    let matches = entries.filter { entry in
+                        ["model", "displayName"].contains { entry[$0].map { normalizedModel($0 as? String ?? "") } == model }
+                    }
+                    guard matches.count == 1,
+                          let raw = matches[0]["supportedReasoningEfforts"] as? [[String: Any]] else { return nil }
+                    let efforts = raw.compactMap { ($0["reasoningEffort"] as? String).flatMap(Effort.init(rawValue:)) }
+                    return efforts.count == raw.count && Set(efforts).count == efforts.count ? efforts : nil
+                }
+            }
+        }
+        return nil
+    }
+}

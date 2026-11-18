@@ -144,6 +144,7 @@ final class OverlayUIState: ObservableObject {
     @Published var runningControlAppIDs: Set<String> = []
     @Published var wheelEntries: [AppWheelView.Entry] = []
     @Published var wheelIndex = 0
+    @Published var codexSettings = CodexSessionSettingsPanel()
     @Published var codexSnapshot = CodexSessions.Snapshot()
     @Published var codexList = CodexSessionList(entries: [])
     @Published var isLaunchingCodexChat = false
@@ -204,6 +205,7 @@ final class OverlayCenter {
         case tutorial = "tutorial"
         case appWheel = "app_wheel"
         case codexSessions = "codex_sessions"
+        case codexSettings = "codex_settings"
         case computerPower = "computer_power"
         case televisionPower = "television_power"
     }
@@ -247,6 +249,8 @@ final class OverlayCenter {
     private var wheelIndex = 0
     private var wheelIdleTimer: Timer?
     private let codexSessions = CodexSessions()
+    private var codexSettingsTask: Task<Void, Never>?
+    private var codexSettingsEpoch: UInt64 = 0
     private var codexSnapshot = CodexSessions.Snapshot()
     private var codexList = CodexSessionList(entries: [])
     private var codexSelection = CodexSessionList.Selection()
@@ -343,7 +347,7 @@ final class OverlayCenter {
         }
         invalidateDouyinHome()
         if active != nil { close() }
-        if kind.isDouyinMenu || kind == .windowPicker || kind == .systemMenu || kind == .computerPower || kind == .televisionPower {
+        if kind == .codexSettings || kind.isDouyinMenu || kind == .windowPicker || kind == .systemMenu || kind == .computerPower || kind == .televisionPower {
             MouseMode.shared.deactivate()
             mouseStatusText = nil
         }
@@ -460,6 +464,10 @@ final class OverlayCenter {
             wheelIndex = wheelApps.count > 1 ? 1 : 0   // 默认选「上一个 App」，一确认即回切
             showPanel()
             restartWheelIdleTimer()
+        case .codexSettings:
+            uiState.codexSettings = CodexSessionSettingsPanel()
+            showPanel()
+            reloadCodexSettings()
         case .codexSessions:
             let identity = CodexSessionIdentity.capture()
             browsedSessions = false
@@ -487,8 +495,8 @@ final class OverlayCenter {
         // 捕获遥控键：浮层期间事件不走动作分发（引擎 mainDispatch 保证主线程回调）。
         engine?.setOverlayCapture({ [weak self] event in
             MainActor.assumeIsolated { self?.handleKey(event) }
-        }, immediateDirections: kind.isDouyinMenu || kind == .systemMenu || kind == .computerPower || kind == .televisionPower,
-           prioritizeNavigationTaps: kind.isDouyinMenu)
+        }, immediateDirections: kind == .codexSettings || kind.isDouyinMenu || kind == .systemMenu || kind == .computerPower || kind == .televisionPower,
+           prioritizeNavigationTaps: kind == .codexSettings || kind.isDouyinMenu)
     }
 
     func close(dismissTelevisionMenu: Bool = true) {
@@ -521,6 +529,9 @@ final class OverlayCenter {
         powerOKHeld = false
         if dismissTV { XiaomiTVController.shared.dismissPowerMenu(matching: televisionConfiguration) }
         else if abandoningTV { XiaomiTVController.shared.abandonMenuNavigation(matching: televisionConfiguration) }
+        codexSettingsEpoch &+= 1
+        codexSettingsTask?.cancel()
+        codexSettingsTask = nil
         codexLaunchTask?.cancel()
         codexLaunchTask = nil
         codexSessions.cancel()
@@ -564,7 +575,10 @@ final class OverlayCenter {
             guard ev.keyCode == 53,
                   ev.cgEvent?.getIntegerValueField(.eventSourceUserData) != DockNavigationController.syntheticEventTag,
                   ev.cgEvent?.getIntegerValueField(.eventSourceUserData) != AppNavigationAccessibility.syntheticEventTag else { return }
-            MainActor.assumeIsolated { self?.close() }
+            MainActor.assumeIsolated {
+                if self?.active == .codexSettings { self?.backFromCodexSettings() }
+                else { self?.close() }
+            }
         }
     }
 
@@ -616,6 +630,7 @@ final class OverlayCenter {
         case .systemMenu:   handleMenuKey(event.key)
         case .appWheel:     handleWheelKey(event.key)
         case .codexSessions: handleCodexKey(event.key)
+        case .codexSettings: handleCodexSettingsKey(event.key)
         case .computerPower: handlePowerKey(event.key)
         case .televisionPower: handleTelevisionPowerKey(event.key)
         case .tutorial:
@@ -1539,12 +1554,121 @@ final class OverlayCenter {
 
     private func runCodexTool(_ tool: CodexSessionList.Tool) {
         guard active == .codexSessions, codexList.tabs[codexSelection.tab].isTools else { return }
+        if tool == .sessionSettings {
+            open("codex_settings")
+            return
+        }
         close()
         Task { @MainActor in
             switch tool {
+            case .sessionSettings: break
             case .updateCodex:
                 if let message = await CodexAppUpdate.run() { CodexNavigation.showNotice(message) }
             }
+        }
+    }
+
+    private func reloadCodexSettings() {
+        guard !uiState.codexSettings.busy else { return }
+        uiState.codexSettings.collapse()
+        performCodexSettingsOperation {
+            let snapshot = try await CodexSessionSettings.capture()
+            try Task.checkCancellation()
+            self.uiState.codexSettings.snapshot = snapshot
+        }
+    }
+
+    private func performCodexSettingsOperation(_ operation: @escaping @MainActor () async throws -> Void) {
+        guard active == .codexSettings, codexSettingsTask == nil else { return }
+        codexSettingsEpoch &+= 1
+        let epoch = codexSettingsEpoch
+        uiState.codexSettings.busy = true
+        uiState.codexSettings.error = nil
+        panel?.orderOut(nil)
+        codexSettingsTask = Task { @MainActor [weak self] in
+            do { try await operation() }
+            catch {
+                guard let self, self.codexSettingsEpoch == epoch else { return }
+                self.uiState.codexSettings.error = error.localizedDescription
+            }
+            guard let self, self.active == .codexSettings,
+                  self.codexSettingsEpoch == epoch, !Task.isCancelled else { return }
+            self.codexSettingsTask = nil
+            self.uiState.codexSettings.busy = false
+            self.panel?.orderFrontRegardless()
+            self.restartOverlayIdleTimer()
+        }
+    }
+
+    private func selectCodexSetting(_ field: CodexSessionSettings.Field) {
+        guard active == .codexSettings, !uiState.codexSettings.busy,
+              let context = uiState.codexSettings.snapshot?.context else { return }
+        uiState.codexSettings.selected = field == .model ? 0 : field == .effort ? 1 : 2
+        if uiState.codexSettings.expanded == field {
+            uiState.codexSettings.collapse()
+            return
+        }
+        performCodexSettingsOperation {
+            let options = try await CodexSessionSettings.options(field, context: context)
+            try Task.checkCancellation()
+            self.uiState.codexSettings.expanded = field
+            self.uiState.codexSettings.options = options
+            self.uiState.codexSettings.optionIndex = options.firstIndex(where: \.isSelected) ?? 0
+        }
+    }
+
+    private func openCodexPlugins() {
+        selectCodexSetting(.plugins)
+    }
+
+    private func applyCodexSetting(_ option: CodexSessionSettings.Option) {
+        guard active == .codexSettings, !uiState.codexSettings.busy, option.isEnabled,
+              let field = uiState.codexSettings.expanded,
+              let context = uiState.codexSettings.snapshot?.context else { return }
+        performCodexSettingsOperation {
+            let current = try await CodexSessionSettings.apply(field, option: option, context: context)
+            try Task.checkCancellation()
+            self.uiState.codexSettings.snapshot = current
+            self.uiState.codexSettings.collapse()
+        }
+    }
+
+    private func backFromCodexSettings() {
+        guard active == .codexSettings else { return }
+        if uiState.codexSettings.expanded != nil, !uiState.codexSettings.busy {
+            uiState.codexSettings.collapse()
+        } else {
+            open("codex_sessions")
+            codexSelection = codexList.initialSelection(tab: 0)
+            browsedSessions = true
+            sync(animated: false)
+        }
+    }
+
+    private func handleCodexSettingsKey(_ key: RemoteKey) {
+        switch key {
+        case .back: backFromCodexSettings()
+        case .home, .tv, .menu: close()
+        case .up, .down, .left, .right:
+            guard !uiState.codexSettings.busy else { return }
+            let step = { [weak self] in
+                guard let self, self.active == .codexSettings, !self.uiState.codexSettings.busy else { return }
+                self.uiState.codexSettings.move(key)
+            }
+            step()
+            startRepeat(key, step: step)
+        case .ok:
+            guard !uiState.codexSettings.busy else { return }
+            if uiState.codexSettings.snapshot == nil { reloadCodexSettings(); return }
+            if uiState.codexSettings.expanded != nil {
+                let state = uiState.codexSettings
+                if state.options.indices.contains(state.optionIndex) { applyCodexSetting(state.options[state.optionIndex]) }
+            } else if uiState.codexSettings.selected == 2 {
+                openCodexPlugins()
+            } else {
+                selectCodexSetting(uiState.codexSettings.selected == 0 ? .model : .effort)
+            }
+        default: break
         }
     }
 
@@ -1635,6 +1759,11 @@ final class OverlayCenter {
             onDismiss: { [weak self] in self?.close() },
             onDouyinBack: { [weak self] in self?.backFromDouyinMenu() },
             onDouyinAction: { [weak self] in self?.performDouyinAction($0) },
+            onCodexSettingsField: { [weak self] in self?.selectCodexSetting($0) },
+            onCodexSettingsOption: { [weak self] in self?.applyCodexSetting($0) },
+            onCodexPlugins: { [weak self] in self?.openCodexPlugins() },
+            onCodexSettingsRetry: { [weak self] in self?.reloadCodexSettings() },
+            onCodexSettingsBack: { [weak self] in self?.backFromCodexSettings() },
             onCodexTool: { [weak self] in self?.runCodexTool($0) },
             onCodexDot: { [weak self] in self?.openCodexDot() },
             onCodexNewChat: { [weak self] in self?.createCodexChat(tabID: $0) },
@@ -1904,6 +2033,8 @@ enum HintBarCatalog {
                     Hint(keys: [.back], text: "取消")]
         case .tutorial:
             return [Hint(keys: [.home, .back, .ok], text: "关闭教程")]
+        case .codexSettings:
+            return []
         case .codexSessions:
             return [Hint(keys: [.up, .down], text: "选会话（按住加速）"),
                     Hint(keys: [.left, .right], text: "切换标签"),
@@ -2038,6 +2169,11 @@ private struct OverlayRootView: View {
     let onDismiss: () -> Void
     let onDouyinBack: () -> Void
     let onDouyinAction: (DouyinMenuItem) -> Void
+    let onCodexSettingsField: (CodexSessionSettings.Field) -> Void
+    let onCodexSettingsOption: (CodexSessionSettings.Option) -> Void
+    let onCodexPlugins: () -> Void
+    let onCodexSettingsRetry: () -> Void
+    let onCodexSettingsBack: () -> Void
     let onCodexTool: (CodexSessionList.Tool) -> Void
     let onCodexDot: () -> Void
     let onCodexNewChat: (String) -> Void
@@ -2071,6 +2207,10 @@ private struct OverlayRootView: View {
                         confirming: state.menuConfirming, onSelect: onMenuSelect, onActivate: onMenuActivate)
                 case .appWheel:
                     AppWheelView(apps: state.wheelEntries, selected: state.wheelIndex)
+                case .codexSettings:
+                    CodexSessionSettingsView(state: state.codexSettings,
+                        onField: onCodexSettingsField, onOption: onCodexSettingsOption,
+                        onPlugins: onCodexPlugins, onBack: onCodexSettingsBack, onRetry: onCodexSettingsRetry)
                 case .codexSessions:
                     CodexSessionsView(snapshot: state.codexSnapshot, list: state.codexList, tabIndex: state.codexSelection.tab,
                                       selected: state.codexSelection.row, dotSelected: state.codexSelection.item == .dot,

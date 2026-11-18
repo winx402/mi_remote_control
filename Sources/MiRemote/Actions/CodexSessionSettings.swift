@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import OSLog
 
 @MainActor
 enum CodexSessionSettings {
@@ -12,6 +13,7 @@ enum CodexSessionSettings {
         fileprivate let title: String
         fileprivate let web: AXUIElement
         fileprivate let editor: AXUIElement
+        fileprivate let picker: AXUIElement
     }
 
     struct Snapshot {
@@ -59,7 +61,6 @@ enum CodexSessionSettings {
 
     private struct Power {
         let item: AXUIElement
-        let model: String
         let effort: Effort
         let index: Int
         let count: Int
@@ -93,6 +94,7 @@ enum CodexSessionSettings {
     private static let effortLabels: Set<String> = ["选择推理强度", "選取推理強度", "選擇推理強度", "Select effort"]
     private static let powerLabels: Set<String> = ["强度", "強度", "Power"]
     private static let pluginLabels: Set<String> = ["插件", "外掛程式", "外掛", "Plugins"]
+    private static let trace = Logger(subsystem: "com.miremote.controller", category: "CodexEffort")
     private static var busy = false
 
     static func capture() async throws -> Snapshot {
@@ -107,8 +109,9 @@ enum CodexSessionSettings {
               let web = firstDescendant(window, depth: 10, limit: 40, matching: { role($0) == "AXWebArea" }) else {
             throw Failure.composer
         }
-        guard let (editor, _) = findComposer(in: web, bounds: bounds) else { throw Failure.composer }
-        let context = Context(pid: running.processIdentifier, window: window, title: title, web: web, editor: editor)
+        guard let (editor, composer) = findComposer(in: web, bounds: bounds) else { throw Failure.composer }
+        let context = Context(pid: running.processIdentifier, window: window, title: title, web: web,
+                              editor: editor, picker: composer.picker)
         return try snapshot(context)
     }
 
@@ -304,52 +307,99 @@ enum CodexSessionSettings {
 
     private static func readPower(_ context: Context, model: String) async throws -> Power {
         enum Entry { case power(Power), selectedModel(AXUIElement) }
-        let entry = try await wait(context, attempts: 40, failure: .effortControl) {
-            () -> Entry? in
-            guard let menu = effortMenu(context, model: model) else { return nil }
-            if let power = currentPower(in: menu) { return .power(power) }
-            let rows = descendants(menu, depth: 9, limit: 160) { item in
-                role(item) == "AXMenuItem" && enabled(item) && matchesModel(label(item), model) &&
-                    !(string(item, "AXMenuItemMarkChar") ?? "").isEmpty
+        var stage = "menu-not-found"
+        do {
+            let entry = try await wait(context, attempts: 40, failure: .effortControl) {
+                () -> Entry? in
+                guard let menu = effortMenu(context) else { return nil }
+                let scope = powerScope(menu)
+                if let power = currentPower(in: scope, model: model) { return .power(power) }
+                if let item = powerItem(in: scope) {
+                    stage = enabled(item) ? "power-status-unreadable" : "power-row-disabled"
+                } else {
+                    stage = "power-row-missing"
+                }
+                let rows = descendants(menu, depth: 9, limit: 160) { item in
+                    role(item) == "AXMenuItem" && enabled(item) && matchesModel(label(item), model) &&
+                        !(string(item, "AXMenuItemMarkChar") ?? "").isEmpty
+                }
+                return rows.count == 1 ? .selectedModel(rows[0]) : nil
             }
-            return rows.count == 1 ? .selectedModel(rows[0]) : nil
-        }
-        switch entry {
-        case .power(let power): return power
-        case .selectedModel(let row):
-            // Activating the already checked model returns to the compact slider view.
-            try press(row, context: context)
-            return try await wait(context, attempts: 40, failure: .effortControl) {
-                effortMenu(context, model: model).flatMap { currentPower(in: $0) }
+            switch entry {
+            case .power(let power): return power
+            case .selectedModel(let row):
+                stage = "compact-view-unavailable"
+                // Activating the already checked model returns to the compact slider view.
+                try press(row, context: context)
+                return try await wait(context, attempts: 40, failure: .effortControl) {
+                    livePower(context, model: model)
+                }
             }
+        } catch {
+            trace.notice("Effort control unavailable: \(stage, privacy: .public)")
+            throw error
         }
     }
 
-    private static func currentPower(in menu: AXUIElement) -> Power? {
-        let scope = descendants(menu, depth: 7, limit: 65) {
-            role($0) == "AXMenuItem" || string($0, kAXSubroleAttribute) == "AXApplicationStatus"
+    private static func powerScope(_ menu: AXUIElement) -> [AXUIElement] {
+        descendants(menu, depth: 10, limit: 150) {
+            ["AXMenuItem", "AXSlider"].contains(role($0)) || string($0, kAXSubroleAttribute) == "AXApplicationStatus"
         }
-        guard let item = scope.first(where: { powerLabels.contains(label($0)) }), enabled(item) else { return nil }
+    }
+
+    private static func powerItem(in scope: [AXUIElement]) -> AXUIElement? {
+        scope.first(where: { ["AXMenuItem", "AXSlider"].contains(role($0)) && powerLabels.contains(label($0)) })
+    }
+
+    private static func livePower(_ context: Context, model: String) -> Power? {
+        effortMenu(context).flatMap { currentPower(in: powerScope($0), model: model) }
+    }
+
+    private static func currentPower(in scope: [AXUIElement], model: String) -> Power? {
+        guard let item = powerItem(in: scope), enabled(item) else { return nil }
         for status in scope where string(status, kAXSubroleAttribute) == "AXApplicationStatus" {
-            for text in staticLabels(status, depth: 2) {
-                let parts = text.components(separatedBy: .init(charactersIn: ",，"))
-                let numbers = parts.dropFirst().joined(separator: " ").split { !$0.isNumber }.compactMap { Int($0) }
-                guard let selection = splitSelection(parts[0]), numbers.count == 2,
-                      numbers[0] > 0, numbers[0] <= numbers[1], numbers[1] <= Effort.allCases.count else { continue }
-                return Power(item: item, model: selection.model, effort: selection.effort,
-                             index: numbers[0] - 1, count: numbers[1])
+            // Electron can expose the label and position as one text node or split children.
+            let labels = staticLabels(status, depth: 4)
+            for text in [labels.joined(separator: " "), label(status), string(status, kAXValueAttribute) ?? ""] {
+                guard let reading = powerReading(text, model: model) else { continue }
+                return Power(item: item, effort: reading.effort, index: reading.index, count: reading.count)
             }
         }
         return nil
     }
 
-    private static func effortMenu(_ context: Context, model: String) -> AXUIElement? {
-        portals(context, matching: { node in
-            guard isMenu(node) else { return false }
-            let title = label(node)
-            if effortLabels.contains(title) { return true }
-            return splitSelection(title).map { matchesModel($0.model, model) } ?? false
-        }).first
+    private static func powerReading(_ text: String, model: String) -> (effort: Effort, index: Int, count: Int)? {
+        let parts = text.components(separatedBy: .init(charactersIn: ",，、"))
+        let selection = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        let numbers = parts.dropFirst().joined(separator: " ").split { !$0.isNumber }.compactMap { Int($0) }
+        guard numbers.count == 2, numbers[0] > 0, numbers[0] <= numbers[1],
+              numbers[1] <= Effort.allCases.count else { return nil }
+        let modelKey = normalizedModel(model)
+        for effort in Effort.allCases {
+            for name in effort.labels where selection.hasSuffix(" " + name) {
+                let key = normalizedModel(String(selection.dropLast(name.count + 1)))
+                if key == modelKey || "gpt" + key == modelKey {
+                    return (effort, numbers[0] - 1, numbers[1])
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func effortMenu(_ context: Context) -> AXUIElement? {
+        guard let picker = (try? validate(context))?.picker, expanded(picker) == true,
+              let anchor = frame(picker) else { return nil }
+        let nearby = anchor.insetBy(dx: -24, dy: -48)
+        let menus = portals(context, matching: { node in isMenu(node) && frame(node)?.intersects(nearby) == true })
+        let app = AXUIElementCreateApplication(context.pid)
+        var focused = element(app, kAXFocusedUIElementAttribute)
+        for _ in 0..<12 {
+            guard let node = focused else { break }
+            if isMenu(node), frame(node)?.intersects(nearby) == true { return node }
+            focused = element(node, kAXParentAttribute)
+        }
+        // Only use geometry alone when it identifies a single nearby menu.
+        return menus.count == 1 ? menus[0] : nil
     }
 
     private static func applyEffort(_ target: Effort, from initial: Snapshot) async throws -> Snapshot {
@@ -367,8 +417,8 @@ enum CodexSessionSettings {
             let previous = saved
             saved = try await withMenu(.effort, context: context) { trigger in
                 let power = try await readPower(context, model: previous.model)
-                guard power.index == index, power.count == catalog.count,
-                      power.effort == catalog[index], matchesModel(power.model, previous.model) else {
+                guard power.index == index, power.count == catalog.count, power.effort == catalog[index] else {
+                    trace.notice("Effort catalog mismatch: UI index \(power.index, privacy: .public) of \(power.count, privacy: .public), expected index \(index, privacy: .public) of \(catalog.count, privacy: .public)")
                     throw Failure.effort
                 }
                 try await focusPower(power.item, context: context)
@@ -378,18 +428,14 @@ enum CodexSessionSettings {
                 // Confirm in the native menu, then read the collapsed composer before moving again.
                 let menuClosed = try await wait(context, attempts: 30, failure: .effortNotApplied) {
                     if expanded(trigger) == false { return true }
-                    guard let menu = effortMenu(context, model: previous.model),
-                          let fresh = currentPower(in: menu), fresh.index == expected,
-                          fresh.effort == catalog[expected], fresh.count == catalog.count,
-                          matchesModel(fresh.model, previous.model) else { return nil }
+                    guard let fresh = livePower(context, model: previous.model), fresh.index == expected,
+                          fresh.effort == catalog[expected], fresh.count == catalog.count else { return nil }
                     return false
                 }
                 if !menuClosed {
                     let app = AXUIElementCreateApplication(context.pid)
-                    guard let menu = effortMenu(context, model: previous.model),
-                          let fresh = currentPower(in: menu), fresh.index == expected,
+                    guard let fresh = livePower(context, model: previous.model), fresh.index == expected,
                           fresh.effort == catalog[expected], fresh.count == catalog.count,
-                          matchesModel(fresh.model, previous.model),
                           let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, fresh.item),
                           postKey(36, context: context) else { throw Failure.effortNotApplied }
                 }
@@ -420,7 +466,9 @@ enum CodexSessionSettings {
     }
 
     private static func isMenu(_ node: AXUIElement) -> Bool {
-        role(node) == "AXGroup" && ["菜单", "選單", "menu"].contains(string(node, kAXRoleDescriptionAttribute) ?? "")
+        let kind = role(node)
+        return kind == "AXMenu" || kind == "AXGroup" &&
+            ["菜单", "選單", "menu"].contains(string(node, kAXRoleDescriptionAttribute) ?? "")
     }
 
     private static func portals(_ context: Context, matching: (AXUIElement) -> Bool) -> [AXUIElement] {
@@ -447,7 +495,8 @@ enum CodexSessionSettings {
               string(window, kAXTitleAttribute) == context.title,
               let parent = element(context.editor, kAXParentAttribute),
               let bounds = frame(window), let editorFrame = frame(context.editor),
-              bounds.intersects(editorFrame), let current = composer(around: parent, editor: context.editor) else {
+              bounds.intersects(editorFrame),
+              let current = composer(around: parent, editor: context.editor, knownPicker: context.picker) else {
             throw Failure.context
         }
         return current
@@ -472,13 +521,16 @@ enum CodexSessionSettings {
         return nil
     }
 
-    private static func composer(around parent: AXUIElement, editor: AXUIElement) -> Composer? {
+    private static func composer(around parent: AXUIElement, editor: AXUIElement,
+                                 knownPicker: AXUIElement? = nil) -> Composer? {
         let siblings = children(parent)
         guard siblings.contains(where: { CFEqual($0, editor) }),
               let add = siblings.first(where: { role($0) == "AXButton" && addLabels.contains(label($0)) }),
-              let picker = siblings.first(where: {
-                  role($0) == "AXPopUpButton" &&
-                    (splitSelection(label($0)) != nil || effortLabels.contains(label($0)))
+              let picker = siblings.first(where: { candidate in
+                  guard role(candidate) == "AXPopUpButton" else { return false }
+                  if let knownPicker, CFEqual(knownPicker, candidate) { return true }
+                  let title = label(candidate)
+                  return splitSelection(title) != nil || effortLabels.contains(title)
               }) else { return nil }
         return Composer(picker: picker, add: add)
     }

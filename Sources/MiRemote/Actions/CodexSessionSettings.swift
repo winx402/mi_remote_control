@@ -28,7 +28,7 @@ enum CodexSessionSettings {
     }
 
     private enum Failure: LocalizedError {
-        case access, context, composer, menu, effort, effortNotApplied, option, verification
+        case access, context, composer, menu, effort, effortControl, effortNotApplied, option, verification
 
         var errorDescription: String? {
             switch self {
@@ -37,6 +37,7 @@ enum CodexSessionSettings {
             case .composer: "当前 Codex 输入区没有可操作的模型设置。"
             case .menu: "无法读取当前 Codex 菜单，请关闭菜单后重试。"
             case .effort: "无法确认该模型当前可用的推理强度，请在 Codex 中调整。"
+            case .effortControl: "Codex 模型菜单没有显示可用的强度滑块，请在 Codex 输入栏检查。"
             case .effortNotApplied: "Codex 没有确认新的思考强度。请重新打开强度列表再试。"
             case .option: "所选项目已不可用，请重新打开下拉菜单。"
             case .verification: "Codex 未确认所选项目，请核对当前会话。"
@@ -116,12 +117,22 @@ enum CodexSessionSettings {
         busy = true
         defer { busy = false }
         let current = try snapshot(context)
-        let catalog = field == .effort ? await effortCatalog(for: current.model, context: context) : nil
-        return try await withMenu(field, context: context) { trigger in
-            if field == .effort {
-                let power = try await readPower(context)
-                return try effortOptions(power, current: current, catalog: catalog)
+        if field == .effort {
+            // Model metadata describes available choices. The live slider is only
+            // needed when applying one, and may be hidden on the model list page.
+            let catalog = await effortCatalog(for: current.model, context: context)
+            try Task.checkCancellation()
+            let fresh = try snapshot(context)
+            guard matchesModel(fresh.model, current.model), let catalog,
+                  let selected = catalog.first(where: { $0.labels.contains(fresh.effort) }) else {
+                throw Failure.effort
             }
+            return catalog.map {
+                Option(id: $0.rawValue, label: $0.label(matching: fresh.effort),
+                       isSelected: $0 == selected, isEnabled: true)
+            }
+        }
+        return try await withMenu(field, context: context) { trigger in
             let rows = try await rows(field, trigger: trigger, context: context)
             return rows.map(\.option)
         }
@@ -170,7 +181,9 @@ enum CodexSessionSettings {
         guard expanded(trigger) == false else { throw Failure.menu }
         try press(trigger, context: context)
         do {
-            try await wait(context) { expanded(trigger) == true ? true : nil }
+            try await wait(context, attempts: field == .effort ? 40 : 14, failure: .menu) {
+                expanded(trigger) == true ? true : nil
+            }
             let value = try await operation(trigger)
             try await close(trigger, context: context)
             return value
@@ -289,12 +302,30 @@ enum CodexSessionSettings {
         return point
     }
 
-    private static func readPower(_ context: Context) async throws -> Power {
-        try await wait(context) { currentPower(context) }
+    private static func readPower(_ context: Context, model: String) async throws -> Power {
+        enum Entry { case power(Power), selectedModel(AXUIElement) }
+        let entry = try await wait(context, attempts: 40, failure: .effortControl) {
+            () -> Entry? in
+            guard let menu = effortMenu(context, model: model) else { return nil }
+            if let power = currentPower(in: menu) { return .power(power) }
+            let rows = descendants(menu, depth: 9, limit: 160) { item in
+                role(item) == "AXMenuItem" && enabled(item) && matchesModel(label(item), model) &&
+                    !(string(item, "AXMenuItemMarkChar") ?? "").isEmpty
+            }
+            return rows.count == 1 ? .selectedModel(rows[0]) : nil
+        }
+        switch entry {
+        case .power(let power): return power
+        case .selectedModel(let row):
+            // Activating the already checked model returns to the compact slider view.
+            try press(row, context: context)
+            return try await wait(context, attempts: 40, failure: .effortControl) {
+                effortMenu(context, model: model).flatMap { currentPower(in: $0) }
+            }
+        }
     }
 
-    private static func currentPower(_ context: Context) -> Power? {
-        guard let menu = modelMenu(context) else { return nil }
+    private static func currentPower(in menu: AXUIElement) -> Power? {
         let scope = descendants(menu, depth: 7, limit: 65) {
             role($0) == "AXMenuItem" || string($0, kAXSubroleAttribute) == "AXApplicationStatus"
         }
@@ -312,14 +343,13 @@ enum CodexSessionSettings {
         return nil
     }
 
-    private static func effortOptions(_ power: Power, current: Snapshot, catalog: [Effort]?) throws -> [Option] {
-        guard let catalog, catalog.count == power.count, catalog.indices.contains(power.index),
-              catalog[power.index] == power.effort, power.effort.labels.contains(current.effort),
-              matchesModel(power.model, current.model) else { throw Failure.effort }
-        return catalog.map {
-            Option(id: $0.rawValue, label: $0.label(matching: current.effort),
-                   isSelected: $0 == power.effort, isEnabled: true)
-        }
+    private static func effortMenu(_ context: Context, model: String) -> AXUIElement? {
+        portals(context, matching: { node in
+            guard isMenu(node) else { return false }
+            let title = label(node)
+            if effortLabels.contains(title) { return true }
+            return splitSelection(title).map { matchesModel($0.model, model) } ?? false
+        }).first
     }
 
     private static func applyEffort(_ target: Effort, from initial: Snapshot) async throws -> Snapshot {
@@ -336,7 +366,7 @@ enum CodexSessionSettings {
             let expected = index + direction
             let previous = saved
             saved = try await withMenu(.effort, context: context) { trigger in
-                let power = try await readPower(context)
+                let power = try await readPower(context, model: previous.model)
                 guard power.index == index, power.count == catalog.count,
                       power.effort == catalog[index], matchesModel(power.model, previous.model) else {
                     throw Failure.effort
@@ -348,14 +378,16 @@ enum CodexSessionSettings {
                 // Confirm in the native menu, then read the collapsed composer before moving again.
                 let menuClosed = try await wait(context, attempts: 30, failure: .effortNotApplied) {
                     if expanded(trigger) == false { return true }
-                    guard let fresh = currentPower(context), fresh.index == expected,
+                    guard let menu = effortMenu(context, model: previous.model),
+                          let fresh = currentPower(in: menu), fresh.index == expected,
                           fresh.effort == catalog[expected], fresh.count == catalog.count,
                           matchesModel(fresh.model, previous.model) else { return nil }
                     return false
                 }
                 if !menuClosed {
                     let app = AXUIElementCreateApplication(context.pid)
-                    guard let fresh = currentPower(context), fresh.index == expected,
+                    guard let menu = effortMenu(context, model: previous.model),
+                          let fresh = currentPower(in: menu), fresh.index == expected,
                           fresh.effort == catalog[expected], fresh.count == catalog.count,
                           matchesModel(fresh.model, previous.model),
                           let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, fresh.item),
@@ -384,8 +416,11 @@ enum CodexSessionSettings {
     }
 
     private static func modelMenu(_ context: Context) -> AXUIElement? {
-        portals(context, matching: { role($0) == "AXGroup" && ["菜单", "選單", "menu"].contains(
-            string($0, kAXRoleDescriptionAttribute) ?? "") }).first
+        portals(context, matching: isMenu).first
+    }
+
+    private static func isMenu(_ node: AXUIElement) -> Bool {
+        role(node) == "AXGroup" && ["菜单", "選單", "menu"].contains(string(node, kAXRoleDescriptionAttribute) ?? "")
     }
 
     private static func portals(_ context: Context, matching: (AXUIElement) -> Bool) -> [AXUIElement] {

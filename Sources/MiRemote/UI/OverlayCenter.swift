@@ -1626,10 +1626,18 @@ final class OverlayCenter {
               let field = uiState.codexSettings.expanded,
               let context = uiState.codexSettings.snapshot?.context else { return }
         performCodexSettingsOperation {
-            let current = try await CodexSessionSettings.apply(field, option: option, context: context)
-            try Task.checkCancellation()
-            self.uiState.codexSettings.snapshot = current
-            self.uiState.codexSettings.collapse()
+            do {
+                let current = try await CodexSessionSettings.apply(field, option: option, context: context)
+                try Task.checkCancellation()
+                self.uiState.codexSettings.snapshot = current
+                self.uiState.codexSettings.collapse()
+            } catch {
+                if field == .effort, !Task.isCancelled {
+                    self.uiState.codexSettings.snapshot = try? CodexSessionSettings.snapshot(context)
+                    self.uiState.codexSettings.collapse()
+                }
+                throw error
+            }
         }
     }
 

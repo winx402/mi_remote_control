@@ -28,7 +28,7 @@ enum CodexSessionSettings {
     }
 
     private enum Failure: LocalizedError {
-        case access, context, composer, menu, effort, option, verification
+        case access, context, composer, menu, effort, effortNotApplied, option, verification
 
         var errorDescription: String? {
             switch self {
@@ -37,6 +37,7 @@ enum CodexSessionSettings {
             case .composer: "当前 Codex 输入区没有可操作的模型设置。"
             case .menu: "无法读取当前 Codex 菜单，请关闭菜单后重试。"
             case .effort: "无法确认该模型当前可用的推理强度，请在 Codex 中调整。"
+            case .effortNotApplied: "Codex 没有确认新的思考强度。请重新打开强度列表再试。"
             case .option: "所选项目已不可用，请重新打开下拉菜单。"
             case .verification: "Codex 未确认所选项目，请核对当前会话。"
             }
@@ -132,25 +133,11 @@ enum CodexSessionSettings {
         defer { busy = false }
         let current = try snapshot(context)
         guard option.isEnabled else { throw Failure.option }
-        let catalog = field == .effort ? await effortCatalog(for: current.model, context: context) : nil
+        if field == .effort {
+            guard let target = Effort(rawValue: option.id) else { throw Failure.option }
+            return try await applyEffort(target, from: current)
+        }
         return try await withMenu(field, context: context) { trigger in
-            if field == .effort {
-                let power = try await readPower(context)
-                let available = try effortOptions(power, current: current, catalog: catalog)
-                guard let desired = available.firstIndex(where: { $0.id == option.id && $0.isEnabled }) else {
-                    throw Failure.option
-                }
-                if desired != power.index {
-                    try await selectEffort(desired, starting: power, context: context)
-                }
-                try await close(trigger, context: context)
-                let result = try snapshot(context)
-                guard let effort = Effort(rawValue: option.id), effort.labels.contains(result.effort) else {
-                    throw Failure.verification
-                }
-                return result
-            }
-
             let rows = try await rows(field, trigger: trigger, context: context)
             guard let row = rows.first(where: { $0.option.id == option.id && $0.option.isEnabled }) else {
                 throw Failure.option
@@ -335,24 +322,64 @@ enum CodexSessionSettings {
         }
     }
 
-    private static func selectEffort(_ desired: Int, starting: Power, context: Context) async throws {
-        var current = starting
-        while current.index != desired {
-            try Task.checkCancellation()
-            _ = try validate(context)
-            let increasing = current.index < desired
-            let expected = current.index + (increasing ? 1 : -1)
-            // A focused AX menuitem routes arrows to the native effort control.
-            // Revalidate before every step because the UI updates after each key.
-            AXUIElementSetAttributeValue(current.item, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            let app = AXUIElementCreateApplication(context.pid)
-            guard let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, current.item),
-                  postKey(increasing ? 124 : 123, context: context) else { throw Failure.effort }
-            current = try await wait(context) {
-                guard let fresh = currentPower(context), fresh.index == expected,
-                      fresh.count == starting.count, matchesModel(fresh.model, starting.model) else { return nil }
-                return fresh
+    private static func applyEffort(_ target: Effort, from initial: Snapshot) async throws -> Snapshot {
+        let context = initial.context
+        guard let catalog = await effortCatalog(for: initial.model, context: context) else { throw Failure.effort }
+        guard let desired = catalog.firstIndex(of: target) else { throw Failure.option }
+        var saved = try snapshot(context)
+        guard matchesModel(saved.model, initial.model),
+              let start = catalog.firstIndex(where: { $0.labels.contains(saved.effort) }) else {
+            throw Failure.effort
+        }
+        let direction = desired >= start ? 1 : -1
+        for index in stride(from: start, to: desired, by: direction) {
+            let expected = index + direction
+            let previous = saved
+            saved = try await withMenu(.effort, context: context) { trigger in
+                let power = try await readPower(context)
+                guard power.index == index, power.count == catalog.count,
+                      power.effort == catalog[index], matchesModel(power.model, previous.model) else {
+                    throw Failure.effort
+                }
+                try await focusPower(power.item, context: context)
+                guard postKey(direction > 0 ? 124 : 123, context: context) else { throw Failure.effort }
+
+                // The live status can show a preview before the composer saves it.
+                // Confirm in the native menu, then read the collapsed composer before moving again.
+                let menuClosed = try await wait(context, attempts: 30, failure: .effortNotApplied) {
+                    if expanded(trigger) == false { return true }
+                    guard let fresh = currentPower(context), fresh.index == expected,
+                          fresh.effort == catalog[expected], fresh.count == catalog.count,
+                          matchesModel(fresh.model, previous.model) else { return nil }
+                    return false
+                }
+                if !menuClosed {
+                    let app = AXUIElementCreateApplication(context.pid)
+                    guard let fresh = currentPower(context), fresh.index == expected,
+                          fresh.effort == catalog[expected], fresh.count == catalog.count,
+                          matchesModel(fresh.model, previous.model),
+                          let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, fresh.item),
+                          postKey(36, context: context) else { throw Failure.effortNotApplied }
+                }
+                return try await wait(context, attempts: 45, failure: .effortNotApplied) {
+                    guard expanded(trigger) == false, enabled(trigger),
+                          let result = try? snapshot(context), matchesModel(result.model, previous.model),
+                          catalog[expected].labels.contains(result.effort) else { return nil }
+                    return result
+                }
             }
+        }
+        return saved
+    }
+
+    private static func focusPower(_ item: AXUIElement, context: Context) async throws {
+        _ = try validate(context)
+        try Task.checkCancellation()
+        AXUIElementSetAttributeValue(item, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        let app = AXUIElementCreateApplication(context.pid)
+        try await wait(context, failure: .effortNotApplied) { () -> Bool? in
+            guard let focused = element(app, kAXFocusedUIElementAttribute), CFEqual(focused, item) else { return nil }
+            return true
         }
     }
 
@@ -371,7 +398,7 @@ enum CodexSessionSettings {
             }, matching: matching)
     }
 
-    private static func snapshot(_ context: Context) throws -> Snapshot {
+    static func snapshot(_ context: Context) throws -> Snapshot {
         let composer = try validate(context)
         guard let value = splitSelection(label(composer.picker)) else { throw Failure.composer }
         return Snapshot(context: context, model: value.model, effort: value.label)
@@ -445,14 +472,15 @@ enum CodexSessionSettings {
     }
 
     @discardableResult
-    private static func wait<T>(_ context: Context, forValue: () -> T?) async throws -> T {
-        for _ in 0..<14 {
+    private static func wait<T>(_ context: Context, attempts: Int = 14, failure: Failure = .verification,
+                                forValue: () -> T?) async throws -> T {
+        for _ in 0..<attempts {
             try Task.checkCancellation()
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == context.pid else { throw Failure.context }
             if let value = forValue() { return value }
             try await Task.sleep(for: .milliseconds(40))
         }
-        throw Failure.verification
+        throw failure
     }
 
     private static func close(_ trigger: AXUIElement, context: Context) async throws {

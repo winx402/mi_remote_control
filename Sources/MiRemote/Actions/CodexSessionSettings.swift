@@ -182,7 +182,7 @@ enum CodexSessionSettings {
             guard let preset = Preset(rawValue: option.id) else { throw Failure.option }
             return try await applyPreset(preset, from: current)
         case .model:
-            return try await applyModel(named: option.id, from: current)
+            return try await applyModel(named: option.label, from: current)
         case .effort:
             guard let target = Effort(rawValue: option.id) else { throw Failure.option }
             guard let catalog = await effortCatalog(for: current.model, context: context) else { throw Failure.effort }
@@ -194,7 +194,7 @@ enum CodexSessionSettings {
                     throw Failure.option
                 }
                 let priorChips = countChips(for: row.option, context: context)
-                try await clickPlugin(row, trigger: trigger, context: context)
+                try await clickMenuRow(row, trigger: trigger, context: context)
                 try await wait(context) {
                     expanded(trigger) == false && countChips(for: row.option, context: context) > priorChips ? true : nil
                 }
@@ -210,8 +210,13 @@ enum CodexSessionSettings {
               catalog.contains(preset.effort) else { throw Failure.effort }
         try Task.checkCancellation()
         let current = try snapshot(initial.context)
-        let selected = try await applyModel(named: preset.model, from: current)
-        return try await applyEffort(preset.effort, from: selected, catalog: catalog)
+        do {
+            let selected = try await applyModel(named: preset.model, from: current)
+            return try await applyEffort(preset.effort, from: selected, catalog: catalog)
+        } catch {
+            trace.notice("Preset failed: \(preset.rawValue, privacy: .public), \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
     }
 
     private static func applyModel(named model: String, from current: Snapshot) async throws -> Snapshot {
@@ -219,11 +224,20 @@ enum CodexSessionSettings {
         let context = current.context
         return try await withMenu(.model, context: context) { trigger in
             let rows = try await rows(.model, trigger: trigger, context: context)
-            let matches = rows.filter { matchesModel($0.option.id, model) && $0.option.isEnabled }
+            let matches = rows.filter { matchesModel($0.option.label, model) && $0.option.isEnabled }
             guard matches.count == 1, let row = matches.first else {
+                trace.notice("Model unavailable: \(model, privacy: .public), matches=\(matches.count, privacy: .public), rows=\(rows.count, privacy: .public)")
                 throw Failure.option
             }
-            try press(row.element, context: context)
+            try await clickMenuRow(row, trigger: trigger, context: context)
+            // After a selection Codex returns to the compact picker or dismisses it.
+            // Closing while the list is still visible can cancel the click.
+            try await wait(context, attempts: 55) { () -> Bool? in
+                guard let picker = (try? validate(context))?.picker else { return nil }
+                if expanded(picker) == false { return true }
+                guard let menu = effortMenu(context), modelSelector(in: menu) != nil else { return nil }
+                return true
+            }
             try await close(try validate(context).picker, context: context)
             return try await wait(context, attempts: 55) {
                 guard let picker = (try? validate(context))?.picker, enabled(picker), expanded(picker) == false,
@@ -264,18 +278,22 @@ enum CodexSessionSettings {
             }
         }
 
-        let menu = try await wait(context) { modelMenu(context) }
-        if let selector = firstDescendant(menu, depth: 7, limit: 45,
-            matching: { role($0) == "AXMenuItem" && modelLabels.contains(label($0)) }) {
-            try press(selector, context: context)
-        }
-        return try await wait(context) {
-            guard let menu = modelMenu(context) else { return nil }
-            let items = descendants(menu, depth: 8, limit: 140) { role($0) == "AXMenuItem" }
+        var openedList = false
+        for _ in 0..<40 {
+            try Task.checkCancellation()
+            _ = try validate(context)
+            guard let menu = effortMenu(context) else {
+                try await Task.sleep(for: .milliseconds(40))
+                continue
+            }
+            if !openedList, let selector = modelSelector(in: menu) {
+                try press(selector, context: context)
+                openedList = true
+            }
+            let items = descendants(menu, depth: 9, limit: 180) { role($0) == "AXMenuItem" }
             let rows: [Row] = items.compactMap { item in
                 let name = label(item)
-                // Model names in the native Codex catalog begin with GPT. Use
-                // only concrete model rows, excluding reset, access and service-tier actions.
+                // Accept concrete model rows, including abbreviated names.
                 guard splitSelection(name) == nil, isModelName(name),
                       !name.localizedCaseInsensitiveContains("locked"),
                       !name.contains("已锁定"), !name.contains("已鎖定") else { return nil }
@@ -283,8 +301,10 @@ enum CodexSessionSettings {
                 return Row(option: Option(id: name, label: name, isSelected: selected,
                                           isEnabled: enabled(item)), element: item)
             }
-            return rows.isEmpty ? nil : unique(rows)
+            if !rows.isEmpty { return unique(rows) }
+            try await Task.sleep(for: .milliseconds(40))
         }
+        throw Failure.menu
     }
 
     private static func pluginRows(_ context: Context) -> [Row]? {
@@ -324,21 +344,21 @@ enum CodexSessionSettings {
         }.count
     }
 
-    private static func clickPlugin(_ row: Row, trigger: AXUIElement, context: Context) async throws {
+    private static func clickMenuRow(_ row: Row, trigger: AXUIElement, context: Context) async throws {
         // Chromium's AXPress dismisses these suggestion rows without invoking
         // the insertion handler. Clicking the same verified element takes its normal path.
-        if pluginHitPoint(row.element) == nil {
+        if menuRowHitPoint(row.element) == nil {
             _ = try validate(context)
             guard expanded(trigger) == true,
                   AXUIElementPerformAction(row.element, "AXScrollToVisible" as CFString) == .success else {
                 throw Failure.option
             }
         }
-        let location = try await wait(context) { pluginHitPoint(row.element) }
+        let location = try await wait(context) { menuRowHitPoint(row.element) }
         try Task.checkCancellation()
         _ = try validate(context)
         guard expanded(trigger) == true, enabled(row.element), label(row.element) == row.option.id,
-              pluginHitPoint(row.element) == location,
+              menuRowHitPoint(row.element) == location,
               let source = CGEventSource(stateID: .hidSystemState),
               let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
                                  mouseCursorPosition: location, mouseButton: .left),
@@ -351,15 +371,20 @@ enum CodexSessionSettings {
         }
     }
 
-    private static func pluginHitPoint(_ item: AXUIElement) -> CGPoint? {
+    private static func menuRowHitPoint(_ item: AXUIElement) -> CGPoint? {
         guard let rect = frame(item), rect.height >= 8, rect.width >= 8 else { return nil }
         let point = CGPoint(x: rect.midX, y: rect.midY)
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, 0.05)
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
-              let hit, CFEqual(hit, item) else { return nil }
-        return point
+              hit != nil else { return nil }
+        for _ in 0..<6 {
+            guard let node = hit else { break }
+            if CFEqual(node, item) { return point }
+            hit = element(node, kAXParentAttribute)
+        }
+        return nil
     }
 
     private static func readPower(_ context: Context, model: String) async throws -> Power {
@@ -527,8 +552,10 @@ enum CodexSessionSettings {
         }
     }
 
-    private static func modelMenu(_ context: Context) -> AXUIElement? {
-        portals(context, matching: isMenu).first
+    private static func modelSelector(in menu: AXUIElement) -> AXUIElement? {
+        firstDescendant(menu, depth: 8, limit: 80) {
+            role($0) == "AXMenuItem" && modelLabels.contains(label($0)) && enabled($0)
+        }
     }
 
     private static func isMenu(_ node: AXUIElement) -> Bool {
@@ -613,7 +640,8 @@ enum CodexSessionSettings {
 
     private static func isModelName(_ name: String) -> Bool {
         let normalized = normalizedModel(name)
-        return normalized.hasPrefix("gpt") && normalized.dropFirst(3).first?.isNumber == true
+        return (normalized.hasPrefix("gpt") && normalized.dropFirst(3).first?.isNumber == true) ||
+            name.range(of: #"^[0-9]+(?:\.[0-9]+)*\s+[A-Za-z]+"#, options: .regularExpression) != nil
     }
 
     nonisolated private static func normalizedModel(_ name: String) -> String {
@@ -621,7 +649,8 @@ enum CodexSessionSettings {
     }
 
     private static func matchesModel(_ lhs: String, _ rhs: String) -> Bool {
-        normalizedModel(lhs) == normalizedModel(rhs)
+        let a = normalizedModel(lhs), b = normalizedModel(rhs)
+        return a == b || "gpt" + a == b || a == "gpt" + b
     }
 
     @discardableResult
